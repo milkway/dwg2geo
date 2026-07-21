@@ -1,0 +1,33 @@
+[package]
+name = "dwg2geo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Convert engineering DWG drawings to auditable GeoJSON"
+publish = false
+license = "MIT"
+
+[features]
+default = ["external-backend"]
+external-backend = []
+native-backend = [
+    "dep:acadrust",
+    "dep:geo-types",
+    "dep:geojson",
+    "dep:proj",
+]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6.3", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+
+# Optional native conversion stack. The first agent session must verify the
+# resolved versions and API compatibility on the target Rust toolchain.
+acadrust = { version = "0.4.1", optional = true }
+geo-types = { version = "0.7.19", optional = true }
+geojson = { version = "1.0.0", optional = true, features = ["geo-types"] }
+proj = { version = "0.31.0", optional = true }

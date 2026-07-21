@@ -1,0 +1,18 @@
+/target/
+/output/
+*.geojson
+*.geojsonseq
+*.dxf
+*.dwg
+*.report.json
+
+# Keep sample instructions and metadata, but never commit client drawings.
+!/samples/README.md
+!/samples/*.metadata.json
+
+.DS_Store
+.idea/
+.vscode/
+
+# Local agent settings
+.claude/
