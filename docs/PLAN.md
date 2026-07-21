@@ -33,7 +33,7 @@ Exit condition: the starter compiles and its unit tests pass.
 - [x] Add layer include/exclude options to the GDAL route where supported.
 - [x] Ensure paths containing spaces and non-ASCII characters work.
 - [x] Add explicit overwrite and partial-output cleanup behavior.
-- [ ] Test a local AC1027 drawing manually and record the observed entity counts outside git if proprietary.
+- [x] Test a local AC1027 drawing manually and record the observed entity counts outside git if proprietary. (Recorded in `samples/validation-corredor-sul.local.md`, git-ignored. Found and fixed: LibreDWG's direct GeoJSON route emits bare `-nan` for NaN coordinates; conversions now validate JSON well-formedness before delivering output.)
 
 Exit condition: a user with LibreDWG and GDAL can perform a traceable, CRS-explicit conversion.
 
@@ -45,7 +45,7 @@ Exit condition: a user with LibreDWG and GDAL can perform a traceable, CRS-expli
 - [x] Extend `inspect` with drawing units, extents, layer count, block count, and entity histogram.
 - [x] Detect unsupported/corrupt objects without crashing the whole report when recoverable. (Strict parse first, failsafe re-read on failure; empty failsafe recoveries are rejected, unknown entities and unresolved handles are counted.)
 - [x] Add synthetic or redistributable DWG fixtures for supported versions. (Fixtures are generated at test time with the `acadrust` DWG writer, so no binary files enter git.)
-- [ ] Compare native inspection counts against LibreDWG output on the local reference file.
+- [x] Compare native inspection counts against LibreDWG output on the local reference file. (8/17 entity types match exactly; native counts 219 more entities (~2.5%) than LibreDWG's DXF export, one-directional, with 5 block definitions missing from the DXF. Adjudication deferred to Milestone 6. Aggregates in the git-ignored local validation note.)
 
 Exit condition: native inspection is stable enough to drive conversion planning and detect feature loss.
 

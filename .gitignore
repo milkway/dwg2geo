@@ -16,3 +16,6 @@
 
 # Local agent settings
 .claude/
+
+# Local-only validation notes (proprietary data derived)
+*.local.md

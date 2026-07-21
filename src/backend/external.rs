@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tempfile::{TempDir, tempdir};
 
 use super::{
@@ -104,7 +104,9 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
         )
     };
 
-    let run = run.and_then(|()| ensure_nonempty_output(&partial));
+    let run = run
+        .and_then(|()| ensure_nonempty_output(&partial))
+        .and_then(|()| ensure_well_formed_json(&partial));
     if let Err(error) = run {
         let _ = fs::remove_file(&partial);
         return Err(error);
@@ -249,6 +251,25 @@ fn quoted_list(names: &[String]) -> String {
         .join(", ")
 }
 
+/// External tools can emit syntactically broken JSON — LibreDWG's GeoJSON
+/// writer prints NaN coordinates as bare `-nan` tokens, for example. A
+/// corrupt file must fail the conversion instead of being delivered.
+fn ensure_well_formed_json(path: &Path) -> Result<()> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("cannot reopen {} for validation", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let parsed = serde::de::IgnoredAny::deserialize(&mut deserializer)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| deserializer.end().map_err(anyhow::Error::from));
+    if let Err(error) = parsed {
+        bail!(
+            "the conversion tool produced malformed JSON ({error}); the drawing may contain values JSON cannot represent, such as NaN coordinates. Try the GDAL route with --source-crs, which sanitizes geometry"
+        );
+    }
+    Ok(())
+}
+
 fn run_checked(mut command: Command, purpose: &str) -> Result<Step> {
     let rendered = render_command(&command);
     let program = command.get_program().to_string_lossy().into_owned();
@@ -360,5 +381,27 @@ mod tests {
     #[test]
     fn no_layer_filter_means_no_clause() {
         assert_eq!(layer_where_clause(&[], &[]), None);
+    }
+
+    #[test]
+    fn rejects_malformed_json_output() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary file");
+        std::io::Write::write_all(
+            &mut file,
+            br#"{"type":"FeatureCollection","features":[[ -nan, -nan ]]}"#,
+        )
+        .expect("write fixture");
+
+        let error = super::ensure_well_formed_json(file.path()).expect_err("nan output must fail");
+        assert!(error.to_string().contains("malformed JSON"));
+    }
+
+    #[test]
+    fn accepts_well_formed_json_output() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary file");
+        std::io::Write::write_all(&mut file, br#"{"type":"FeatureCollection","features":[]}"#)
+            .expect("write fixture");
+
+        super::ensure_well_formed_json(file.path()).expect("valid output must pass");
     }
 }
