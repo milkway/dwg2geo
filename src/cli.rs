@@ -12,7 +12,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Check optional external conversion tools.
-    Doctor,
+    Doctor {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Inspect stable DWG file-level metadata without parsing drawing entities.
     Inspect {
@@ -52,6 +56,23 @@ pub enum Command {
         /// Replace an existing output file.
         #[arg(long)]
         force: bool,
+
+        /// Keep the intermediate DXF next to the output for diagnostics.
+        #[arg(long)]
+        keep_intermediate: bool,
+
+        /// Convert only these layers (comma-separated). GDAL route only.
+        #[arg(long, value_delimiter = ',', value_name = "LAYER")]
+        include_layers: Vec<String>,
+
+        /// Skip these layers (comma-separated). GDAL route only.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "LAYER",
+            conflicts_with = "include_layers"
+        )]
+        exclude_layers: Vec<String>,
     },
 }
 

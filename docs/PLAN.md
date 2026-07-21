@@ -18,21 +18,21 @@ The project succeeds when it can convert representative engineering DWGs into Ge
 - [x] Add a conservative external LibreDWG/GDAL pipeline.
 - [x] Record reference-file metadata without including the proprietary DWG.
 - [x] Add agent prompts, architecture, risks, and entity mapping.
-- [ ] Run formatting, compilation, Clippy, and tests on a Rust-enabled machine.
-- [ ] Initialize git and create the first commit.
+- [x] Run formatting, compilation, Clippy, and tests on a Rust-enabled machine.
+- [x] Initialize git and create the first commit.
 
 Exit condition: the starter compiles and its unit tests pass.
 
 ## Milestone 1 — external backend MVP
 
-- [ ] Add integration tests for CLI validation and exit codes.
-- [ ] Add structured `doctor --json` output.
-- [ ] Detect LibreDWG and GDAL versions and include them in conversion reports.
-- [ ] Write a sidecar `<output>.report.json` containing options, tools, source hash, timings, and warnings.
-- [ ] Add `--keep-intermediate` for diagnostic DXF retention.
-- [ ] Add layer include/exclude options to the GDAL route where supported.
-- [ ] Ensure paths containing spaces and non-ASCII characters work.
-- [ ] Add explicit overwrite and partial-output cleanup behavior.
+- [x] Add integration tests for CLI validation and exit codes.
+- [x] Add structured `doctor --json` output.
+- [x] Detect LibreDWG and GDAL versions and include them in conversion reports.
+- [x] Write a sidecar `<output>.report.json` containing options, tools, source hash, timings, and warnings.
+- [x] Add `--keep-intermediate` for diagnostic DXF retention.
+- [x] Add layer include/exclude options to the GDAL route where supported.
+- [x] Ensure paths containing spaces and non-ASCII characters work.
+- [x] Add explicit overwrite and partial-output cleanup behavior.
 - [ ] Test a local AC1027 drawing manually and record the observed entity counts outside git if proprietary.
 
 Exit condition: a user with LibreDWG and GDAL can perform a traceable, CRS-explicit conversion.

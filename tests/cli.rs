@@ -1,17 +1,29 @@
-use std::{io::Write, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
+
+fn binary() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_dwg2geo"))
+}
+
+fn write_fixture(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, b"AC1027synthetic-cli-fixture").expect("write fixture");
+    path
+}
 
 #[test]
 fn inspect_emits_ac1027_json() {
-    let mut fixture = NamedTempFile::new().expect("temporary file");
-    fixture
-        .write_all(b"AC1027synthetic-cli-fixture")
-        .expect("write fixture");
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dwg2geo"))
+    let output = binary()
         .arg("inspect")
-        .arg(fixture.path())
+        .arg(&fixture)
         .arg("--json")
         .output()
         .expect("run binary");
@@ -23,22 +35,255 @@ fn inspect_emits_ac1027_json() {
 }
 
 #[test]
-fn convert_requires_coordinate_policy() {
-    let mut fixture = NamedTempFile::new().expect("temporary file");
-    fixture
-        .write_all(b"AC1027synthetic-cli-fixture")
-        .expect("write fixture");
+fn inspect_handles_spaces_and_non_ascii_paths() {
+    let dir = TempDir::new().expect("temporary directory");
+    let sub = dir.path().join("peça técnica nº 1");
+    fs::create_dir_all(&sub).expect("create non-ascii directory");
+    let fixture = write_fixture(&sub, "corredor sul – trecho ç.dwg");
 
-    let output_path = fixture.path().with_extension("geojson");
-    let output = Command::new(env!("CARGO_BIN_EXE_dwg2geo"))
-        .arg("convert")
-        .arg(fixture.path())
-        .arg("--output")
-        .arg(output_path)
+    let output = binary()
+        .arg("inspect")
+        .arg(&fixture)
+        .arg("--json")
         .output()
         .expect("run binary");
 
-    assert!(!output.status.success());
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("inspect --json must emit valid JSON");
+    assert_eq!(parsed["signature"], "AC1027");
+}
+
+#[test]
+fn convert_requires_coordinate_policy() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojson"))
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("source CRS is required"));
+}
+
+#[test]
+fn conflicting_coordinate_flags_are_a_usage_error() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojson"))
+        .args(["--source-crs", "EPSG:31985", "--allow-local-coordinates"])
+        .output()
+        .expect("run binary");
+
+    // clap reports conflicting arguments as a usage error.
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn layer_filters_require_the_gdal_route() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojson"))
+        .args(["--allow-local-coordinates", "--include-layers", "EIXO"])
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--source-crs"));
+}
+
+#[test]
+fn convert_refuses_existing_output_without_force() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+    let out = dir.path().join("out.geojson");
+    fs::write(&out, "precious previous output").expect("seed output");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args(["--source-crs", "EPSG:31985"])
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--force"));
+    assert_eq!(
+        fs::read_to_string(&out).expect("output must survive"),
+        "precious previous output"
+    );
+}
+
+#[test]
+fn doctor_json_reports_both_tools() {
+    let output = binary()
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run binary");
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("doctor --json must emit valid JSON");
+    assert!(parsed["healthy"].is_boolean());
+
+    let tools = parsed["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(names, ["dwgread", "ogr2ogr"]);
+    for tool in tools {
+        assert!(tool["status"].is_string());
+        assert!(tool["required"].is_boolean());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_tools_fail_actionably_and_leave_no_partial_output() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+    let out = dir.path().join("out.geojson");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .arg("--allow-local-coordinates")
+        .env("PATH", "")
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dwgread"), "stderr: {stderr}");
+    assert!(stderr.contains("dwg2geo doctor"), "stderr: {stderr}");
+    assert!(stderr.contains("LibreDWG"), "stderr: {stderr}");
+
+    assert!(!out.exists());
+    assert!(!dir.path().join("out.geojson.partial").exists());
+    assert!(!dir.path().join("out.geojson.report.json").exists());
+}
+
+/// Install a stand-in for dwgread/ogr2ogr that records its arguments and
+/// writes a small FeatureCollection to the destination path (the
+/// second-to-last argument in every invocation this program issues).
+#[cfg(unix)]
+fn install_stub(dir: &Path, name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(name);
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "{name} stub 1.0.0"
+  exit 0
+fi
+printf '%s\n' "$@" > "$0.args"
+prev=""
+dst=""
+for a in "$@"; do
+  dst="$prev"
+  prev="$a"
+done
+printf '{{"type":"FeatureCollection","features":[]}}' > "$dst"
+"#
+    );
+    fs::write(&path, script).expect("write stub");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+}
+
+#[cfg(unix)]
+#[test]
+fn stubbed_conversion_writes_output_report_and_intermediate() {
+    let stub_dir = TempDir::new().expect("stub directory");
+    install_stub(stub_dir.path(), "dwgread");
+    install_stub(stub_dir.path(), "ogr2ogr");
+
+    let dir = TempDir::new().expect("temporary directory");
+    let workspace = dir.path().join("saída ç");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let fixture = write_fixture(&workspace, "corredor sul.dwg");
+    let out = workspace.join("corredor sul.geojson");
+    fs::write(&out, "old output").expect("seed output for --force");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args([
+            "--source-crs",
+            "EPSG:31985",
+            "--include-layers",
+            "EIXO,PISTA SUL",
+            "--keep-intermediate",
+            "--force",
+        ])
+        .env("PATH", stub_dir.path())
+        .output()
+        .expect("run binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    let geojson = fs::read_to_string(&out).expect("output exists");
+    assert_eq!(geojson, r#"{"type":"FeatureCollection","features":[]}"#);
+    assert!(
+        workspace
+            .join("corredor sul.geojson.intermediate.dxf")
+            .exists()
+    );
+    assert!(!workspace.join("corredor sul.geojson.partial").exists());
+
+    let report_text = fs::read_to_string(workspace.join("corredor sul.geojson.report.json"))
+        .expect("report exists");
+    let report: serde_json::Value = serde_json::from_str(&report_text).expect("report is JSON");
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["source"]["signature"], "AC1027");
+    assert_eq!(report["source"]["sha256"].as_str().expect("hash").len(), 64);
+    assert_eq!(report["options"]["source_crs"], "EPSG:31985");
+    assert_eq!(report["options"]["target_crs"], "EPSG:4326");
+    assert_eq!(report["options"]["include_layers"][1], "PISTA SUL");
+    assert_eq!(report["steps"].as_array().expect("steps").len(), 2);
+    assert_eq!(
+        report["output"]["size_bytes"].as_u64(),
+        Some(geojson.len() as u64)
+    );
+    for tool in report["external_tools"].as_array().expect("tools") {
+        assert_eq!(tool["status"], "available");
+        assert!(
+            tool["version"]
+                .as_str()
+                .expect("version")
+                .contains("stub 1.0.0")
+        );
+    }
+
+    let ogr_args =
+        fs::read_to_string(stub_dir.path().join("ogr2ogr.args")).expect("ogr2ogr was invoked");
+    assert!(
+        ogr_args.contains("Layer IN ('EIXO', 'PISTA SUL')"),
+        "ogr2ogr args: {ogr_args}"
+    );
 }

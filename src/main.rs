@@ -2,6 +2,7 @@ mod backend;
 mod cli;
 mod commands;
 mod dwg;
+mod report;
 
 use anyhow::Result;
 use clap::Parser;

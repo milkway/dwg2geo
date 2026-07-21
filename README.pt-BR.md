@@ -5,8 +5,8 @@ Este pacote contém um plano técnico, prompts para Codex CLI e Claude Code e um
 ## O que já está desenhado
 
 - `inspect`: identifica a assinatura DWG, geração do AutoCAD, tamanho e SHA-256 sem depender de bibliotecas CAD.
-- `doctor`: verifica `dwgread` e `ogr2ogr`.
-- `convert`: usa LibreDWG + GDAL e exige o CRS de origem, salvo quando coordenadas locais são aceitas explicitamente.
+- `doctor`: verifica `dwgread` e `ogr2ogr`, com versões; `--json` emite um relatório legível por máquina.
+- `convert`: usa LibreDWG + GDAL e exige o CRS de origem, salvo quando coordenadas locais são aceitas explicitamente. Cada conversão bem-sucedida grava um relatório em `<saída>.report.json` com opções, ferramentas, hash da origem, tempos e avisos.
 - backend nativo futuro com `acadrust`, isolado por feature do Cargo.
 - plano por marcos, arquitetura, mapeamento de entidades, riscos e decisões.
 

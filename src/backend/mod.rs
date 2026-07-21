@@ -1,4 +1,5 @@
 mod external;
+pub mod tools;
 
 use std::path::Path;
 
@@ -11,10 +12,13 @@ pub struct ConvertRequest<'a> {
     pub target_crs: &'a str,
     pub allow_local_coordinates: bool,
     pub force: bool,
+    pub keep_intermediate: bool,
+    pub include_layers: &'a [String],
+    pub exclude_layers: &'a [String],
 }
 
-pub fn doctor() -> Result<()> {
-    external::doctor()
+pub fn doctor(json: bool) -> Result<()> {
+    external::doctor(json)
 }
 
 pub fn convert_external(request: &ConvertRequest<'_>) -> Result<()> {

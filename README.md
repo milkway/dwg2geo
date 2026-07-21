@@ -7,11 +7,19 @@ Starter repository for an open-source CLI that converts engineering DWG drawings
 The starter implements a conservative external-tool MVP:
 
 - `dwg2geo inspect`: reads the six-byte DWG signature, reports the AutoCAD generation, size, and SHA-256 without requiring LibreDWG or GDAL.
-- `dwg2geo doctor`: checks whether `dwgread` and `ogr2ogr` are available.
+- `dwg2geo doctor`: checks whether `dwgread` and `ogr2ogr` are available, including versions; `--json` emits a machine-readable report and the exit code reflects tool health.
 - `dwg2geo convert`: either:
   - converts DWG -> DXF with LibreDWG and reprojects DXF -> GeoJSON with GDAL, when `--source-crs` is provided; or
   - exports raw/local coordinates directly through LibreDWG only when `--allow-local-coordinates` is explicit.
 - `--backend native` is reserved for the `acadrust` implementation described in the roadmap.
+
+Every successful conversion also writes a sidecar report at `<output>.report.json` recording the CLI options, external tool versions, source signature and SHA-256, executed commands with timings, and warnings. Apart from the duration fields, the report is deterministic for the same input and options.
+
+Convert options for traceability and control:
+
+- `--keep-intermediate` keeps the LibreDWG DXF at `<output>.intermediate.dxf` for diagnostics (GDAL route).
+- `--include-layers` / `--exclude-layers` restrict the GDAL route to a comma-separated layer subset via an attribute filter; they require `--source-crs`.
+- Overwrites are explicit: an existing output fails without `--force`, and even with `--force` the previous file is replaced only after the new output is complete. Failed runs remove their partial output; nothing is silently truncated.
 
 The uploaded reference drawing is **not included** in this repository. Its observed metadata is stored in `samples/corredor-sul.metadata.json`.
 
