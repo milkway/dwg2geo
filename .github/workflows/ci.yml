@@ -16,3 +16,5 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - run: cargo clippy --all-targets --features native-backend -- -D warnings
+      - run: cargo test --features native-backend

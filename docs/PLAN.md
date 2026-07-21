@@ -39,12 +39,12 @@ Exit condition: a user with LibreDWG and GDAL can perform a traceable, CRS-expli
 
 ## Milestone 2 — native inspection with acadrust
 
-- [ ] Enable and compile the `native-backend` Cargo feature.
-- [ ] Read AC1027 into `CadDocument` using `acadrust`.
-- [ ] Implement `layers` with counts by entity type and model/paper space.
-- [ ] Extend `inspect` with drawing units, extents, layer count, block count, and entity histogram.
-- [ ] Detect unsupported/corrupt objects without crashing the whole report when recoverable.
-- [ ] Add synthetic or redistributable DWG fixtures for supported versions.
+- [x] Enable and compile the `native-backend` Cargo feature. (PROJ reprojection moved to a separate `native-reproject` feature; see ADR-009.)
+- [x] Read AC1027 into `CadDocument` using `acadrust`.
+- [x] Implement `layers` with counts by entity type and model/paper space.
+- [x] Extend `inspect` with drawing units, extents, layer count, block count, and entity histogram.
+- [x] Detect unsupported/corrupt objects without crashing the whole report when recoverable. (Strict parse first, failsafe re-read on failure; empty failsafe recoveries are rejected, unknown entities and unresolved handles are counted.)
+- [x] Add synthetic or redistributable DWG fixtures for supported versions. (Fixtures are generated at test time with the `acadrust` DWG writer, so no binary files enter git.)
 - [ ] Compare native inspection counts against LibreDWG output on the local reference file.
 
 Exit condition: native inspection is stable enough to drive conversion planning and detect feature loss.

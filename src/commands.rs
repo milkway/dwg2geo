@@ -1,10 +1,25 @@
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
 use crate::{
     backend::{self, ConvertRequest},
     cli::{BackendChoice, Command},
     dwg,
 };
+
+#[derive(Debug, Serialize)]
+struct InspectOutput {
+    #[serde(flatten)]
+    file: dwg::DwgInfo,
+
+    #[cfg(feature = "native-backend")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native: Option<backend::native::NativeInspection>,
+
+    #[cfg(feature = "native-backend")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_error: Option<String>,
+}
 
 pub fn execute(command: Command) -> Result<()> {
     match command {
@@ -13,17 +28,64 @@ pub fn execute(command: Command) -> Result<()> {
             let info = dwg::inspect(&input)
                 .with_context(|| format!("failed to inspect {}", input.display()))?;
 
+            #[cfg(feature = "native-backend")]
+            let (native, native_error) = match backend::native::inspect(&input) {
+                Ok(native) => (Some(native), None),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            };
+
+            let output = InspectOutput {
+                file: info,
+                #[cfg(feature = "native-backend")]
+                native,
+                #[cfg(feature = "native-backend")]
+                native_error,
+            };
+
             if json {
-                println!("{}", serde_json::to_string_pretty(&info)?);
+                println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                println!("Path: {}", info.path);
-                println!("Signature: {}", info.signature);
-                println!("AutoCAD generation: {}", info.autocad_generation);
-                println!("Size: {} bytes", info.size_bytes);
-                println!("SHA-256: {}", info.sha256);
+                println!("Path: {}", output.file.path);
+                println!("Signature: {}", output.file.signature);
+                println!("AutoCAD generation: {}", output.file.autocad_generation);
+                println!("Size: {} bytes", output.file.size_bytes);
+                println!("SHA-256: {}", output.file.sha256);
+
+                #[cfg(feature = "native-backend")]
+                {
+                    if let Some(native) = &output.native {
+                        for line in native.human_lines() {
+                            println!("{line}");
+                        }
+                    }
+                    if let Some(error) = &output.native_error {
+                        println!("Native inspection failed: {error}");
+                    }
+                }
             }
 
             Ok(())
+        }
+        #[cfg(feature = "native-backend")]
+        Command::Layers { input, json } => {
+            let report = backend::native::layers(&input)
+                .with_context(|| format!("failed to read layers from {}", input.display()))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for line in report.human_lines() {
+                    println!("{line}");
+                }
+            }
+
+            Ok(())
+        }
+        #[cfg(not(feature = "native-backend"))]
+        Command::Layers { .. } => {
+            bail!(
+                "the `layers` command uses the native backend; rebuild with --features native-backend"
+            )
         }
         Command::Convert {
             input,

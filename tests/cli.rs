@@ -287,3 +287,157 @@ fn stubbed_conversion_writes_output_report_and_intermediate() {
         "ogr2ogr args: {ogr_args}"
     );
 }
+
+#[cfg(not(feature = "native-backend"))]
+#[test]
+fn layers_without_native_backend_explains_rebuild() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+
+    let output = binary()
+        .arg("layers")
+        .arg(&fixture)
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--features native-backend"));
+}
+
+/// Write a small synthetic AC1027 drawing with two custom layers, three
+/// model-space entities, and one paper-space entity.
+#[cfg(feature = "native-backend")]
+fn write_native_fixture(dir: &Path) -> PathBuf {
+    use acadrust::{
+        CadDocument, DxfVersion,
+        entities::{Circle, EntityType, Line, Point},
+        io::dwg::DwgWriter,
+        tables::Layer,
+    };
+
+    let mut document = CadDocument::with_version(DxfVersion::AC1027);
+
+    let mut eixo = Layer::new("EIXO");
+    eixo.handle = document.allocate_handle();
+    document.layers.add(eixo).expect("add EIXO layer");
+
+    let mut apoio = Layer::new("APOIO");
+    apoio.handle = document.allocate_handle();
+    apoio.flags.frozen = true;
+    document.layers.add(apoio).expect("add APOIO layer");
+
+    let mut line = EntityType::Line(Line::from_coords(0.0, 0.0, 0.0, 100.0, 50.0, 0.0));
+    line.common_mut().layer = "EIXO".to_string();
+    document.add_entity(line).expect("add line");
+
+    let mut second = EntityType::Line(Line::from_coords(10.0, 0.0, 0.0, 10.0, 90.0, 0.0));
+    second.common_mut().layer = "EIXO".to_string();
+    document.add_entity(second).expect("add second line");
+
+    let mut point = EntityType::Point(Point::from_coords(5.0, 5.0, 0.0));
+    point.common_mut().layer = "APOIO".to_string();
+    document.add_entity(point).expect("add point");
+
+    let mut circle = EntityType::Circle(Circle::from_coords(50.0, 25.0, 0.0, 12.5));
+    circle.common_mut().layer = "EIXO".to_string();
+    document
+        .add_paper_space_entity(circle)
+        .expect("add paper-space circle");
+
+    let path = dir.join("native fixture ç.dwg");
+    DwgWriter::write_to_file(&path, &document).expect("write DWG fixture");
+    path
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_inspect_extends_json_with_histogram() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_native_fixture(dir.path());
+
+    let output = binary()
+        .arg("inspect")
+        .arg(&fixture)
+        .arg("--json")
+        .output()
+        .expect("run binary");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("inspect --json must emit valid JSON");
+
+    assert_eq!(parsed["signature"], "AC1027");
+    let native = &parsed["native"];
+    assert_eq!(native["dwg_version"], "AC1027");
+    assert_eq!(native["read_mode"], "strict");
+    assert_eq!(native["layer_count"], 3);
+    assert_eq!(native["entity_counts"]["model_space"], 3);
+    assert_eq!(native["entity_counts"]["paper_space"], 1);
+
+    let histogram = native["entity_histogram"].as_array().expect("histogram");
+    let types: Vec<&str> = histogram
+        .iter()
+        .map(|entry| entry["entity_type"].as_str().expect("type"))
+        .collect();
+    assert_eq!(types, ["CIRCLE", "LINE", "POINT"]);
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_inspect_reports_parse_failure_without_failing_file_inspection() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fake.dwg");
+
+    let output = binary()
+        .arg("inspect")
+        .arg(&fixture)
+        .arg("--json")
+        .output()
+        .expect("run binary");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("inspect --json must emit valid JSON");
+    assert_eq!(parsed["signature"], "AC1027");
+    assert!(parsed.get("native").is_none());
+    assert!(
+        parsed["native_error"]
+            .as_str()
+            .expect("native_error")
+            .contains("strict error")
+    );
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn layers_json_lists_sorted_layers_with_counts() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_native_fixture(dir.path());
+
+    let output = binary()
+        .arg("layers")
+        .arg(&fixture)
+        .arg("--json")
+        .output()
+        .expect("run binary");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("layers --json must emit valid JSON");
+
+    let names: Vec<&str> = parsed["layers"]
+        .as_array()
+        .expect("layers array")
+        .iter()
+        .map(|layer| layer["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, ["0", "APOIO", "EIXO"]);
+
+    let eixo = &parsed["layers"][2];
+    assert_eq!(eixo["entity_counts"]["model_space"], 2);
+    assert_eq!(eixo["entity_counts"]["paper_space"], 1);
+    let apoio = &parsed["layers"][1];
+    assert_eq!(apoio["frozen"], true);
+    assert_eq!(apoio["entity_types"][0]["entity_type"], "POINT");
+}

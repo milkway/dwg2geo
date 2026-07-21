@@ -11,7 +11,7 @@ The starter implements a conservative external-tool MVP:
 - `dwg2geo convert`: either:
   - converts DWG -> DXF with LibreDWG and reprojects DXF -> GeoJSON with GDAL, when `--source-crs` is provided; or
   - exports raw/local coordinates directly through LibreDWG only when `--allow-local-coordinates` is explicit.
-- `--backend native` is reserved for the `acadrust` implementation described in the roadmap.
+- `--backend native` conversion is reserved for the roadmap, but native *inspection* is available today behind the `native-backend` feature (see below).
 
 Every successful conversion also writes a sidecar report at `<output>.report.json` recording the CLI options, external tool versions, source signature and SHA-256, executed commands with timings, and warnings. Apart from the duration fields, the report is deterministic for the same input and options.
 
@@ -87,6 +87,22 @@ cargo run -- convert \
   --output output/corredor-sul-local.geojson \
   --allow-local-coordinates
 ```
+
+## Native inspection (optional feature)
+
+Building with the pure-Rust `acadrust` reader enables entity-level inspection without LibreDWG or GDAL:
+
+```bash
+cargo build --features native-backend
+```
+
+With the feature enabled:
+
+- `inspect` additionally reports the DWG version, measurement system, insertion units, model extents, layer and block counts, and an entity histogram split by model space, paper space, block definitions, and unowned entities. A parse failure never hides the file-level report; it appears as an explicit `native_error`.
+- `dwg2geo layers <FILE> [--json]` lists every layer with its flags and entity counts by type and space, plus any layer names referenced by entities but missing from the layer table.
+- Corrupt files are retried in failsafe mode; recovered reports are labeled `failsafe_recovery` and carry the strict-parse error. Unknown entities and unresolved handles are counted, never dropped.
+
+The separate `native-reproject` feature adds the `proj` crate for Milestone 5 reprojection; it needs system PROJ >= 9.6 or a build toolchain with cmake and sqlite3 (see `docs/DECISIONS.md`, ADR-009).
 
 ## Continue with an AI coding agent
 

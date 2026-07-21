@@ -14,8 +14,11 @@ native-backend = [
     "dep:acadrust",
     "dep:geo-types",
     "dep:geojson",
-    "dep:proj",
 ]
+# PROJ-based reprojection for the native backend (Milestone 5). Split out of
+# native-backend because proj-sys needs system PROJ >= 9.6 or a from-source
+# build (cmake + sqlite3), which Milestone 2 inspection does not require.
+native-reproject = ["native-backend", "dep:proj"]
 
 [dependencies]
 anyhow = "1"

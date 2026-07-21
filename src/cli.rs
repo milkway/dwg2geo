@@ -28,6 +28,16 @@ pub enum Command {
         json: bool,
     },
 
+    /// List layers with entity counts by type and space (native backend).
+    Layers {
+        /// Input DWG file.
+        input: PathBuf,
+
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Convert a DWG drawing to GeoJSON.
     Convert {
         /// Input DWG file.

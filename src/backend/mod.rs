@@ -1,4 +1,6 @@
 mod external;
+#[cfg(feature = "native-backend")]
+pub mod native;
 pub mod tools;
 
 use std::path::Path;
