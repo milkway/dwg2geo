@@ -53,9 +53,9 @@ Exit condition: native inspection is stable enough to drive conversion planning 
 
 Implement entities in this order:
 
-- [ ] `POINT` -> `Point`.
-- [ ] `LINE` -> `LineString`.
-- [ ] `LWPOLYLINE` without bulges -> `LineString` / optional `Polygon`.
+- [x] `POINT` -> `Point`.
+- [x] `LINE` -> `LineString`.
+- [x] `LWPOLYLINE` without bulges -> `LineString` / optional `Polygon`. (`--polygonize-closed`; closed polylines stay LineStrings by default per ADR-006. Bulged polylines are skipped with an explicit reason until bulge tessellation lands.)
 - [ ] Classic `POLYLINE` / `VERTEX`.
 - [ ] Bulge arc tessellation with deterministic tolerance.
 - [ ] `ARC` and `CIRCLE` tessellation.
@@ -67,11 +67,11 @@ Implement entities in this order:
 
 Cross-cutting tasks:
 
-- [ ] OCS -> WCS conversion.
-- [ ] model-space filtering by default;
-- [ ] stable feature IDs;
-- [ ] per-entity error isolation;
-- [ ] geometry-validity checks;
+- [x] OCS -> WCS conversion. (Arbitrary axis algorithm applied to the entity types converted so far; each new curved type must reuse it.)
+- [x] model-space filtering by default; paper-space, block-definition, and unowned entities are counted as excluded in the report.
+- [x] stable feature IDs; entity handles, with a document-order fallback for null handles.
+- [x] per-entity error isolation; failures and skips are per-entity outcomes with reasons and sample handles, never command aborts.
+- [x] geometry-validity checks — non-finite coordinates, degenerate lines, sub-minimal rings. (Deeper checks — self-intersection, duplicate vertices — belong to Milestone 6.)
 - [ ] `GeoJSONSeq` streaming mode for large drawings.
 
 Exit condition: common civil/utility plan geometry converts natively with quantified losses.

@@ -3,9 +3,12 @@ mod external;
 pub mod native;
 pub mod tools;
 
-use std::path::Path;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 pub struct ConvertRequest<'a> {
     pub input: &'a Path,
@@ -17,6 +20,7 @@ pub struct ConvertRequest<'a> {
     pub keep_intermediate: bool,
     pub include_layers: &'a [String],
     pub exclude_layers: &'a [String],
+    pub polygonize_closed: bool,
 }
 
 pub fn doctor(json: bool) -> Result<()> {
@@ -28,15 +32,87 @@ pub fn convert_external(request: &ConvertRequest<'_>) -> Result<()> {
 }
 
 #[cfg(feature = "native-backend")]
-pub fn convert_native(_request: &ConvertRequest<'_>) -> Result<()> {
-    bail!(
-        "the native backend feature is enabled, but entity conversion is not implemented yet; complete Milestones 2 and 3"
-    )
+pub fn convert_native(request: &ConvertRequest<'_>) -> Result<()> {
+    native::convert::convert(request)
 }
 
 #[cfg(not(feature = "native-backend"))]
 pub fn convert_native(_request: &ConvertRequest<'_>) -> Result<()> {
     bail!(
-        "the native backend is not built; rebuild with --features native-backend after implementing Milestones 2 and 3"
+        "the native backend is not built; rebuild with --features native-backend to convert without external tools"
     )
+}
+
+// Output-lifecycle helpers shared by both backends: outputs are produced at
+// `<output>.partial` and renamed into place only once complete, so failures
+// never leave partial files and --force never destroys the previous output
+// before a replacement exists.
+
+pub(crate) fn validate_input(input: &Path) -> Result<()> {
+    if !input.is_file() {
+        bail!("input is not a readable file: {}", input.display());
+    }
+    Ok(())
+}
+
+pub(crate) fn check_output_collision(output: &Path, force: bool) -> Result<()> {
+    if output.exists() && !force {
+        bail!(
+            "output already exists: {}; pass --force to replace it",
+            output.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_parent_directory(output: &Path) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create output directory {}", parent.display()))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+pub(crate) fn remove_stale(partial: &Path) -> Result<()> {
+    if partial.exists() {
+        fs::remove_file(partial).with_context(|| {
+            format!(
+                "cannot remove stale partial output {} from a previous run",
+                partial.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_nonempty_output(output: &Path) -> Result<()> {
+    let metadata = fs::metadata(output)
+        .with_context(|| format!("conversion did not create {}", output.display()))?;
+    if metadata.len() == 0 {
+        bail!("conversion created an empty output: {}", output.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::append_suffix;
+
+    #[test]
+    fn append_suffix_keeps_full_file_name() {
+        assert_eq!(
+            append_suffix(Path::new("out/plan a.geojson"), ".partial"),
+            Path::new("out/plan a.geojson.partial")
+        );
+    }
 }

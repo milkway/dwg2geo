@@ -83,6 +83,11 @@ pub enum Command {
             conflicts_with = "include_layers"
         )]
         exclude_layers: Vec<String>,
+
+        /// Emit closed polylines as Polygons instead of closed LineStrings
+        /// (native backend only; see ADR-006).
+        #[arg(long)]
+        polygonize_closed: bool,
     },
 }
 

@@ -441,3 +441,207 @@ fn layers_json_lists_sorted_layers_with_counts() {
     assert_eq!(apoio["frozen"], true);
     assert_eq!(apoio["entity_types"][0]["entity_type"], "POINT");
 }
+
+#[test]
+fn polygonize_closed_requires_native_backend() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojson"))
+        .args(["--allow-local-coordinates", "--polygonize-closed"])
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--backend native"), "stderr: {stderr}");
+}
+
+/// Fixture for conversion tests: three convertible model-space entities, a
+/// bulged polyline and a circle that must be skipped with reasons, and one
+/// paper-space entity that must be excluded.
+#[cfg(feature = "native-backend")]
+fn write_convert_fixture(dir: &Path) -> PathBuf {
+    use acadrust::{
+        CadDocument, DxfVersion,
+        entities::{Circle, EntityType, Line, LwPolyline, Point},
+        io::dwg::DwgWriter,
+        tables::Layer,
+        types::Vector2,
+    };
+
+    let mut document = CadDocument::with_version(DxfVersion::AC1027);
+    for name in ["EIXO", "PISTA"] {
+        let mut layer = Layer::new(name);
+        layer.handle = document.allocate_handle();
+        document.layers.add(layer).expect("add layer");
+    }
+
+    let mut line = EntityType::Line(Line::from_coords(0.0, 0.0, 0.0, 100.0, 50.0, 0.0));
+    line.common_mut().layer = "EIXO".to_string();
+    document.add_entity(line).expect("add line");
+
+    let mut point = EntityType::Point(Point::from_coords(5.0, 5.0, 0.0));
+    point.common_mut().layer = "EIXO".to_string();
+    document.add_entity(point).expect("add point");
+
+    let mut square = LwPolyline::new();
+    for (x, y) in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)] {
+        square.add_point(Vector2::new(x, y));
+    }
+    square.is_closed = true;
+    let mut square = EntityType::LwPolyline(square);
+    square.common_mut().layer = "PISTA".to_string();
+    document.add_entity(square).expect("add closed polyline");
+
+    let mut bulged = LwPolyline::new();
+    bulged.add_point_with_bulge(Vector2::new(20.0, 0.0), 0.5);
+    bulged.add_point(Vector2::new(30.0, 0.0));
+    let mut bulged = EntityType::LwPolyline(bulged);
+    bulged.common_mut().layer = "PISTA".to_string();
+    document.add_entity(bulged).expect("add bulged polyline");
+
+    let mut circle = EntityType::Circle(Circle::from_coords(50.0, 25.0, 0.0, 12.5));
+    circle.common_mut().layer = "EIXO".to_string();
+    document.add_entity(circle).expect("add circle");
+
+    let mut paper_point = EntityType::Point(Point::from_coords(1.0, 1.0, 0.0));
+    paper_point.common_mut().layer = "EIXO".to_string();
+    document
+        .add_paper_space_entity(paper_point)
+        .expect("add paper point");
+
+    let path = dir.join("convert fixture ç.dwg");
+    DwgWriter::write_to_file(&path, &document).expect("write DWG fixture");
+    path
+}
+
+#[cfg(feature = "native-backend")]
+fn run_native_convert(fixture: &Path, out: &Path) -> std::process::Output {
+    binary()
+        .arg("convert")
+        .arg(fixture)
+        .arg("--output")
+        .arg(out)
+        .args([
+            "--backend",
+            "native",
+            "--allow-local-coordinates",
+            "--polygonize-closed",
+        ])
+        .output()
+        .expect("run binary")
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_convert_writes_geojson_and_accounted_report() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let out = dir.path().join("saída ç.geojson");
+
+    let output = run_native_convert(&fixture, &out);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    let geojson: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out).expect("output exists"))
+            .expect("output is JSON");
+    assert_eq!(geojson["type"], "FeatureCollection");
+    assert_eq!(
+        geojson["dwg2geo"]["coordinate_status"],
+        "local-unreferenced"
+    );
+
+    let features = geojson["features"].as_array().expect("features");
+    assert_eq!(features.len(), 3);
+    let kinds: Vec<(&str, &str)> = features
+        .iter()
+        .map(|feature| {
+            (
+                feature["properties"]["entity_type"].as_str().expect("type"),
+                feature["geometry"]["type"].as_str().expect("geom type"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("LINE", "LineString"),
+            ("POINT", "Point"),
+            ("LWPOLYLINE", "Polygon"),
+        ]
+    );
+    for feature in features {
+        assert_eq!(feature["properties"]["space"], "model");
+        assert!(feature["id"].is_string(), "feature must have a stable id");
+    }
+
+    let report_path = dir.path().join("saída ç.geojson.report.json");
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("report exists"))
+            .expect("report is JSON");
+    assert_eq!(report["options"]["backend"], "native");
+    assert_eq!(report["options"]["polygonize_closed"], true);
+
+    let native = &report["native"];
+    assert_eq!(native["read_mode"], "strict");
+    assert_eq!(native["features_written"], 3);
+    assert_eq!(native["excluded"]["paper_space"], 1);
+
+    let skipped = native["skipped"].as_array().expect("skipped");
+    let mut skip_pairs: Vec<(&str, &str)> = skipped
+        .iter()
+        .map(|entry| {
+            (
+                entry["entity_type"].as_str().expect("type"),
+                entry["reason"].as_str().expect("reason"),
+            )
+        })
+        .collect();
+    skip_pairs.sort_unstable();
+    assert_eq!(skip_pairs.len(), 2);
+    assert_eq!(skip_pairs[0].0, "CIRCLE");
+    assert!(skip_pairs[1].1.contains("bulge"));
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_convert_output_is_deterministic() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let first_out = dir.path().join("first.geojson");
+    let second_out = dir.path().join("second.geojson");
+
+    assert!(run_native_convert(&fixture, &first_out).status.success());
+    assert!(run_native_convert(&fixture, &second_out).status.success());
+
+    let first = fs::read(&first_out).expect("first output");
+    let second = fs::read(&second_out).expect("second output");
+    assert_eq!(first, second, "GeoJSON output must be byte-identical");
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_convert_rejects_source_crs_until_milestone_5() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojson"))
+        .args(["--backend", "native", "--source-crs", "EPSG:31985"])
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("native-reproject"), "stderr: {stderr}");
+    assert!(!dir.path().join("out.geojson").exists());
+}

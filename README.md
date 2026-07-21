@@ -101,6 +101,7 @@ With the feature enabled:
 - `inspect` additionally reports the DWG version, measurement system, insertion units, model extents, layer and block counts, and an entity histogram split by model space, paper space, block definitions, and unowned entities. A parse failure never hides the file-level report; it appears as an explicit `native_error`.
 - `dwg2geo layers <FILE> [--json]` lists every layer with its flags and entity counts by type and space, plus any layer names referenced by entities but missing from the layer table.
 - Corrupt files are retried in failsafe mode; recovered reports are labeled `failsafe_recovery` and carry the strict-parse error. Unknown entities and unresolved handles are counted, never dropped.
+- `convert --backend native --allow-local-coordinates` converts model-space `POINT`, `LINE`, and `LWPOLYLINE` (without bulge arcs) to GeoJSON in raw drawing coordinates, entirely in-process. Closed polylines become closed LineStrings, or Polygons with CCW rings when `--polygonize-closed` is passed. Every skipped or failed entity appears in the report's `native` section with a reason and sample handles; the output carries a `dwg2geo` foreign member marking it as non-geographic. Reprojection (`--source-crs`) on the native backend is rejected until Milestone 5 (`native-reproject`).
 
 The separate `native-reproject` feature adds the `proj` crate for Milestone 5 reprojection; it needs system PROJ >= 9.6 or a build toolchain with cmake and sqlite3 (see `docs/DECISIONS.md`, ADR-009).
 

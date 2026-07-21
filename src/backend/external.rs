@@ -11,8 +11,10 @@ use serde::Serialize;
 use tempfile::{TempDir, tempdir};
 
 use super::{
-    ConvertRequest,
+    ConvertRequest, append_suffix, check_output_collision, ensure_nonempty_output,
+    ensure_parent_directory, remove_stale,
     tools::{self, ToolInfo},
+    validate_input,
 };
 use crate::{
     dwg,
@@ -132,10 +134,12 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             keep_intermediate: request.keep_intermediate,
             include_layers: request.include_layers.to_vec(),
             exclude_layers: request.exclude_layers.to_vec(),
+            polygonize_closed: request.polygonize_closed,
         },
         external_tools,
         steps,
         warnings,
+        native: None,
         output: OutputInfo {
             path: request.output.display().to_string(),
             size_bytes: output_size,
@@ -245,60 +249,6 @@ fn quoted_list(names: &[String]) -> String {
         .join(", ")
 }
 
-fn validate_input(input: &Path) -> Result<()> {
-    if !input.is_file() {
-        bail!("input is not a readable file: {}", input.display());
-    }
-    Ok(())
-}
-
-fn check_output_collision(output: &Path, force: bool) -> Result<()> {
-    if output.exists() && !force {
-        bail!(
-            "output already exists: {}; pass --force to replace it",
-            output.display()
-        );
-    }
-    Ok(())
-}
-
-fn ensure_parent_directory(output: &Path) -> Result<()> {
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create output directory {}", parent.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-fn remove_stale(partial: &Path) -> Result<()> {
-    if partial.exists() {
-        fs::remove_file(partial).with_context(|| {
-            format!(
-                "cannot remove stale partial output {} from a previous run",
-                partial.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn ensure_nonempty_output(output: &Path) -> Result<()> {
-    let metadata = fs::metadata(output)
-        .with_context(|| format!("conversion did not create {}", output.display()))?;
-    if metadata.len() == 0 {
-        bail!("conversion created an empty output: {}", output.display());
-    }
-    Ok(())
-}
-
 fn run_checked(mut command: Command, purpose: &str) -> Result<Step> {
     let rendered = render_command(&command);
     let program = command.get_program().to_string_lossy().into_owned();
@@ -371,9 +321,9 @@ fn bounded_text(bytes: &[u8], max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, path::Path};
+    use std::ffi::OsStr;
 
-    use super::{append_suffix, bounded_text, layer_where_clause, render_arg};
+    use super::{bounded_text, layer_where_clause, render_arg};
 
     #[test]
     fn quotes_arguments_with_spaces() {
@@ -410,13 +360,5 @@ mod tests {
     #[test]
     fn no_layer_filter_means_no_clause() {
         assert_eq!(layer_where_clause(&[], &[]), None);
-    }
-
-    #[test]
-    fn append_suffix_keeps_full_file_name() {
-        assert_eq!(
-            append_suffix(Path::new("out/plan a.geojson"), ".partial"),
-            Path::new("out/plan a.geojson.partial")
-        );
     }
 }

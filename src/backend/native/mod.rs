@@ -4,6 +4,8 @@
 //! the CLI is a CAD-neutral, serializable summary. Conversion to GeoJSON is
 //! Milestone 3; this module only reads and reports.
 
+pub mod convert;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
@@ -196,7 +198,7 @@ pub fn layers(path: &Path) -> Result<LayersReport> {
 /// Strict read first; on failure retry in failsafe mode so recoverable
 /// corruption still yields a report instead of nothing. Both failures are
 /// surfaced, never swallowed.
-fn read_document(path: &Path) -> Result<(CadDocument, ReadMode, Vec<String>)> {
+pub(crate) fn read_document(path: &Path) -> Result<(CadDocument, ReadMode, Vec<String>)> {
     let mut reader = DwgReader::from_file(path)
         .with_context(|| format!("cannot open {} for native reading", path.display()))?;
 

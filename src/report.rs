@@ -24,8 +24,47 @@ pub struct ConversionReport {
     pub external_tools: Vec<ToolInfo>,
     pub steps: Vec<Step>,
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeConversionSummary>,
     pub output: OutputInfo,
     pub total_duration_ms: u64,
+}
+
+/// Entity-level accounting for the native backend: everything read is either
+/// converted, skipped with a reason, failed with a reason, or excluded by the
+/// documented model-space filter — the counts must add up.
+#[derive(Debug, Serialize)]
+pub struct NativeConversionSummary {
+    pub read_mode: String,
+    pub read_errors: Vec<String>,
+    pub features_written: usize,
+    pub converted: Vec<ConvertedCount>,
+    pub skipped: Vec<OutcomeCount>,
+    pub failed: Vec<OutcomeCount>,
+    pub excluded: ExcludedCounts,
+    pub feature_warnings: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConvertedCount {
+    pub entity_type: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutcomeCount {
+    pub entity_type: String,
+    pub reason: String,
+    pub count: usize,
+    /// Bounded sample of entity handles (hex) affected by this outcome.
+    pub sample_handles: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExcludedCounts {
+    pub paper_space: usize,
+    pub block_definitions: usize,
+    pub unowned: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +92,7 @@ pub struct ConversionOptions {
     pub keep_intermediate: bool,
     pub include_layers: Vec<String>,
     pub exclude_layers: Vec<String>,
+    pub polygonize_closed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +153,7 @@ mod tests {
                 keep_intermediate: false,
                 include_layers: vec!["EIXO".to_string()],
                 exclude_layers: Vec::new(),
+                polygonize_closed: false,
             },
             external_tools: Vec::new(),
             steps: vec![Step {
@@ -121,6 +162,7 @@ mod tests {
                 duration_ms: 0,
             }],
             warnings: Vec::new(),
+            native: None,
             output: OutputInfo {
                 path: "out.geojson".to_string(),
                 size_bytes: 42,
