@@ -105,7 +105,7 @@ Exit condition: output positioning is explicit, reproducible, and sanity checked
 - [x] Report bounding boxes before and after transformation. (`native.bbox_drawing` and `native.bbox_output` as [min_x, min_y, max_x, max_y]; identical for local-coordinate output.)
 - [x] Detect NaN, infinite, duplicate, empty, and degenerate geometries. (Output-side `native.geometry_checks` pass over the final features; non-finite/empty/degenerate counts raise converter-bug warnings, duplicate consecutive vertices are counted as informational.)
 - [x] Validate polygon ring closure and orientation. (Same pass: every Polygon/MultiPolygon ring is checked for closure, CCW shells/CW holes, and minimum size.)
-- [ ] Add golden GeoJSON tests with coordinate tolerances.
+- [x] Add golden GeoJSON tests with coordinate tolerances. (A synthetic AC1027 fixture pins seven native features; coordinates compare recursively within 1e-9; `UPDATE_GOLDEN=1` regenerates, and a sensitivity test proves the comparator catches 1e-6 drift.)
 - [ ] Add property-based tests for arc tessellation and affine transforms.
 - [ ] Differentially compare native output with LibreDWG/GDAL on a fixture corpus.
 - [ ] Establish acceptable loss thresholds per entity class.
