@@ -953,6 +953,7 @@ fn convert_entity(
         EntityType::Point(point) => convert_point(point, placement),
         EntityType::Line(line) => convert_line(line, placement),
         EntityType::Face3D(face) => convert_face3d(face, placement),
+        EntityType::Solid(solid) => convert_solid(solid, placement),
         EntityType::LwPolyline(polyline) => convert_lwpolyline(polyline, options, placement),
         EntityType::Polyline2D(polyline) => convert_polyline2d(polyline, options, placement),
         EntityType::Polyline3D(polyline) => convert_polyline3d(polyline, options, placement),
@@ -1038,6 +1039,54 @@ fn convert_face3d(face: &acadrust::entities::Face3D, placement: &Placement) -> E
     if count_distinct(&ring) < 3 {
         return EntityOutcome::Skipped(
             "degenerate 3DFACE: fewer than three distinct corners".to_string(),
+        );
+    }
+    if ring.first() != ring.last() {
+        ring.push(ring[0]);
+    }
+    if signed_area(&ring) < 0.0 {
+        ring.reverse();
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+
+    EntityOutcome::Converted {
+        geometry: GeometryValue::new_polygon(vec![ring]),
+        extra_properties: vec![("is_closed", JsonValue::from(true))],
+        warnings,
+    }
+}
+
+/// DXF SOLID corners live in OCS and are stored in bow-tie order: the
+/// visual quad is first, second, fourth, third; triangles duplicate the
+/// third corner into the fourth.
+fn convert_solid(solid: &acadrust::entities::Solid, placement: &Placement) -> EntityOutcome {
+    let corners = [
+        solid.first_corner,
+        solid.second_corner,
+        solid.fourth_corner,
+        solid.third_corner,
+    ];
+    if corners.iter().any(|corner| !is_finite(corner)) || !is_finite(&solid.normal) {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+
+    let ocs_to_wcs = Matrix3::arbitrary_axis(solid.normal);
+    let mut ring: Vec<(f64, f64)> = Vec::with_capacity(5);
+    let mut max_abs_z: f64 = 0.0;
+    for corner in corners {
+        let wcs = ocs_to_wcs.transform_point(corner);
+        let Some(position) = project(placement, wcs, &mut max_abs_z) else {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        };
+        ring.push(position);
+    }
+    ring.dedup();
+
+    if count_distinct(&ring) < 3 {
+        return EntityOutcome::Skipped(
+            "degenerate SOLID: fewer than three distinct corners".to_string(),
         );
     }
     if ring.first() != ring.last() {
@@ -3003,13 +3052,11 @@ mod tests {
     fn unsupported_types_are_counted_and_paper_space_is_excluded() {
         let mut document = CadDocument::with_version(DxfVersion::AC1027);
         document
-            .add_entity(EntityType::Solid(acadrust::entities::Solid::new(
+            .add_entity(EntityType::Ray(acadrust::entities::Ray::new(
                 acadrust::types::Vector3::new(0.0, 0.0, 0.0),
                 acadrust::types::Vector3::new(1.0, 0.0, 0.0),
-                acadrust::types::Vector3::new(0.0, 1.0, 0.0),
-                acadrust::types::Vector3::new(1.0, 1.0, 0.0),
             )))
-            .expect("add solid");
+            .expect("add ray");
         document
             .add_entity(EntityType::Point(Point::from_coords(1.0, 1.0, 0.0)))
             .expect("add point");
@@ -3024,7 +3071,7 @@ mod tests {
         assert_eq!(extraction.excluded_paper_space, 1);
         let skipped: Vec<_> = extraction.skipped.keys().collect();
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].0, "SOLID");
+        assert_eq!(skipped[0].0, "RAY");
         let samples = extraction.skipped.values().next().expect("skip entry");
         assert_eq!(samples.count, 1);
         assert_eq!(samples.samples.len(), 1);
@@ -3709,6 +3756,72 @@ mod tests {
                 assert!(warnings.iter().any(|w| w.contains("dropped")));
             }
             other => panic!("mixed hatch must convert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn solid_bowtie_corner_order_becomes_a_proper_quad() {
+        use acadrust::entities::Solid;
+        use acadrust::types::Vector3;
+
+        // DXF stores the quad as 1,2,3,4 with 3/4 swapped visually: this
+        // input is a unit square only when read as first-second-fourth-third.
+        let solid = Solid::new(
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(1.0, 1.0, 0.0),
+        );
+        match convert_entity(&EntityType::Solid(solid), &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => {
+                let GeometryValue::Polygon { coordinates } = geometry else {
+                    panic!("expected Polygon");
+                };
+                let ring = ring_tuples(&coordinates[0]);
+                assert_eq!(ring.len(), 5);
+                assert_eq!(ring.first(), ring.last());
+                assert!(signed_area(&ring) > 0.0, "ring must be CCW");
+                // A proper square has area 1; a bow-tie would cancel to ~0.
+                assert!(
+                    (signed_area(&ring) - 1.0).abs() < 1e-9,
+                    "corner order must untwist the bow-tie: area {}",
+                    signed_area(&ring)
+                );
+            }
+            other => panic!("solid must convert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triangular_and_degenerate_solids() {
+        use acadrust::entities::Solid;
+        use acadrust::types::Vector3;
+
+        let triangle = Solid::new(
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(2.0, 0.0, 0.0),
+            Vector3::new(1.0, 2.0, 0.0),
+            Vector3::new(1.0, 2.0, 0.0),
+        );
+        match convert_entity(&EntityType::Solid(triangle), &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => {
+                let GeometryValue::Polygon { coordinates } = geometry else {
+                    panic!("expected Polygon");
+                };
+                assert_eq!(coordinates[0].len(), 4, "triangle ring has 4 positions");
+            }
+            other => panic!("triangular solid must convert, got {other:?}"),
+        }
+
+        let degenerate = Solid::new(
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::new(1.0, 1.0, 0.0),
+        );
+        match convert_entity(&EntityType::Solid(degenerate), &opts(false)) {
+            EntityOutcome::Skipped(reason) => assert!(reason.contains("degenerate"), "{reason}"),
+            other => panic!("degenerate solid must be skipped, got {other:?}"),
         }
     }
 }

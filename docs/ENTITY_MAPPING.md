@@ -18,7 +18,7 @@
 | TEXT / MTEXT | Point | Store text, rotation, height, style, alignment, and layer. |
 | INSERT | Expanded child features or Point/reference | Compose nested transforms and preserve block path. Native backend: expanded by default (translation, normal orientation, rotation, non-uniform scale, MINSERT grids, nesting up to 16 levels; recursion and missing definitions fail with reasons); `--preserve-inserts` emits anchor Points with `block_name` and `attributes`; block content on layer "0" inherits the insert's effective layer (`source_layer` keeps the original). |
 | DIMENSION | Expanded graphics and/or semantic properties | Initially report unsupported rather than silently flattening incorrectly. |
-| SOLID / TRACE | Polygon | Validate vertex ordering. |
+| SOLID / TRACE | Polygon | Validate vertex ordering. Native backend: SOLID converts as a CCW Polygon with the DXF bow-tie order (1-2-4-3) untwisted, OCS corners lifted via the arbitrary axis, duplicate triangle corners collapsed, and degenerate solids skipped; TRACE is not exposed by acadrust 0.4.1. |
 | RAY / XLINE | Unsupported by default | Infinite geometry needs clipping bounds. |
 | ACIS 3D solids | Unsupported initially | Report counts and handles; do not pretend to preserve solids in GeoJSON. |
 
