@@ -109,6 +109,8 @@ Exit condition: output positioning is explicit, reproducible, and sanity checked
 - [ ] Add property-based tests for arc tessellation and affine transforms.
 - [ ] Differentially compare native output with LibreDWG/GDAL on a fixture corpus.
 - [ ] Establish acceptable loss thresholds per entity class.
+- [ ] Detect spatial outliers relative to the main coordinate cluster (dispersion/percentile based). Motivated by the reference drawing: ~18% of features are title blocks and legends near the drawing origin that reproject into geometry scattered across ±50° of longitude without tripping the global WGS 84 extent check.
+- [ ] Validate output containment against a reference boundary polygon (e.g. an IBGE municipal boundary fetched by `scripts/fetch-sorocaba-boundary.sh`); this technique conclusively identified the reference drawing's CRS.
 
 Exit condition: releases have measurable correctness criteria rather than visual confidence alone.
 
