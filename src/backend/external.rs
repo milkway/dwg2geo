@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
@@ -18,23 +19,68 @@ use super::{
 };
 use crate::{
     dwg,
-    report::{self, ConversionOptions, ConversionReport, Generator, OutputInfo, Step},
+    report::{
+        self, ConversionOptions, ConversionReport, ExternalSummary, ExternalToolDiagnostic,
+        Generator, OutputInfo, Step,
+    },
 };
 
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     healthy: bool,
+    routes: DoctorRoutes,
     tools: Vec<ToolInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorRoutes {
+    local_coordinates: RouteCapability,
+    reprojection: RouteCapability,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteCapability {
+    available: bool,
+    required_tools: Vec<&'static str>,
+}
+
+impl DoctorRoutes {
+    fn from_tools(tools: &[ToolInfo]) -> Self {
+        let available = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .is_some_and(ToolInfo::is_available)
+        };
+        let dwgread = available("dwgread");
+        Self {
+            local_coordinates: RouteCapability {
+                available: dwgread,
+                required_tools: vec!["dwgread"],
+            },
+            reprojection: RouteCapability {
+                available: dwgread && available("ogr2ogr"),
+                required_tools: vec!["dwgread", "ogr2ogr"],
+            },
+        }
+    }
+
+    fn healthy(&self) -> bool {
+        self.local_coordinates.available && self.reprojection.available
+    }
 }
 
 pub fn doctor(json: bool) -> Result<()> {
     let tools = tools::probe_external_tools();
-    let healthy = tools
-        .iter()
-        .all(|tool| !tool.required || tool.is_available());
+    let routes = DoctorRoutes::from_tools(&tools);
+    let healthy = routes.healthy();
 
     if json {
-        let report = DoctorReport { healthy, tools };
+        let report = DoctorReport {
+            healthy,
+            routes,
+            tools,
+        };
         println!("{}", serde_json::to_string_pretty(&report)?);
         if !report.healthy {
             bail!("required external tools are not usable; see the JSON tool list");
@@ -45,6 +91,14 @@ pub fn doctor(json: bool) -> Result<()> {
     for tool in &tools {
         println!("{}: {}", tool.name, tool.human_status());
     }
+    println!(
+        "local-coordinates route: {} (requires dwgread)",
+        capability_status(routes.local_coordinates.available)
+    );
+    println!(
+        "reprojection route: {} (requires dwgread + ogr2ogr)",
+        capability_status(routes.reprojection.available)
+    );
 
     if !healthy {
         let missing: Vec<&str> = tools
@@ -59,6 +113,14 @@ pub fn doctor(json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn capability_status(available: bool) -> &'static str {
+    if available {
+        "available"
+    } else {
+        "unavailable"
+    }
 }
 
 pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
@@ -103,10 +165,24 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     remove_stale(&partial)?;
 
     let mut steps = Vec::new();
+    let mut external_diagnostics = Vec::new();
     let run = if let Some(source_crs) = request.source_crs {
-        convert_with_reprojection(request, source_crs, &partial, &mut steps, &mut warnings)
+        convert_with_reprojection(
+            request,
+            source_crs,
+            &partial,
+            &mut steps,
+            &mut external_diagnostics,
+            &mut warnings,
+        )
     } else if request.allow_local_coordinates {
-        convert_local_coordinates(request, &partial, &mut steps, &mut warnings)
+        convert_local_coordinates(
+            request,
+            &partial,
+            &mut steps,
+            &mut external_diagnostics,
+            &mut warnings,
+        )
     } else {
         bail!(
             "internal validation error: neither a source CRS nor local-coordinate permission was provided"
@@ -115,11 +191,15 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
 
     let run = run
         .and_then(|()| ensure_nonempty_output(&partial))
-        .and_then(|()| ensure_well_formed_json(&partial));
-    if let Err(error) = run {
-        let _ = fs::remove_file(&partial);
-        return Err(error);
-    }
+        .and_then(|()| ensure_well_formed_json(&partial))
+        .and_then(|()| summarize_external_output(&partial));
+    let external_summary = match run {
+        Ok(summary) => summary,
+        Err(error) => {
+            let _ = fs::remove_file(&partial);
+            return Err(error);
+        }
+    };
 
     fs::rename(&partial, request.output).with_context(|| {
         format!(
@@ -165,7 +245,12 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     };
 
     let report_file = report::report_path(request.output);
-    report::write(&conversion_report, &report_file)?;
+    report::write_external(
+        &conversion_report,
+        &external_diagnostics,
+        &external_summary,
+        &report_file,
+    )?;
 
     eprintln!("wrote {}", request.output.display());
     eprintln!("wrote report {}", report_file.display());
@@ -178,9 +263,10 @@ fn convert_with_reprojection(
     source_crs: &str,
     partial: &Path,
     steps: &mut Vec<Step>,
-    _warnings: &mut Vec<String>,
+    diagnostics: &mut Vec<ExternalToolDiagnostic>,
+    warnings: &mut Vec<String>,
 ) -> Result<()> {
-    let (dxf_path, _temporary): (PathBuf, Option<TempDir>) = if request.keep_intermediate {
+    let (dxf_path, temporary): (PathBuf, Option<TempDir>) = if request.keep_intermediate {
         (append_suffix(request.output, ".intermediate.dxf"), None)
     } else {
         let temporary = tempdir().context("cannot create temporary conversion directory")?;
@@ -194,7 +280,16 @@ fn convert_with_reprojection(
         .arg("-o")
         .arg(&dxf_path)
         .arg(request.input);
-    steps.push(run_checked(dwgread, "LibreDWG conversion to DXF")?);
+    record_run(
+        run_checked(
+            dwgread,
+            "LibreDWG conversion to DXF",
+            temporary.as_ref().map(TempDir::path),
+        )?,
+        steps,
+        diagnostics,
+        warnings,
+    );
 
     let mut ogr2ogr = Command::new("ogr2ogr");
     ogr2ogr
@@ -212,7 +307,16 @@ fn convert_with_reprojection(
     }
 
     ogr2ogr.arg(partial).arg(&dxf_path);
-    steps.push(run_checked(ogr2ogr, "GDAL conversion and reprojection")?);
+    record_run(
+        run_checked(
+            ogr2ogr,
+            "GDAL conversion and reprojection",
+            temporary.as_ref().map(TempDir::path),
+        )?,
+        steps,
+        diagnostics,
+        warnings,
+    );
 
     if request.keep_intermediate {
         eprintln!("kept intermediate DXF {}", dxf_path.display());
@@ -225,6 +329,7 @@ fn convert_local_coordinates(
     request: &ConvertRequest<'_>,
     partial: &Path,
     steps: &mut Vec<Step>,
+    diagnostics: &mut Vec<ExternalToolDiagnostic>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     if request.keep_intermediate {
@@ -242,7 +347,12 @@ fn convert_local_coordinates(
         .arg(partial)
         .arg(request.input);
 
-    steps.push(run_checked(dwgread, "LibreDWG direct GeoJSON conversion")?);
+    record_run(
+        run_checked(dwgread, "LibreDWG direct GeoJSON conversion", None)?,
+        steps,
+        diagnostics,
+        warnings,
+    );
     Ok(())
 }
 
@@ -285,8 +395,87 @@ fn ensure_well_formed_json(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_checked(mut command: Command, purpose: &str) -> Result<Step> {
-    let rendered = render_command(&command);
+#[derive(Deserialize)]
+struct ExternalFeatureCollection {
+    #[serde(rename = "type")]
+    kind: String,
+    features: Vec<ExternalFeature>,
+}
+
+#[derive(Deserialize)]
+struct ExternalFeature {
+    #[serde(default)]
+    geometry: Option<ExternalGeometry>,
+}
+
+#[derive(Deserialize)]
+struct ExternalGeometry {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+fn summarize_external_output(path: &Path) -> Result<ExternalSummary> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("cannot reopen {} for reconciliation", path.display()))?;
+    let collection: ExternalFeatureCollection =
+        serde_json::from_reader(std::io::BufReader::new(file))
+            .with_context(|| format!("cannot parse {} for reconciliation", path.display()))?;
+    if collection.kind != "FeatureCollection" {
+        bail!("the conversion tool did not produce a GeoJSON FeatureCollection");
+    }
+
+    let mut geometry_type_counts = BTreeMap::new();
+    for feature in &collection.features {
+        let geometry_type = feature
+            .geometry
+            .as_ref()
+            .map_or("<null>", |geometry| geometry.kind.as_str());
+        *geometry_type_counts
+            .entry(geometry_type.to_string())
+            .or_insert(0) += 1;
+    }
+
+    Ok(ExternalSummary {
+        total_features: collection.features.len(),
+        geometry_type_counts,
+    })
+}
+
+struct CheckedRun {
+    step: Step,
+    stdout_excerpt: Option<String>,
+    stderr_excerpt: Option<String>,
+}
+
+fn record_run(
+    run: CheckedRun,
+    steps: &mut Vec<Step>,
+    diagnostics: &mut Vec<ExternalToolDiagnostic>,
+    warnings: &mut Vec<String>,
+) {
+    let step_index = steps.len();
+    if let Some(stderr) = &run.stderr_excerpt {
+        warnings.push(format!(
+            "external tool emitted stderr during {}: {stderr}",
+            run.step.purpose
+        ));
+    }
+    if run.stdout_excerpt.is_some() || run.stderr_excerpt.is_some() {
+        diagnostics.push(ExternalToolDiagnostic {
+            step_index,
+            stdout_excerpt: run.stdout_excerpt,
+            stderr_excerpt: run.stderr_excerpt,
+        });
+    }
+    steps.push(run.step);
+}
+
+fn run_checked(
+    mut command: Command,
+    purpose: &str,
+    temporary_directory: Option<&Path>,
+) -> Result<CheckedRun> {
+    let rendered = render_command(&command, temporary_directory);
     let program = command.get_program().to_string_lossy().into_owned();
 
     let started = Instant::now();
@@ -303,10 +492,14 @@ fn run_checked(mut command: Command, purpose: &str) -> Result<Step> {
     let duration_ms = started.elapsed().as_millis() as u64;
 
     if output.status.success() {
-        return Ok(Step {
-            purpose: purpose.to_string(),
-            command: rendered,
-            duration_ms,
+        return Ok(CheckedRun {
+            step: Step {
+                purpose: purpose.to_string(),
+                command: rendered,
+                duration_ms,
+            },
+            stdout_excerpt: bounded_excerpt(&output.stdout, 2_000),
+            stderr_excerpt: bounded_excerpt(&output.stderr, 2_000),
         });
     }
 
@@ -321,12 +514,16 @@ fn run_checked(mut command: Command, purpose: &str) -> Result<Step> {
     )
 }
 
-fn render_command(command: &Command) -> String {
-    std::iter::once(command.get_program())
+fn render_command(command: &Command, temporary_directory: Option<&Path>) -> String {
+    let rendered = std::iter::once(command.get_program())
         .chain(command.get_args())
         .map(render_arg)
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    match temporary_directory {
+        Some(directory) => rendered.replace(directory.to_string_lossy().as_ref(), "<tmp>"),
+        None => rendered,
+    }
 }
 
 fn render_arg(value: &OsStr) -> String {
@@ -353,6 +550,16 @@ fn bounded_text(bytes: &[u8], max_bytes: usize) -> String {
         boundary -= 1;
     }
     format!("{}… [truncated]", trimmed[..boundary].trim())
+}
+
+fn bounded_excerpt(bytes: &[u8], max_bytes: usize) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(bounded_text(bytes, max_bytes))
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -8,7 +9,9 @@ use serde::Serialize;
 
 use crate::{backend::tools::ToolInfo, dwg::DwgInfo};
 
-pub const REPORT_VERSION: u32 = 1;
+/// Conversion-report schema version. Any field addition or semantic change
+/// bumps this value; consumers must treat unknown fields as additive.
+pub const REPORT_VERSION: u32 = 2;
 
 /// Sidecar conversion report written next to the GeoJSON output.
 ///
@@ -241,6 +244,24 @@ pub struct Step {
     pub duration_ms: u64,
 }
 
+/// Captured output from a successful external-tool step. Only non-empty
+/// streams are serialized, and excerpts are bounded by the caller.
+#[derive(Debug, Serialize)]
+pub struct ExternalToolDiagnostic {
+    pub step_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_excerpt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_excerpt: Option<String>,
+}
+
+/// Reconciliation of the GeoJSON delivered by the external backend.
+#[derive(Debug, Serialize)]
+pub struct ExternalSummary {
+    pub total_features: usize,
+    pub geometry_type_counts: BTreeMap<String, usize>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct OutputInfo {
     pub path: String,
@@ -254,9 +275,41 @@ pub fn report_path(output: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+#[cfg(feature = "native-backend")]
 pub fn write(report: &ConversionReport, path: &Path) -> Result<()> {
+    write_serializable(report, path)
+}
+
+/// Write the common report plus external-backend-only diagnostics. Keeping
+/// these fields in a serialization wrapper avoids leaking external concerns
+/// into native report construction.
+pub fn write_external(
+    report: &ConversionReport,
+    diagnostics: &[ExternalToolDiagnostic],
+    summary: &ExternalSummary,
+    path: &Path,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct ExternalReport<'a> {
+        #[serde(flatten)]
+        common: &'a ConversionReport,
+        external_diagnostics: &'a [ExternalToolDiagnostic],
+        external_summary: &'a ExternalSummary,
+    }
+
+    write_serializable(
+        &ExternalReport {
+            common: report,
+            external_diagnostics: diagnostics,
+            external_summary: summary,
+        },
+        path,
+    )
+}
+
+fn write_serializable(value: &impl Serialize, path: &Path) -> Result<()> {
     let mut json =
-        serde_json::to_string_pretty(report).context("cannot serialize conversion report")?;
+        serde_json::to_string_pretty(value).context("cannot serialize conversion report")?;
     json.push('\n');
     fs::write(path, json)
         .with_context(|| format!("cannot write conversion report {}", path.display()))

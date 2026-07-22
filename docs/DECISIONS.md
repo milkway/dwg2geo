@@ -71,3 +71,9 @@ Invoking an installed LibreDWG executable is architecturally separate from linki
 **Status:** accepted.
 
 The roadmap phrase "local affine calibration" is implemented as a 4-parameter similarity (Helmert) fit, not a 6-parameter affine. A full affine can shear and scale axes independently, distorting angles and proportions of engineering geometry in ways no residual report would make obvious. Rotation, uniform scale, and translation establish a local georeference without introducing distortions; residuals, RMS, and max error quantify how well the drawing actually fits that model.
+
+## ADR-013 — Doctor health requires both external routes
+
+**Status:** accepted.
+
+The external backend has two documented capabilities: local-coordinate export requires `dwgread`, while CRS-explicit reprojection requires both `dwgread` and `ogr2ogr`. `doctor` reports both route capabilities explicitly, and its overall `healthy` value and exit status are successful only when both routes are available. A system with only `dwgread` remains usable for explicitly opted-in local coordinates, but is reported as degraded rather than healthy because the canonical CRS-explicit route is unavailable.
