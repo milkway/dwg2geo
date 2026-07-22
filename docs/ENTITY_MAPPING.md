@@ -67,24 +67,39 @@ These variants currently produce explicit skipped/report diagnostics. The intend
 | `EntityType::Ole2Frame` | OLE2FRAME | Report-only initially, with footprint and object metadata when available; never embed opaque object data in GeoJSON. | Not recorded. |
 | `EntityType::PolygonMesh` | polygon mesh | Polygon/MultiPolygon faces after mesh topology, projection, winding, and Z policies are defined. | Not recorded. |
 
-## Feature properties
+## Feature properties (canonical schema, v1)
 
-Recommended minimum properties:
+The shipped property names below are the canonical schema (ADR-014); the
+earlier `cad_*`-prefixed sketch is superseded. The committed golden file
+(`tests/golden/native-basic.geojson`) pins this schema; renames are breaking
+changes that require a schema-version decision, a golden regeneration, and a
+migration note.
+
+Always present:
 
 ```json
 {
-  "cad_entity_type": "LWPOLYLINE",
-  "cad_layer": "EIXO_PROJ",
-  "cad_handle": "1A2B",
-  "cad_space": "model",
-  "cad_block_path": ["BLOCO_A", "SUB_BLOCO"],
-  "cad_closed": true,
-  "cad_approximated": true,
-  "cad_warning_codes": ["CURVE_TESSELLATED"]
+  "entity_type": "LWPOLYLINE",
+  "layer": "EIXO_PROJ",
+  "handle": "0x1A2B",
+  "space": "model"
 }
 ```
 
-Optional style fields may include color, line type, line weight, text style, and visibility. Keep style separate from geometry correctness.
+Conditionally present: `source_layer` (original layer when block content on
+layer "0" inherited the insert's layer), `block_path` (slash-joined chain,
+e.g. `"BLOCO_A/SUB_BLOCO"`), `is_closed`, `approximated`, `warnings`
+(free-text array; machine-readable warning codes remain an open roadmap
+idea), text properties (`text`, `text_raw`, `text_height`,
+`text_rotation_deg`, `text_style`, and layout properties when non-default),
+INSERT anchor properties (`block_name`, `rotation_deg`, `attributes`), hatch
+properties (`hatch_pattern`, `hatch_solid`, `hatch_loops_dropped`).
+
+Resolved style, always present: `color_index` (ACI 1-255) and/or `color_rgb`
+(`#RRGGBB`) after resolving ByLayer through the effective layer and ByBlock
+through the enclosing insert chain, or the raw policy string in `color` when
+unresolvable; `linetype` resolved the same way. Unresolvable policies are
+emitted verbatim — never silently dropped.
 
 The native backend emits resolved style properties on every feature: `color_index` (ACI 1-255) and/or `color_rgb` (`#RRGGBB`) after resolving ByLayer through the effective layer and ByBlock through the enclosing insert chain; `linetype` resolved the same way. Policies that cannot be resolved (missing layer, ByBlock outside a block) are emitted verbatim as `color`/`linetype` strings — never silently dropped.
 

@@ -77,3 +77,9 @@ The roadmap phrase "local affine calibration" is implemented as a 4-parameter si
 **Status:** accepted.
 
 The external backend has two documented capabilities: local-coordinate export requires `dwgread`, while CRS-explicit reprojection requires both `dwgread` and `ogr2ogr`. `doctor` reports both route capabilities explicitly, and its overall `healthy` value and exit status are successful only when both routes are available. A system with only `dwgread` remains usable for explicitly opted-in local coordinates, but is reported as degraded rather than healthy because the canonical CRS-explicit route is unavailable.
+
+## ADR-014 — The shipped feature-property schema is canonical
+
+**Status:** accepted.
+
+`docs/ENTITY_MAPPING.md` originally sketched `cad_*`-prefixed property names (`cad_entity_type`, `cad_layer`, array `cad_block_path`, `cad_warning_codes`). The implementation shipped unprefixed names (`entity_type`, `layer`, slash-joined `block_path`, free-text `warnings`), the committed golden file pins them, and downstream consumers see them today. Renaming to the sketch would break every consumer for cosmetic benefit. Decision: the shipped names are the canonical v1 schema, documented exhaustively in ENTITY_MAPPING.md; the sketch is superseded. Property renames are breaking changes requiring a schema-version decision, golden regeneration, and a migration note. Machine-readable warning codes (in addition to free text) remain a recorded open idea, not a promise.

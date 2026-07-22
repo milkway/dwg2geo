@@ -2341,18 +2341,29 @@ fn boundary_edge_points(
                 return Err("spline boundary edge with an empty parameter domain".to_string());
             }
             let spans = control_count - degree;
-            let segments =
-                (spans * SPLINE_SEGMENTS_PER_SPAN).clamp(SPLINE_MIN_SEGMENTS, MAX_ARC_SEGMENTS);
             *approximated = true;
-            let mut points = Vec::with_capacity(segments + 1);
-            for i in 0..=segments {
-                let t = domain_start + (domain_end - domain_start) * (i as f64) / (segments as f64);
-                let Some(point) = evaluate_nurbs(t, degree, &spline.knots, &homogeneous) else {
-                    return Err("spline boundary edge evaluated to a non-finite point".to_string());
-                };
-                points.push((point.0, point.1));
+            let Some(NurbsSampling {
+                points,
+                tolerance_met,
+                ..
+            }) = sample_nurbs_with_tolerance(
+                degree,
+                &spline.knots,
+                &homogeneous,
+                domain_start,
+                domain_end,
+                spans,
+                options.curve_tolerance,
+            )
+            else {
+                return Err("spline boundary edge evaluated to a non-finite point".to_string());
+            };
+            if !tolerance_met {
+                warnings.push(format!(
+                    "spline boundary edge capped at {MAX_ARC_SEGMENTS} segments; chord tolerance not met"
+                ));
             }
-            Ok(points)
+            Ok(points.into_iter().map(|point| (point.0, point.1)).collect())
         }
     }
 }
@@ -2392,10 +2403,56 @@ fn assemble_hatch_polygons(mut rings: Vec<Vec<(f64, f64)>>) -> GeometryValue {
             ring.reverse();
         }
     }
+    // Containment is pairwise, so hatches with many loops are quadratic in
+    // loop count; the bbox pre-check makes the common disjoint-loop pair an
+    // O(1) reject instead of a full ray cast (audit finding C2).
+    let bboxes: Vec<[f64; 4]> = rings
+        .iter()
+        .map(|ring| {
+            let mut bbox = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+            for (x, y) in ring {
+                bbox = [
+                    bbox[0].min(*x),
+                    bbox[1].min(*y),
+                    bbox[2].max(*x),
+                    bbox[3].max(*y),
+                ];
+            }
+            bbox
+        })
+        .collect();
+    let contains = |ring_index: usize, point: (f64, f64)| -> bool {
+        let bbox = &bboxes[ring_index];
+        point.0 >= bbox[0]
+            && point.0 <= bbox[2]
+            && point.1 >= bbox[1]
+            && point.1 <= bbox[3]
+            && ring_contains_point(&rings[ring_index], point)
+    };
+    // Uniform x-grid over the ring bboxes: candidate rings for a probe are
+    // those sharing its x-cell, which makes the disjoint-loop case (the
+    // common one) near-linear instead of all-pairs.
+    let (grid_min_x, grid_cell) = {
+        let min_x = bboxes.iter().fold(f64::MAX, |m, b| m.min(b[0]));
+        let max_x = bboxes.iter().fold(f64::MIN, |m, b| m.max(b[2]));
+        let width = (max_x - min_x).max(f64::MIN_POSITIVE);
+        (min_x, width / (rings.len().max(1) as f64))
+    };
+    let cell_of = |x: f64| -> usize { ((x - grid_min_x) / grid_cell) as usize };
+    let mut grid: Vec<Vec<usize>> = vec![Vec::new(); rings.len() + 2];
+    for (index, bbox) in bboxes.iter().enumerate() {
+        let last = grid.len() - 1;
+        let (first_cell, last_cell) = (cell_of(bbox[0]).min(last), cell_of(bbox[2]).min(last));
+        for cell in grid[first_cell..=last_cell].iter_mut() {
+            cell.push(index);
+        }
+    }
     let depths: Vec<usize> = (0..rings.len())
         .map(|i| {
-            (0..rings.len())
-                .filter(|&j| j != i && ring_contains_point(&rings[j], rings[i][0]))
+            let probe = rings[i][0];
+            grid[cell_of(probe.0).min(grid.len() - 1)]
+                .iter()
+                .filter(|&&j| j != i && contains(j, probe))
                 .count()
         })
         .collect();
@@ -2414,7 +2471,7 @@ fn assemble_hatch_polygons(mut rings: Vec<Vec<(f64, f64)>>) -> GeometryValue {
         let probe = ring[0];
         let shell = polygons
             .iter_mut()
-            .filter(|(shell_index, _)| ring_contains_point(&rings[*shell_index], probe))
+            .filter(|(shell_index, _)| contains(*shell_index, probe))
             .max_by_key(|(shell_index, _)| depths[*shell_index]);
         let mut hole = ring.clone();
         hole.reverse();
@@ -2986,8 +3043,73 @@ fn convert_ellipse(
 }
 
 /// Fixed sampling density for spline evaluation, per knot span.
-const SPLINE_SEGMENTS_PER_SPAN: usize = 8;
-const SPLINE_MIN_SEGMENTS: usize = 16;
+const SPLINE_SEGMENTS_PER_SPAN: usize = 2;
+const SPLINE_MIN_SEGMENTS: usize = 8;
+
+/// Uniform NURBS sampling with the smallest segment count (doubling from a
+/// span-based floor) whose estimated chord error meets `tolerance`. The
+/// error estimate is the deviation of the curve at each segment's parameter
+/// midpoint from the segment chord's midpoint — the standard subdivision
+/// bound for smooth curves. Returns the 3D samples, the segment count used,
+/// and whether the tolerance was met before the segment cap; None when
+/// evaluation produces a non-finite or zero-weight point.
+#[allow(clippy::too_many_arguments)]
+fn sample_nurbs_with_tolerance(
+    degree: usize,
+    knots: &[f64],
+    homogeneous: &[[f64; 4]],
+    domain_start: f64,
+    domain_end: f64,
+    spans: usize,
+    tolerance: f64,
+) -> Option<NurbsSampling> {
+    let mut segments =
+        (spans * SPLINE_SEGMENTS_PER_SPAN).clamp(SPLINE_MIN_SEGMENTS, MAX_ARC_SEGMENTS);
+    loop {
+        let mut points = Vec::with_capacity(segments + 1);
+        for i in 0..=segments {
+            let t = domain_start + (domain_end - domain_start) * (i as f64) / (segments as f64);
+            points.push(evaluate_nurbs(t, degree, knots, homogeneous)?);
+        }
+
+        let mut max_error: f64 = 0.0;
+        for i in 0..segments {
+            let t_mid =
+                domain_start + (domain_end - domain_start) * (i as f64 + 0.5) / (segments as f64);
+            let on_curve = evaluate_nurbs(t_mid, degree, knots, homogeneous)?;
+            let (a, b) = (points[i], points[i + 1]);
+            let chord_mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0, (a.2 + b.2) / 2.0);
+            let error = ((on_curve.0 - chord_mid.0).powi(2)
+                + (on_curve.1 - chord_mid.1).powi(2)
+                + (on_curve.2 - chord_mid.2).powi(2))
+            .sqrt();
+            max_error = max_error.max(error);
+        }
+
+        if max_error <= tolerance {
+            return Some(NurbsSampling {
+                points,
+                segments,
+                tolerance_met: true,
+            });
+        }
+        if segments >= MAX_ARC_SEGMENTS {
+            return Some(NurbsSampling {
+                points,
+                segments,
+                tolerance_met: false,
+            });
+        }
+        segments = (segments * 2).min(MAX_ARC_SEGMENTS);
+    }
+}
+
+/// Result of [`sample_nurbs_with_tolerance`].
+struct NurbsSampling {
+    points: Vec<(f64, f64, f64)>,
+    segments: usize,
+    tolerance_met: bool,
+}
 
 /// Evaluate the NURBS control net with de Boor's algorithm; when the NURBS
 /// data is invalid, fall back to a polyline through the fit points rather
@@ -3053,17 +3175,28 @@ fn convert_spline(
     }
 
     let spans = control_count - degree;
-    let segments = (spans * SPLINE_SEGMENTS_PER_SPAN).clamp(SPLINE_MIN_SEGMENTS, MAX_ARC_SEGMENTS);
+    let Some(NurbsSampling {
+        points,
+        segments,
+        tolerance_met,
+    }) = sample_nurbs_with_tolerance(
+        degree,
+        &spline.knots,
+        &homogeneous,
+        domain_start,
+        domain_end,
+        spans,
+        options.curve_tolerance,
+    )
+    else {
+        return EntityOutcome::Failed(
+            "spline evaluation produced a non-finite or zero-weight point".to_string(),
+        );
+    };
 
-    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(segments + 1);
+    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(points.len());
     let mut max_abs_z: f64 = 0.0;
-    for i in 0..=segments {
-        let t = domain_start + (domain_end - domain_start) * (i as f64) / (segments as f64);
-        let Some(point) = evaluate_nurbs(t, degree, &spline.knots, &homogeneous) else {
-            return EntityOutcome::Failed(
-                "spline evaluation produced a non-finite or zero-weight point".to_string(),
-            );
-        };
+    for point in points {
         let Some(position) = project(
             placement,
             Vector3::new(point.0, point.1, point.2),
@@ -3076,10 +3209,16 @@ fn convert_spline(
 
     let mut warnings = Vec::new();
     push_z_warning(&mut warnings, max_abs_z);
-    warnings.push(format!(
-        "spline sampled at {} points with uniform parameter spacing; chord tolerance is not applied to splines yet",
-        segments + 1
-    ));
+    if tolerance_met {
+        warnings.push(format!(
+            "spline tessellated at {} segments to meet chord tolerance {} drawing units",
+            segments, options.curve_tolerance
+        ));
+    } else {
+        warnings.push(format!(
+            "spline tessellation capped at {MAX_ARC_SEGMENTS} segments; chord tolerance not met"
+        ));
+    }
     finish_coordinates(
         coordinates,
         spline.flags.closed,
@@ -3732,7 +3871,12 @@ mod tests {
                     }
                     other => panic!("expected LineString, got {other:?}"),
                 }
-                assert!(warnings.iter().any(|w| w.contains("spline sampled")));
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|w| w.contains("spline tessellated") && w.contains("chord tolerance")),
+                    "{warnings:?}"
+                );
             }
             _ => panic!("spline must convert"),
         }
@@ -5297,6 +5441,43 @@ mod tests {
             properties.get("layer"),
             Some(&geojson::JsonValue::from("EIXO"))
         );
+    }
+
+    #[test]
+    fn spline_sampling_is_tolerance_driven() {
+        use acadrust::entities::Spline;
+        use acadrust::types::Vector3;
+
+        let make = || {
+            let mut spline = Spline::new();
+            spline.degree = 2;
+            spline.control_points = vec![
+                Vector3::new(0.0, 0.0, 0.0),
+                Vector3::new(50.0, 100.0, 0.0),
+                Vector3::new(100.0, 0.0, 0.0),
+            ];
+            spline.knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+            spline
+        };
+        let count = |tolerance: f64| -> usize {
+            let mut options = opts(false);
+            options.curve_tolerance = tolerance;
+            match convert_entity(&EntityType::Spline(make()), &options) {
+                EntityOutcome::Converted { geometry, .. } => match geometry {
+                    GeometryValue::LineString { coordinates } => coordinates.len(),
+                    other => panic!("expected LineString, got {other:?}"),
+                },
+                other => panic!("spline must convert, got {other:?}"),
+            }
+        };
+
+        let coarse = count(5.0);
+        let fine = count(0.01);
+        assert!(
+            fine > coarse,
+            "finer tolerance must sample more: coarse {coarse}, fine {fine}"
+        );
+        assert!(coarse >= 9, "span floor applies: {coarse}");
     }
 
     mod properties {
