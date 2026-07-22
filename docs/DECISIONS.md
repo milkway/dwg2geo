@@ -59,3 +59,15 @@ Invoking an installed LibreDWG executable is architecturally separate from linki
 **Status:** accepted.
 
 `acadrust`'s failsafe mode returns an empty default document even for garbage input. The native backend therefore parses strictly first and retries in failsafe mode only on failure; a failsafe result is accepted only if it contains entities or non-default layers, is labeled `failsafe_recovery`, and carries the strict-parse error. An empty recovery is reported as a parse failure, never as a valid empty drawing.
+
+## ADR-011 — Header unit hints are not authoritative for georeferencing
+
+**Status:** accepted.
+
+`$INSUNITS` describes intended insertion/plot units, not the georeferencing of model-space coordinates: engineering drawings routinely carry UTM-metre coordinates while the header says millimetres (the reference drawing does exactly this, and its `$MEASUREMENT` contradicts `$INSUNITS`). Auto-scaling by the header would silently corrupt such files by a factor of 1000. Native reprojection therefore trusts the header only when it is unambiguous and internally consistent — and even then warns and records the provenance — and demands an explicit `--source-units` override otherwise. Unit scaling assumes a meter-based projected source CRS; the WGS 84 extent check backstops gross unit/CRS mistakes.
+
+## ADR-012 — Control-point calibration is similarity-only
+
+**Status:** accepted.
+
+The roadmap phrase "local affine calibration" is implemented as a 4-parameter similarity (Helmert) fit, not a 6-parameter affine. A full affine can shear and scale axes independently, distorting angles and proportions of engineering geometry in ways no residual report would make obvious. Rotation, uniform scale, and translation establish a local georeference without introducing distortions; residuals, RMS, and max error quantify how well the drawing actually fits that model.

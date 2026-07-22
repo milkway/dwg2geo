@@ -47,6 +47,46 @@ pub struct NativeConversionSummary {
     pub failed: Vec<OutcomeCount>,
     pub excluded: ExcludedCounts,
     pub feature_warnings: usize,
+    /// Present when the native backend reprojected the output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reprojection: Option<ReprojectionInfo>,
+    /// Present when the output was georeferenced by control-point
+    /// calibration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<CalibrationInfo>,
+}
+
+/// How a control-point calibration fit the drawing to the target CRS.
+#[derive(Debug, Serialize)]
+pub struct CalibrationInfo {
+    pub control_points: usize,
+    /// Uniform scale of the similarity transform.
+    pub scale: f64,
+    pub rotation_deg: f64,
+    /// Translation component, in target-CRS units.
+    pub translation: (f64, f64),
+    /// Per-point Euclidean error in target-CRS units, in input order.
+    pub residuals: Vec<f64>,
+    pub rms_error: f64,
+    pub max_error: f64,
+    pub target_crs: String,
+}
+
+/// How coordinates were georeferenced by the native backend.
+#[derive(Debug, Serialize)]
+pub struct ReprojectionInfo {
+    pub source_crs: String,
+    pub target_crs: String,
+    /// Resolved linear drawing unit name.
+    pub drawing_unit: String,
+    /// Where the unit came from: "header" or "override".
+    pub unit_source: String,
+    pub meters_per_drawing_unit: f64,
+    /// Axis-order convention of both input and output coordinates.
+    pub axis_order: String,
+    /// PROJ transformation pipeline definition, when available.
+    pub pipeline: Option<String>,
+    pub proj_version: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +146,8 @@ pub struct ConversionOptions {
     /// Native output format: "geojson" or "geojson-seq". `None` on routes
     /// that do not choose the output representation themselves.
     pub output_format: Option<String>,
+    /// The --source-units override as given, when one was passed.
+    pub source_units: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,6 +212,7 @@ mod tests {
                 curve_tolerance: None,
                 block_mode: None,
                 output_format: None,
+                source_units: None,
             },
             external_tools: Vec::new(),
             steps: vec![Step {

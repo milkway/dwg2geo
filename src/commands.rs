@@ -103,10 +103,28 @@ pub fn execute(command: Command) -> Result<()> {
             curve_tolerance,
             explode_blocks,
             preserve_inserts,
+            source_units,
+            allow_suspect_extents,
+            control_points,
         } => {
-            if source_crs.is_none() && !allow_local_coordinates {
+            if source_crs.is_none() && !allow_local_coordinates && control_points.is_empty() {
                 bail!(
-                    "a source CRS is required; pass --source-crs <CRS>, or explicitly accept raw drawing coordinates with --allow-local-coordinates"
+                    "a coordinate policy is required; pass --source-crs <CRS>, calibrate with --control-point, or explicitly accept raw drawing coordinates with --allow-local-coordinates"
+                );
+            }
+            if control_points.len() == 1 {
+                bail!(
+                    "local calibration needs at least two --control-point arguments; one point cannot determine scale and rotation"
+                );
+            }
+            if !control_points.is_empty() && backend != BackendChoice::Native {
+                bail!(
+                    "--control-point calibration is only supported by the native backend; pass --backend native"
+                );
+            }
+            if allow_suspect_extents && source_crs.is_none() && control_points.is_empty() {
+                bail!(
+                    "--allow-suspect-extents only applies to georeferenced output; pass --source-crs or --control-point"
                 );
             }
 
@@ -146,6 +164,13 @@ pub fn execute(command: Command) -> Result<()> {
                 );
             }
 
+            if (source_units.is_some() || allow_suspect_extents) && backend != BackendChoice::Native
+            {
+                bail!(
+                    "--source-units and --allow-suspect-extents are only supported by the native backend; pass --backend native (the GDAL route interprets units itself)"
+                );
+            }
+
             if allow_local_coordinates {
                 eprintln!(
                     "warning: exporting local CAD coordinates without establishing a geographic CRS"
@@ -166,6 +191,9 @@ pub fn execute(command: Command) -> Result<()> {
                 polygonize_closed,
                 curve_tolerance,
                 preserve_inserts,
+                source_units: source_units.as_deref(),
+                allow_suspect_extents,
+                control_points: &control_points,
             };
 
             match backend {

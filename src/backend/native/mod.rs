@@ -6,6 +6,12 @@
 
 pub mod calibrate;
 pub mod convert;
+#[cfg(feature = "native-reproject")]
+pub mod reproject;
+// Consumed by the reproject path; compiled (and unit-tested) without it so
+// the units policy cannot bitrot behind the optional feature.
+#[cfg_attr(not(feature = "native-reproject"), allow(dead_code))]
+pub mod units;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},

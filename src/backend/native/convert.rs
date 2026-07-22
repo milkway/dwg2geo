@@ -25,6 +25,10 @@ use geojson::{
     Feature, FeatureCollection, Geometry, GeometryValue, JsonObject, JsonValue, feature::Id,
 };
 
+#[cfg(feature = "native-reproject")]
+use super::reproject::Reprojector;
+#[cfg(feature = "native-reproject")]
+use super::units;
 use super::{ReadMode, read_document};
 use crate::{
     backend::{
@@ -295,12 +299,16 @@ fn insert_matrix(
 pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let started = Instant::now();
 
+    #[cfg(not(feature = "native-reproject"))]
     if let Some(source_crs) = request.source_crs {
         bail!(
-            "the native backend cannot reproject from {source_crs} yet; reprojection arrives with the `native-reproject` feature (Milestone 5). Use --backend external for CRS-aware conversion, or --allow-local-coordinates for raw drawing coordinates"
+            "this binary was built without reprojection support and cannot transform from {source_crs}; rebuild with --features native-reproject, use --backend external, or pass --allow-local-coordinates for raw drawing coordinates"
         );
     }
-    if !request.allow_local_coordinates {
+    if !request.allow_local_coordinates
+        && request.source_crs.is_none()
+        && request.control_points.is_empty()
+    {
         bail!("internal validation error: native conversion reached without a coordinate policy");
     }
 
@@ -318,8 +326,11 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             source.signature
         ));
     }
-    warnings
-        .push("output uses raw drawing coordinates; no geographic CRS was established".to_string());
+    if request.allow_local_coordinates {
+        warnings.push(
+            "output uses raw drawing coordinates; no geographic CRS was established".to_string(),
+        );
+    }
     if request.keep_intermediate {
         warnings.push(
             "the native backend produces GeoJSON directly; there is no intermediate DXF to keep"
@@ -336,6 +347,24 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
         command: "(in-process acadrust reader)".to_string(),
         duration_ms: parse_started.elapsed().as_millis() as u64,
     });
+
+    // Resolve units, PROJ transforms, and calibrations before extraction so
+    // a bad CRS, ambiguous units, or bad control points fail fast.
+    #[cfg(feature = "native-reproject")]
+    let reprojection_plan = match request.source_crs {
+        Some(source_crs) => Some(build_reprojection_plan(
+            request,
+            source_crs,
+            &document,
+            &mut warnings,
+        )?),
+        None => None,
+    };
+    let calibration_plan = if request.control_points.is_empty() {
+        None
+    } else {
+        Some(build_calibration_plan(request)?)
+    };
 
     let geometry_options = GeometryOptions {
         polygonize_closed: request.polygonize_closed,
@@ -359,7 +388,44 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     }
 
     let features_written = extraction.features.len();
-    let features = extraction.features;
+    let mut features = extraction.features;
+
+    #[cfg(feature = "native-reproject")]
+    if let Some(plan) = &reprojection_plan {
+        let transform_started = Instant::now();
+        let reprojector = &plan.reprojector;
+        transform_features(&mut features, &|x, y| reprojector.transform(x, y))?;
+        steps.push(Step {
+            purpose: "coordinate reprojection".to_string(),
+            command: format!("(in-process PROJ {})", plan.info.proj_version),
+            duration_ms: transform_started.elapsed().as_millis() as u64,
+        });
+    }
+    if let Some((calibration, _)) = &calibration_plan {
+        let transform_started = Instant::now();
+        transform_features(&mut features, &|x, y| Ok(calibration.apply((x, y))))?;
+        steps.push(Step {
+            purpose: "control-point calibration".to_string(),
+            command: "(in-process similarity transform)".to_string(),
+            duration_ms: transform_started.elapsed().as_millis() as u64,
+        });
+    }
+
+    let georeferenced = request.source_crs.is_some() || calibration_plan.is_some();
+    if georeferenced && crs_is_wgs84(request.target_crs) && !request.allow_suspect_extents {
+        if let Some((id, x, y)) = wgs84_out_of_range(&features) {
+            bail!(
+                "output contains implausible WGS 84 coordinates (feature {id}: {x}, {y}); the source CRS, --source-units, or control points are probably wrong for this drawing. Pass --allow-suspect-extents to deliver anyway"
+            );
+        }
+    }
+    let features = features;
+
+    #[cfg(feature = "native-reproject")]
+    let reprojection_info = reprojection_plan.map(|plan| plan.info);
+    #[cfg(not(feature = "native-reproject"))]
+    let reprojection_info: Option<report::ReprojectionInfo> = None;
+    let calibration_info = calibration_plan.map(|(_, info)| info);
 
     let partial = append_suffix(request.output, ".partial");
     remove_stale(&partial)?;
@@ -369,7 +435,11 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             let collection = FeatureCollection {
                 bbox: None,
                 features,
-                foreign_members: Some(foreign_members(&source)),
+                foreign_members: Some(foreign_members(
+                    &source,
+                    reprojection_info.as_ref(),
+                    calibration_info.as_ref(),
+                )),
             };
             serde_json::to_string_pretty(&collection)
                 .context("cannot serialize GeoJSON feature collection")
@@ -416,9 +486,10 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
         source,
         options: ConversionOptions {
             backend: "native",
-            source_crs: None,
-            target_crs: None,
-            allow_local_coordinates: true,
+            source_crs: request.source_crs.map(str::to_string),
+            target_crs: (request.source_crs.is_some() || !request.control_points.is_empty())
+                .then(|| request.target_crs.to_string()),
+            allow_local_coordinates: request.allow_local_coordinates,
             force: request.force,
             keep_intermediate: request.keep_intermediate,
             include_layers: request.include_layers.to_vec(),
@@ -434,6 +505,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
                 .to_string(),
             ),
             output_format: Some(request.output_format.to_string()),
+            source_units: request.source_units.map(str::to_string),
         },
         external_tools: Vec::new(),
         steps,
@@ -460,6 +532,8 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
                 unowned: extraction.excluded_unowned,
             },
             feature_warnings: extraction.feature_warnings,
+            reprojection: reprojection_info,
+            calibration: calibration_info,
         }),
         output: OutputInfo {
             path: request.output.display().to_string(),
@@ -477,19 +551,257 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     Ok(())
 }
 
-/// GeoJSON foreign members marking the output as non-geographic, per the
-/// local-coordinates contract (RFC 7946 output is otherwise assumed WGS 84).
-fn foreign_members(source: &dwg::DwgInfo) -> JsonObject {
+/// GeoJSON foreign members recording the coordinate status: either the
+/// local-coordinates marker (RFC 7946 output is otherwise assumed WGS 84) or
+/// the reprojection provenance.
+fn foreign_members(
+    source: &dwg::DwgInfo,
+    reprojection: Option<&report::ReprojectionInfo>,
+    calibration: Option<&report::CalibrationInfo>,
+) -> JsonObject {
     let mut members = JsonObject::new();
-    members.insert(
-        "dwg2geo".to_string(),
-        serde_json::json!({
+    let payload = match (reprojection, calibration) {
+        (None, Some(info)) => serde_json::json!({
+            "coordinate_status": "calibrated",
+            "target_crs": info.target_crs,
+            "control_points": info.control_points,
+            "rms_error": info.rms_error,
+            "note": "coordinates were georeferenced by a local similarity calibration; accuracy is bounded by the control points",
+            "source_sha256": source.sha256,
+        }),
+        (None, None) => serde_json::json!({
             "coordinate_status": "local-unreferenced",
             "note": "coordinates are raw drawing units; no geographic CRS was established",
             "source_sha256": source.sha256,
         }),
-    );
+        (Some(info), _) => {
+            let note = if crs_is_wgs84(&info.target_crs) {
+                "coordinates are WGS 84 longitude/latitude per RFC 7946"
+            } else {
+                "coordinates are NOT WGS 84; RFC 7946 consumers must handle the recorded CRS explicitly"
+            };
+            serde_json::json!({
+                "coordinate_status": "georeferenced",
+                "source_crs": info.source_crs,
+                "target_crs": info.target_crs,
+                "axis_order": info.axis_order,
+                "note": note,
+                "source_sha256": source.sha256,
+            })
+        }
+    };
+    members.insert("dwg2geo".to_string(), payload);
     members
+}
+
+/// Whether a CRS string names WGS 84 longitude/latitude as GeoJSON uses it.
+fn crs_is_wgs84(crs: &str) -> bool {
+    let normalized = crs.trim().to_ascii_uppercase();
+    normalized == "EPSG:4326" || normalized == "OGC:CRS84" || normalized == "CRS84"
+}
+
+/// First coordinate outside the plausible WGS 84 longitude/latitude range,
+/// with the id of the feature carrying it.
+fn wgs84_out_of_range(features: &[Feature]) -> Option<(String, f64, f64)> {
+    for feature in features {
+        let Some(geometry) = &feature.geometry else {
+            continue;
+        };
+        let mut offending = None;
+        visit_positions(&geometry.value, &mut |x, y| {
+            if offending.is_none()
+                && (!(-180.0..=180.0).contains(&x) || !(-90.0..=90.0).contains(&y))
+            {
+                offending = Some((x, y));
+            }
+        });
+        if let Some((x, y)) = offending {
+            let id = match &feature.id {
+                Some(Id::String(id)) => id.clone(),
+                other => format!("{other:?}"),
+            };
+            return Some((id, x, y));
+        }
+    }
+    None
+}
+
+/// Visit every (x, y) position of a geometry.
+fn visit_positions(value: &GeometryValue, visit: &mut impl FnMut(f64, f64)) {
+    match value {
+        GeometryValue::Point { coordinates } => visit(coordinates[0], coordinates[1]),
+        GeometryValue::MultiPoint { coordinates } | GeometryValue::LineString { coordinates } => {
+            for position in coordinates {
+                visit(position[0], position[1]);
+            }
+        }
+        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
+            for line in coordinates {
+                for position in line {
+                    visit(position[0], position[1]);
+                }
+            }
+        }
+        GeometryValue::MultiPolygon { coordinates } => {
+            for polygon in coordinates {
+                for ring in polygon {
+                    for position in ring {
+                        visit(position[0], position[1]);
+                    }
+                }
+            }
+        }
+        GeometryValue::GeometryCollection { geometries } => {
+            for geometry in geometries {
+                visit_positions(&geometry.value, visit);
+            }
+        }
+    }
+}
+
+/// The resolved unit, PROJ transform, and report provenance for one run.
+#[cfg(feature = "native-reproject")]
+struct ReprojectionPlan {
+    reprojector: Reprojector,
+    info: report::ReprojectionInfo,
+}
+
+#[cfg(feature = "native-reproject")]
+fn build_reprojection_plan(
+    request: &ConvertRequest<'_>,
+    source_crs: &str,
+    document: &CadDocument,
+    warnings: &mut Vec<String>,
+) -> Result<ReprojectionPlan> {
+    let (unit, unit_source) = match request.source_units {
+        Some(text) => {
+            let unit = units::parse_override(text).map_err(|reason| anyhow::anyhow!(reason))?;
+            (unit, "override")
+        }
+        None => {
+            match units::from_header(document.header.insertion_units, document.header.measurement) {
+                Ok(unit) => (unit, "header"),
+                Err(reason) => bail!(
+                    "cannot determine the drawing's linear unit: {reason}. Pass --source-units <UNIT> (m, mm, cm, dm, km, in, ft, usft) stating what one drawing unit means"
+                ),
+            }
+        }
+    };
+
+    if unit_source == "header" {
+        warnings.push(format!(
+            "drawing unit {} taken from the DWG header; header unit hints are not authoritative for georeferencing — pass --source-units to override",
+            unit.name
+        ));
+    }
+    if (unit.meters_per_unit - 1.0).abs() > f64::EPSILON {
+        warnings.push(format!(
+            "drawing coordinates are scaled by {} meters per drawing unit ({}) before the CRS transform, assuming a meter-based projected source CRS",
+            unit.meters_per_unit, unit.name
+        ));
+    }
+
+    let reprojector = Reprojector::new(source_crs, request.target_crs, unit.meters_per_unit)?;
+    let info = report::ReprojectionInfo {
+        source_crs: source_crs.to_string(),
+        target_crs: request.target_crs.to_string(),
+        drawing_unit: unit.name.to_string(),
+        unit_source: unit_source.to_string(),
+        meters_per_drawing_unit: unit.meters_per_unit,
+        axis_order: super::reproject::AXIS_ORDER.to_string(),
+        pipeline: reprojector.pipeline(),
+        proj_version: reprojector.proj_version(),
+    };
+    Ok(ReprojectionPlan { reprojector, info })
+}
+
+/// Transform every feature geometry in place. A transform failure aborts the
+/// conversion: a vertex the transform rejects means the CRS or units are
+/// wrong for the whole drawing, and delivering a partial mix would be silent
+/// loss.
+fn transform_features(
+    features: &mut [Feature],
+    transform: &impl Fn(f64, f64) -> Result<(f64, f64)>,
+) -> Result<()> {
+    for feature in features.iter_mut() {
+        let id = match &feature.id {
+            Some(Id::String(id)) => id.clone(),
+            other => format!("{other:?}"),
+        };
+        if let Some(geometry) = &mut feature.geometry {
+            transform_positions(&mut geometry.value, transform)
+                .with_context(|| format!("while transforming feature {id}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn transform_positions(
+    value: &mut GeometryValue,
+    transform: &impl Fn(f64, f64) -> Result<(f64, f64)>,
+) -> Result<()> {
+    let transform_one = |position: &mut geojson::Position| -> Result<()> {
+        let (x, y) = transform(position[0], position[1])?;
+        position[0] = x;
+        position[1] = y;
+        Ok(())
+    };
+    match value {
+        GeometryValue::Point { coordinates } => transform_one(coordinates)?,
+        GeometryValue::MultiPoint { coordinates } | GeometryValue::LineString { coordinates } => {
+            for position in coordinates {
+                transform_one(position)?;
+            }
+        }
+        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
+            for line in coordinates {
+                for position in line {
+                    transform_one(position)?;
+                }
+            }
+        }
+        GeometryValue::MultiPolygon { coordinates } => {
+            for polygon in coordinates {
+                for ring in polygon {
+                    for position in ring {
+                        transform_one(position)?;
+                    }
+                }
+            }
+        }
+        GeometryValue::GeometryCollection { geometries } => {
+            for geometry in geometries {
+                transform_positions(&mut geometry.value, transform)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse and solve the control-point calibration, producing the transform
+/// and its report block.
+fn build_calibration_plan(
+    request: &ConvertRequest<'_>,
+) -> Result<(super::calibrate::Calibration, report::CalibrationInfo)> {
+    let points: Vec<super::calibrate::ControlPoint> = request
+        .control_points
+        .iter()
+        .map(|text| super::calibrate::parse_control_point(text))
+        .collect::<Result<_, String>>()
+        .map_err(|reason| anyhow::anyhow!("invalid --control-point: {reason}"))?;
+    let (calibration, quality) = super::calibrate::solve(&points)
+        .map_err(|reason| anyhow::anyhow!("cannot calibrate from the control points: {reason}"))?;
+    let info = report::CalibrationInfo {
+        control_points: points.len(),
+        scale: quality.scale,
+        rotation_deg: quality.rotation_deg,
+        translation: (calibration.tx, calibration.ty),
+        residuals: quality.residuals,
+        rms_error: quality.rms_error,
+        max_error: quality.max_error,
+        target_crs: request.target_crs.to_string(),
+    };
+    Ok((calibration, info))
 }
 
 #[derive(Default)]
@@ -3823,5 +4135,35 @@ mod tests {
             EntityOutcome::Skipped(reason) => assert!(reason.contains("degenerate"), "{reason}"),
             other => panic!("degenerate solid must be skipped, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wgs84_extent_check_flags_out_of_range_coordinates() {
+        use super::{crs_is_wgs84, wgs84_out_of_range};
+        use geojson::{Feature, Geometry, feature::Id};
+
+        let feature = |id: &str, x: f64, y: f64| Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(GeometryValue::new_point((x, y)))),
+            id: Some(Id::String(id.to_string())),
+            properties: None,
+            foreign_members: None,
+        };
+
+        let plausible = vec![feature("A", -51.2, -23.4), feature("B", 180.0, 90.0)];
+        assert!(wgs84_out_of_range(&plausible).is_none());
+
+        // UTM-magnitude coordinates delivered as "WGS 84" must be flagged.
+        let implausible = vec![
+            feature("A", -51.2, -23.4),
+            feature("B", 248_000.0, 7_396_000.0),
+        ];
+        let (id, x, _y) = wgs84_out_of_range(&implausible).expect("must flag");
+        assert_eq!(id, "B");
+        assert_eq!(x, 248_000.0);
+
+        assert!(crs_is_wgs84("epsg:4326"));
+        assert!(crs_is_wgs84(" OGC:CRS84 "));
+        assert!(!crs_is_wgs84("EPSG:31982"));
     }
 }

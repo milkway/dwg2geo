@@ -90,12 +90,12 @@ Exit condition: nested engineering symbols and repeated structures are spatially
 
 ## Milestone 5 — CRS, units, and calibration
 
-- [ ] Read drawing units and require an override when absent or ambiguous.
-- [ ] Reproject using the Rust `proj` crate.
-- [ ] Support local affine calibration from at least two control points.
-- [ ] Add residual/error reporting for three or more control points.
-- [ ] Reject implausible EPSG:4326 extents unless explicitly overridden.
-- [ ] Record axis order, units, source CRS, target CRS, and transformation pipeline.
+- [x] Read drawing units and require an override when absent or ambiguous. ($INSUNITS is trusted only when unambiguous AND consistent with $MEASUREMENT; otherwise native reprojection demands `--source-units` (m, mm, cm, dm, km, in, ft, usft). Header-derived units carry a warning that header hints are not authoritative for georeferencing. The reference drawing's mm-vs-english inconsistency triggers exactly this override path.)
+- [x] Reproject using the Rust `proj` crate. (`--source-crs`/`--target-crs` on the native backend behind `native-reproject`; drawing units scale to meters before the transform under the documented meter-based-projected-source assumption; a vertex PROJ rejects aborts the conversion — no partial mixes.)
+- [x] Support local affine calibration from at least two control points. (`--control-point DX,DY=X,Y`, repeatable; deliberately a 4-parameter similarity — full affine could shear engineering geometry, see the module docs. Exact for two points, least squares beyond; conflicts with `--source-crs` and works without PROJ.)
+- [x] Add residual/error reporting for three or more control points. (Per-point residuals, RMS, and max error in target-CRS units, reported for every point count; recorded in the report's `native.calibration` block.)
+- [x] Reject implausible EPSG:4326 extents unless explicitly overridden. (Georeferenced output targeting WGS 84 fails closed when any coordinate leaves [-180, 180] x [-90, 90], naming the offending feature; `--allow-suspect-extents` overrides.)
+- [x] Record axis order, units, source CRS, target CRS, and transformation pipeline. (Report `native.reprojection`: unit + provenance, meters/unit factor, normalized axis order, PROJ pipeline definition and version; the GeoJSON `dwg2geo` foreign member carries the coordinate status: georeferenced, calibrated, or local-unreferenced.)
 
 Exit condition: output positioning is explicit, reproducible, and sanity checked.
 

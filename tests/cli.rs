@@ -69,7 +69,8 @@ fn convert_requires_coordinate_policy() {
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("source CRS is required"));
+    assert!(stderr.contains("coordinate policy is required"), "{stderr}");
+    assert!(stderr.contains("--source-crs"), "{stderr}");
 }
 
 #[test]
@@ -761,9 +762,9 @@ fn native_geojson_seq_output_is_deterministic() {
     assert_eq!(first, second, "GeoJSONSeq output must be byte-identical");
 }
 
-#[cfg(feature = "native-backend")]
+#[cfg(all(feature = "native-backend", not(feature = "native-reproject")))]
 #[test]
-fn native_convert_rejects_source_crs_until_milestone_5() {
+fn native_convert_rejects_source_crs_without_the_reproject_feature() {
     let dir = TempDir::new().expect("temporary directory");
     let fixture = write_convert_fixture(dir.path());
 
@@ -780,4 +781,255 @@ fn native_convert_rejects_source_crs_until_milestone_5() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("native-reproject"), "stderr: {stderr}");
     assert!(!dir.path().join("out.geojson").exists());
+}
+
+#[cfg(feature = "native-reproject")]
+#[test]
+fn native_reprojection_requires_units_when_the_header_is_ambiguous() {
+    let dir = TempDir::new().expect("temporary directory");
+    // The generated fixture leaves $INSUNITS at 0 (unitless).
+    let fixture = write_convert_fixture(dir.path());
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojson"))
+        .args(["--backend", "native", "--source-crs", "EPSG:31982"])
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--source-units"), "stderr: {stderr}");
+    assert!(stderr.contains("unitless"), "stderr: {stderr}");
+    assert!(!dir.path().join("out.geojson").exists());
+}
+
+#[cfg(feature = "native-reproject")]
+#[test]
+fn native_reprojection_transforms_and_records_provenance() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let out = dir.path().join("out.geojson");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args([
+            "--backend",
+            "native",
+            "--source-crs",
+            "EPSG:31982",
+            "--target-crs",
+            "EPSG:4326",
+            "--source-units",
+            "m",
+        ])
+        .output()
+        .expect("run binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+    let geojson: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("read output"))
+            .expect("valid GeoJSON");
+    let marker = &geojson["dwg2geo"];
+    assert_eq!(marker["coordinate_status"], "georeferenced");
+    assert_eq!(marker["source_crs"], "EPSG:31982");
+    assert_eq!(marker["target_crs"], "EPSG:4326");
+    // Every coordinate must be plausible longitude/latitude now.
+    let first = &geojson["features"][0]["geometry"]["coordinates"];
+    let probe = if first[0].is_array() {
+        &first[0]
+    } else {
+        first
+    };
+    let lon = probe[0].as_f64().expect("finite lon");
+    assert!((-180.0..=180.0).contains(&lon), "lon {lon}");
+
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("out.geojson.report.json")).expect("read report"),
+    )
+    .expect("valid report");
+    let reprojection = &report["native"]["reprojection"];
+    assert_eq!(reprojection["unit_source"], "override");
+    assert_eq!(reprojection["drawing_unit"], "meters");
+    assert_eq!(reprojection["meters_per_drawing_unit"], 1.0);
+    assert!(
+        reprojection["proj_version"]
+            .as_str()
+            .expect("proj version")
+            .starts_with('9'),
+        "{reprojection}"
+    );
+    assert_eq!(report["options"]["source_units"], "m");
+    assert_eq!(report["options"]["source_crs"], "EPSG:31982");
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn control_point_calibration_transforms_and_reports_residuals() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let out = dir.path().join("out.geojson");
+
+    // Pure translation: drawing (x, y) -> (x + 1000, y + 2000).
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args([
+            "--backend",
+            "native",
+            "--target-crs",
+            "EPSG:31982",
+            "--control-point",
+            "0,0=1000,2000",
+            "--control-point",
+            "100,50=1100,2050",
+            "--control-point",
+            "10,10=1010,2010",
+        ])
+        .output()
+        .expect("run binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+    let geojson: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("read output"))
+            .expect("valid GeoJSON");
+    assert_eq!(geojson["dwg2geo"]["coordinate_status"], "calibrated");
+    assert_eq!(geojson["dwg2geo"]["control_points"], 3);
+    // The fixture's point entity sits at (5, 5) -> (1005, 2005).
+    let features = geojson["features"].as_array().expect("features");
+    let point = features
+        .iter()
+        .find(|f| f["properties"]["entity_type"] == "POINT")
+        .expect("point feature");
+    let x = point["geometry"]["coordinates"][0].as_f64().expect("x");
+    let y = point["geometry"]["coordinates"][1].as_f64().expect("y");
+    assert!(
+        (x - 1005.0).abs() < 1e-9 && (y - 2005.0).abs() < 1e-9,
+        "({x}, {y})"
+    );
+
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("out.geojson.report.json")).expect("read report"),
+    )
+    .expect("valid report");
+    let calibration = &report["native"]["calibration"];
+    assert_eq!(calibration["control_points"], 3);
+    let scale = calibration["scale"].as_f64().expect("scale");
+    assert!((scale - 1.0).abs() < 1e-12, "scale {scale}");
+    let rotation = calibration["rotation_deg"].as_f64().expect("rotation");
+    assert!(rotation.abs() < 1e-9, "rotation {rotation}");
+    assert_eq!(
+        calibration["residuals"]
+            .as_array()
+            .expect("residuals")
+            .len(),
+        3
+    );
+    let rms = calibration["rms_error"].as_f64().expect("rms");
+    assert!(rms < 1e-9, "rms {rms}");
+    assert_eq!(calibration["target_crs"], "EPSG:31982");
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn calibration_validation_fails_closed() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let out = dir.path().join("out.geojson");
+
+    // One control point cannot determine the transform.
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args(["--backend", "native", "--control-point", "0,0=10,10"])
+        .output()
+        .expect("run binary");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("at least two"), "stderr: {stderr}");
+
+    // UTM-magnitude targets delivered as the default EPSG:4326 must trip
+    // the extent check.
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args([
+            "--backend",
+            "native",
+            "--control-point",
+            "0,0=248000,7396000",
+            "--control-point",
+            "100,50=248100,7396050",
+        ])
+        .output()
+        .expect("run binary");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("implausible"), "stderr: {stderr}");
+    assert!(!out.exists());
+}
+
+#[cfg(feature = "native-reproject")]
+#[test]
+fn implausible_wgs84_extents_fail_closed_unless_overridden() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let out = dir.path().join("out.geojson");
+
+    // Degrees scaled by 1000: the identity transform then yields longitudes
+    // in the tens of thousands — exactly the wrong-units mistake the check
+    // exists to catch.
+    let args = [
+        "--backend",
+        "native",
+        "--source-crs",
+        "EPSG:4326",
+        "--target-crs",
+        "EPSG:4326",
+        "--source-units",
+        "km",
+    ];
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args(args)
+        .output()
+        .expect("run binary");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("implausible"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--allow-suspect-extents"),
+        "stderr: {stderr}"
+    );
+    assert!(!out.exists());
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args(args)
+        .arg("--allow-suspect-extents")
+        .output()
+        .expect("run binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(out.exists());
 }

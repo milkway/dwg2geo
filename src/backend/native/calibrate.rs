@@ -7,9 +7,6 @@
 //! geometry. Rotation, uniform scale, and translation establish a local
 //! coordinate relationship without introducing those distortions.
 
-// This public API is consumed by the concurrent Milestone 5 integration work.
-#![allow(dead_code)]
-
 /// One drawing-to-target correspondence.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ControlPoint {

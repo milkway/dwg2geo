@@ -109,6 +109,30 @@ pub enum Command {
         /// attributes instead of expanding them (native backend only).
         #[arg(long)]
         preserve_inserts: bool,
+
+        /// Linear unit of the drawing coordinates (m, mm, cm, dm, km, in,
+        /// ft, usft). Required with --source-crs on the native backend when
+        /// the drawing's own unit hints are absent, ambiguous, or
+        /// inconsistent.
+        #[arg(long, value_name = "UNIT", requires = "source_crs")]
+        source_units: Option<String>,
+
+        /// Deliver EPSG:4326 output even when coordinates fall outside the
+        /// plausible longitude/latitude range (native backend only; the
+        /// default is to fail closed on implausible extents).
+        #[arg(long)]
+        allow_suspect_extents: bool,
+
+        /// Georeference by local similarity calibration instead of a source
+        /// CRS: map drawing coordinates to target-CRS coordinates using at
+        /// least two control points "DX,DY=X,Y" (native backend only;
+        /// repeatable; three or more points additionally report residuals).
+        #[arg(
+            long = "control-point",
+            value_name = "DX,DY=X,Y",
+            conflicts_with_all = ["source_crs", "allow_local_coordinates"]
+        )]
+        control_points: Vec<String>,
     },
 }
 

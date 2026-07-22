@@ -64,9 +64,13 @@ pub fn doctor(json: bool) -> Result<()> {
 pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let started = Instant::now();
 
-    // The CLI rejects the native-only block-mode and output-format flags before reaching here.
+    // The CLI rejects the native-only block-mode, output-format, and unit
+    // flags before reaching here.
     debug_assert!(!request.preserve_inserts);
     debug_assert_eq!(request.output_format, OutputFormat::GeoJson);
+    debug_assert!(request.source_units.is_none());
+    debug_assert!(!request.allow_suspect_extents);
+    debug_assert!(request.control_points.is_empty());
 
     validate_input(request.input)?;
     check_output_collision(request.output, request.force)?;
@@ -146,6 +150,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             curve_tolerance: request.curve_tolerance,
             block_mode: None,
             output_format: None,
+            source_units: None,
         },
         external_tools,
         steps,
