@@ -167,6 +167,11 @@ pub struct ReprojectionInfo {
     /// Where the unit came from: "header" or "override".
     pub unit_source: String,
     pub meters_per_drawing_unit: f64,
+    /// Horizontal axis unit reported by PROJ for the source CRS.
+    pub crs_unit: String,
+    /// Multiplier actually applied before PROJ, in source-CRS units per
+    /// drawing unit.
+    pub coordinate_scale: f64,
     /// Axis-order convention of both input and output coordinates.
     pub axis_order: String,
     /// PROJ transformation pipeline definition, when available.
