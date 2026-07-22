@@ -153,6 +153,12 @@
   .tag.mpl { background: rgba(255,177,78,.18); color: var(--accent); }
   .tag.gpl { background: rgba(255,95,87,.16); color: #ff8a80; }
 
+  .diagram {
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 22px; box-shadow: var(--shadow); overflow-x: auto;
+  }
+  .diagram img { display: block; width: 100%; max-width: 960px; height: auto; margin: 0 auto; }
+
   footer { padding: 40px 0 60px; color: var(--muted); border-top: 1px solid var(--border); }
   .foot-inner { display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center; }
   .foot-links { display: flex; gap: 18px; flex-wrap: wrap; }
@@ -164,7 +170,7 @@
     <div class="brand"><span class="logo">🗺️</span> dwg2geo</div>
     <nav class="nav-links">
       <a class="hide-sm" href="#features">Features</a>
-      <a class="hide-sm" href="#entities">Entities</a>
+      <a class="hide-sm" href="#how">How it works</a>
       <a class="hide-sm" href="#install">Install</a>
       <a class="hide-sm" href="#trust">Trust</a>
       <a class="btn" href="https://github.com/milkway/dwg2geo">GitHub ↗</a>
@@ -232,6 +238,17 @@
         <span class="pill">POINT</span><span class="pill">LINE</span><span class="pill">LWPOLYLINE</span><span class="pill">POLYLINE 2D/3D</span><span class="pill">ARC</span><span class="pill">CIRCLE</span><span class="pill">ELLIPSE</span><span class="pill">SPLINE</span><span class="pill">3DFACE</span><span class="pill">SOLID</span><span class="pill">HATCH</span><span class="pill">TEXT</span><span class="pill">MTEXT</span><span class="pill">INSERT / blocks</span>
       </div>
       <p class="note">Bulge arcs and splines tessellate under an explicit chord tolerance; hatches nest into Polygons/MultiPolygons with holes; blocks expand with full transform composition and provenance. Deliberately unsupported types (rays, ACIS solids) and not-yet-converted types (dimensions, leaders, meshes) are reported, never guessed.</p>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="wrap">
+      <h2>How it works</h2>
+      <p class="sub">One header inspector, two backends, and a single writer — the pure-Rust path builds a CAD-neutral model that every transform and check operates on.</p>
+      <div class="diagram"><img src="assets/architecture.svg" alt="dwg2geo architecture: DWG input flows to the header inspector, the external LibreDWG/GDAL backend, or the native backend that builds a CAD-neutral model and writes GeoJSON with a report." loading="lazy" /></div>
+      <h3 style="margin:34px 0 6px">Conversion pipeline &amp; key parameters</h3>
+      <p class="sub">Fail closed on coordinates, resolve units, transform, validate, then write deterministically.</p>
+      <div class="diagram"><img src="assets/pipeline.svg" alt="Conversion pipeline: coordinate policy, units, geometry, validation, and deterministic output, with the CLI flags at each stage." loading="lazy" /></div>
     </div>
   </section>
 

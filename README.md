@@ -133,28 +133,17 @@ Dockerfile               slim, native-only container image
 
 ## Architecture
 
-```text
-DWG input
-   |
-   +--> header inspector (always available: signature, size, SHA-256)
-   |
-   +--> external backend: LibreDWG -> DXF -> GDAL reprojection -> GeoJSON
-   |
-   +--> native backend: acadrust -> CAD-neutral model (CadFeature/CadGeometry)
-                                       |
-                                       +--> block/INSERT expansion, OCS->WCS
-                                       +--> deterministic curve tessellation
-                                       +--> geometry validation & accounting
-                                       +--> CRS/unit transform or calibration
-                                       +--> single GeoJSON / GeoJSONSeq writer
-                                       +--> sidecar conversion report
-```
+![dwg2geo architecture](site/assets/architecture.svg)
 
 - **CLI** parses arguments and rejects ambiguous CRS/unit behavior before any expensive work.
 - **Header inspector** reads only stable file-level metadata and works without any CAD library.
 - **Backend adapters** — `external` shells out to `dwgread`/`ogr2ogr`; `native` adapts `acadrust`. `acadrust` types never leak past the adapter.
 - **CAD-neutral model** (`CadFeature`/`CadGeometry`) is the internal contract every transform, validity check, and statistic operates on; the writer is the single place it becomes GeoJSON (ADR-004).
 - **Streaming pipeline** — extraction hands each feature to a sink; the GeoJSONSeq route writes and drops it immediately, so memory is bounded by the parsed document, not the feature count.
+
+### Conversion pipeline & key parameters
+
+![dwg2geo conversion pipeline](site/assets/pipeline.svg)
 
 ## License
 
