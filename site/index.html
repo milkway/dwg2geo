@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dwg2geo — auditable DWG → GeoJSON conversion</title>
+<meta name="description" content="A Rust CLI that converts engineering DWG drawings to GeoJSON with explicit coordinate-reference handling, per-entity diagnostics, and deterministic, traceable conversion reports." />
+<meta property="og:title" content="dwg2geo — auditable DWG → GeoJSON conversion" />
+<meta property="og:description" content="Convert engineering DWG drawings to GeoJSON with explicit CRS handling, per-entity diagnostics, and deterministic reports. Pure-Rust native backend, no black boxes." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://milkway.github.io/dwg2geo/" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%97%BA%EF%B8%8F%3C/text%3E%3C/svg%3E" />
+<style>
+  :root {
+    --bg: #0b1020;
+    --bg-soft: #121a33;
+    --card: #16203f;
+    --border: #263457;
+    --fg: #e8edf7;
+    --muted: #9fb0d0;
+    --brand: #7c5cff;
+    --brand-2: #29c7ac;
+    --accent: #ffb14e;
+    --code-bg: #0d1428;
+    --shadow: 0 12px 40px rgba(0,0,0,.35);
+    --radius: 16px;
+    --maxw: 1080px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f8fe;
+      --bg-soft: #eef2fb;
+      --card: #ffffff;
+      --border: #dbe3f4;
+      --fg: #10192e;
+      --muted: #56648a;
+      --code-bg: #0d1428;
+      --shadow: 0 12px 36px rgba(30,45,90,.12);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--fg);
+    background:
+      radial-gradient(1100px 600px at 12% -8%, rgba(124,92,255,.20), transparent 60%),
+      radial-gradient(900px 500px at 96% 4%, rgba(41,199,172,.16), transparent 55%),
+      var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--brand-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 22px; }
+
+  /* Nav */
+  header.nav {
+    position: sticky; top: 0; z-index: 10;
+    backdrop-filter: blur(10px);
+    background: color-mix(in srgb, var(--bg) 78%, transparent);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 62px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; letter-spacing: -.02em; font-size: 1.1rem; }
+  .brand .logo { font-size: 1.35rem; }
+  .nav-links { display: flex; gap: 22px; align-items: center; }
+  .nav-links a { color: var(--muted); font-weight: 600; font-size: .95rem; }
+  .nav-links a:hover { color: var(--fg); text-decoration: none; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 16px; border-radius: 12px; font-weight: 700; font-size: .95rem;
+    border: 1px solid var(--border); color: var(--fg); background: var(--card);
+    transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+  }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); box-shadow: var(--shadow); }
+  .btn.primary { background: linear-gradient(135deg, var(--brand), #5b73ff); color: #fff; border: none; }
+  @media (max-width: 720px) { .nav-links a.hide-sm { display: none; } }
+
+  /* Hero */
+  .hero { padding: 74px 0 40px; }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: .8rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--brand-2); background: color-mix(in srgb, var(--brand-2) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--brand-2) 30%, transparent);
+    padding: 6px 12px; border-radius: 999px;
+  }
+  h1 { font-size: clamp(2.2rem, 5vw, 3.6rem); line-height: 1.05; letter-spacing: -.03em; margin: 18px 0 14px; }
+  h1 .grad { background: linear-gradient(120deg, var(--brand), var(--brand-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lead { font-size: 1.18rem; color: var(--muted); max-width: 40ch; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin: 24px 0 26px; }
+  .badges img { height: 22px; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; }
+
+  .hero-grid { display: grid; grid-template-columns: 1.05fr .95fr; gap: 40px; align-items: center; }
+  @media (max-width: 900px) { .hero-grid { grid-template-columns: 1fr; } }
+
+  /* Terminal card */
+  .term {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); overflow: hidden;
+  }
+  .term-bar { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,.07); }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
+  .term-title { margin-left: 8px; color: #7f8bb0; font: 600 .82rem ui-monospace, monospace; }
+  pre { margin: 0; padding: 18px 18px 22px; overflow-x: auto; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88rem; }
+  pre code { color: #d7e0f5; }
+  .c-prompt { color: #6ee7c8; } .c-flag { color: #ffb14e; } .c-cmd { color: #8ea2ff; } .c-cmt { color: #6b779b; } .c-ok { color: #59d99a; }
+
+  /* Sections */
+  section { padding: 56px 0; }
+  section.alt { background: var(--bg-soft); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+  h2 { font-size: clamp(1.6rem, 3.4vw, 2.2rem); letter-spacing: -.02em; margin: 0 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 30px; max-width: 62ch; }
+
+  .grid { display: grid; gap: 18px; }
+  .grid.f3 { grid-template-columns: repeat(3, 1fr); }
+  .grid.f2 { grid-template-columns: repeat(2, 1fr); }
+  @media (max-width: 860px) { .grid.f3, .grid.f2 { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 22px; transition: transform .14s ease, box-shadow .14s ease, border-color .14s ease;
+  }
+  .card:hover { transform: translateY(-3px); box-shadow: var(--shadow); border-color: color-mix(in srgb, var(--brand) 40%, var(--border)); }
+  .card .ic { font-size: 1.5rem; }
+  .card h3 { margin: 12px 0 6px; font-size: 1.1rem; letter-spacing: -.01em; }
+  .card p { margin: 0; color: var(--muted); font-size: .96rem; }
+
+  /* Entity pills */
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  .pill { font: 600 .82rem ui-monospace, monospace; padding: 6px 11px; border-radius: 999px; background: color-mix(in srgb, var(--brand) 12%, transparent); border: 1px solid color-mix(in srgb, var(--brand) 26%, transparent); color: var(--fg); }
+
+  /* Steps */
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  @media (max-width: 860px) { .steps { grid-template-columns: 1fr 1fr; } }
+  .step { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
+  .step .n { font: 800 .8rem ui-monospace, monospace; color: var(--brand-2); }
+  .step h4 { margin: 6px 0 4px; font-size: 1rem; }
+  .step p { margin: 0; color: var(--muted); font-size: .9rem; }
+
+  /* Install tabs (pure CSS via details) */
+  .panel { background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px; }
+  .note { color: var(--muted); font-size: .9rem; margin-top: 10px; }
+
+  table.lic { width: 100%; border-collapse: collapse; font-size: .94rem; }
+  table.lic th, table.lic td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  table.lic th { color: var(--muted); font-weight: 700; }
+  .tag { font: 700 .74rem ui-monospace, monospace; padding: 3px 8px; border-radius: 6px; }
+  .tag.mit { background: rgba(41,199,172,.16); color: var(--brand-2); }
+  .tag.mpl { background: rgba(255,177,78,.18); color: var(--accent); }
+  .tag.gpl { background: rgba(255,95,87,.16); color: #ff8a80; }
+
+  footer { padding: 40px 0 60px; color: var(--muted); border-top: 1px solid var(--border); }
+  .foot-inner { display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center; }
+  .foot-links { display: flex; gap: 18px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<header class="nav">
+  <div class="wrap nav-inner">
+    <div class="brand"><span class="logo">🗺️</span> dwg2geo</div>
+    <nav class="nav-links">
+      <a class="hide-sm" href="#features">Features</a>
+      <a class="hide-sm" href="#entities">Entities</a>
+      <a class="hide-sm" href="#install">Install</a>
+      <a class="hide-sm" href="#trust">Trust</a>
+      <a class="btn" href="https://github.com/milkway/dwg2geo">GitHub ↗</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div>
+        <span class="eyebrow">◆ Rust · CAD → GIS</span>
+        <h1>Turn DWG drawings into <span class="grad">auditable GeoJSON</span>.</h1>
+        <p class="lead">A command-line converter that never presents unreferenced CAD coordinates as geographically correct — with per-entity diagnostics and deterministic, traceable reports.</p>
+        <div class="badges">
+          <a href="https://github.com/milkway/dwg2geo/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/milkway/dwg2geo/actions/workflows/ci.yml/badge.svg"></a>
+          <a href="https://github.com/milkway/dwg2geo/releases"><img alt="Release" src="https://img.shields.io/github/v/release/milkway/dwg2geo?sort=semver"></a>
+          <a href="https://github.com/milkway/dwg2geo/blob/main/LICENSE-MIT"><img alt="License MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+          <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
+          <img alt="Platforms" src="https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-informational.svg">
+        </div>
+        <div class="cta">
+          <a class="btn primary" href="#install">Get started →</a>
+          <a class="btn" href="https://github.com/milkway/dwg2geo">Star on GitHub ★</a>
+        </div>
+      </div>
+      <div class="term" aria-hidden="true">
+        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title">dwg2geo — convert</span></div>
+<pre><code><span class="c-prompt">$</span> <span class="c-cmd">dwg2geo</span> convert corridor.dwg <span class="c-flag">\</span>
+    <span class="c-flag">--backend</span> native <span class="c-flag">--source-crs</span> EPSG:31983 <span class="c-flag">\</span>
+    <span class="c-flag">--source-units</span> m <span class="c-flag">--output</span> corridor.geojson
+
+<span class="c-cmt"># 16,065 features · 4,533/4,533 accounted · 0 violations</span>
+<span class="c-ok">wrote</span> corridor.geojson
+<span class="c-ok">wrote report</span> corridor.geojson.report.json
+
+<span class="c-prompt">$</span> <span class="c-cmd">jq</span> .native.accounting corridor.geojson.report.json
+<span class="c-ok">{</span> "model_space_entities": 4533,
+  "top_level_accounted": 4533,
+  "unaccounted": <span class="c-ok">0</span> <span class="c-ok">}</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="features" class="alt">
+    <div class="wrap">
+      <h2>Built for engineering data, not screenshots</h2>
+      <p class="sub">Every design choice serves one goal: output you can trust and verify — no silent loss, no fake georeferencing.</p>
+      <div class="grid f3">
+        <div class="card"><div class="ic">🧭</div><h3>Fails closed on CRS</h3><p>Requires a source CRS or an explicit local-coordinate override. Drawing units are trusted only when the header is unambiguous; otherwise you state them.</p></div>
+        <div class="card"><div class="ic">🔎</div><h3>No silent loss</h3><p>Every unsupported, skipped, failed, or approximated entity is counted with a reason and sample handles. The accounting must balance — or it warns.</p></div>
+        <div class="card"><div class="ic">🦀</div><h3>Pure-Rust native backend</h3><p>Reads DWG in-process via <code>acadrust</code> — no LibreDWG or GDAL needed. A self-contained binary that runs anywhere.</p></div>
+        <div class="card"><div class="ic">📐</div><h3>Real engineering geometry</h3><p>OCS→WCS arbitrary-axis transforms, bulge arcs, deterministic curve tessellation, nested INSERT/MINSERT expansion, and hatch loops with holes.</p></div>
+        <div class="card"><div class="ic">🌍</div><h3>PROJ reprojection & calibration</h3><p>In-process PROJ reprojection with resolved units and axis order, plus local control-point calibration for drawings without a CRS.</p></div>
+        <div class="card"><div class="ic">🧾</div><h3>Deterministic reports</h3><p>Same input, same bytes. A sidecar report records options, tool versions, source hash, bounding boxes, geometry checks, and outlier scans.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="entities">
+    <div class="wrap">
+      <h2>Entity coverage</h2>
+      <p class="sub">The native backend converts the common civil/utility drawing set — and every one of the 44 acadrust entity types has a documented policy, checked by a test.</p>
+      <div class="pills">
+        <span class="pill">POINT</span><span class="pill">LINE</span><span class="pill">LWPOLYLINE</span><span class="pill">POLYLINE 2D/3D</span><span class="pill">ARC</span><span class="pill">CIRCLE</span><span class="pill">ELLIPSE</span><span class="pill">SPLINE</span><span class="pill">3DFACE</span><span class="pill">SOLID</span><span class="pill">HATCH</span><span class="pill">TEXT</span><span class="pill">MTEXT</span><span class="pill">INSERT / blocks</span>
+      </div>
+      <p class="note">Bulge arcs and splines tessellate under an explicit chord tolerance; hatches nest into Polygons/MultiPolygons with holes; blocks expand with full transform composition and provenance. Deliberately unsupported types (rays, ACIS solids) and not-yet-converted types (dimensions, leaders, meshes) are reported, never guessed.</p>
+    </div>
+  </section>
+
+  <section id="install" class="alt">
+    <div class="wrap">
+      <h2>Install &amp; run</h2>
+      <p class="sub">Grab a self-contained binary, pull the container, or build from source.</p>
+      <div class="grid f2">
+        <div>
+          <div class="panel">
+<pre><code><span class="c-cmt"># Prebuilt release binary (Linux/macOS/Windows)</span>
+<span class="c-cmt"># from github.com/milkway/dwg2geo/releases</span>
+
+<span class="c-cmt"># or build from source (Rust 1.85+)</span>
+<span class="c-prompt">$</span> <span class="c-cmd">cargo</span> build <span class="c-flag">--release</span> <span class="c-flag">--features</span> native-backend
+
+<span class="c-cmt"># add PROJ reprojection (needs system PROJ ≥ 9.6)</span>
+<span class="c-prompt">$</span> <span class="c-cmd">cargo</span> build <span class="c-flag">--release</span> <span class="c-flag">--features</span> native-reproject</code></pre>
+          </div>
+        </div>
+        <div>
+          <div class="panel">
+<pre><code><span class="c-cmt"># Slim container — native binary only, 28 MB, MIT-clean</span>
+<span class="c-prompt">$</span> <span class="c-cmd">docker</span> build <span class="c-flag">-t</span> dwg2geo .
+<span class="c-prompt">$</span> <span class="c-cmd">docker</span> run <span class="c-flag">--rm</span> <span class="c-flag">-v</span> "$PWD:/w" dwg2geo <span class="c-flag">\</span>
+    inspect /w/drawing.dwg <span class="c-flag">--json</span>
+
+<span class="c-cmt"># check optional external tools</span>
+<span class="c-prompt">$</span> <span class="c-cmd">dwg2geo</span> doctor</code></pre>
+          </div>
+        </div>
+      </div>
+      <div class="steps" style="margin-top:18px">
+        <div class="step"><div class="n">01</div><h4>Inspect</h4><p>Signature, version, units, extents, layer &amp; entity histogram.</p></div>
+        <div class="step"><div class="n">02</div><h4>Choose CRS</h4><p>Source CRS + units, or explicit local coordinates.</p></div>
+        <div class="step"><div class="n">03</div><h4>Convert</h4><p>Native or external backend to deterministic GeoJSON.</p></div>
+        <div class="step"><div class="n">04</div><h4>Verify</h4><p>Read the sidecar report — accounting, checks, bounds.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="trust">
+    <div class="wrap">
+      <h2>Transparent by construction</h2>
+      <p class="sub">Multi-platform CI, a three-way independent audit, a verified architecture refactor, and a clean license posture.</p>
+      <div class="grid f3">
+        <div class="card"><div class="ic">✅</div><h3>CI on every platform</h3><p>fmt · clippy <code>-D warnings</code> · full test suite on Linux, macOS, and Windows, plus a PROJ-enabled reprojection job.</p></div>
+        <div class="card"><div class="ic">🛡️</div><h3>Audited &amp; verified</h3><p>Independent correctness, completeness, and robustness passes; findings fixed and re-verified against a baseline build.</p></div>
+        <div class="card"><div class="ic">📦</div><h3>SBOM &amp; licenses</h3><p>A CycloneDX SBOM and a full third-party license report ship with the repo; a CI gate blocks any new copyleft dependency.</p></div>
+      </div>
+      <div style="margin-top:22px" class="card">
+        <table class="lic">
+          <thead><tr><th>Component</th><th>License</th><th>Distribution</th></tr></thead>
+          <tbody>
+            <tr><td><code>dwg2geo</code> + native deps</td><td><span class="tag mit">MIT / permissive</span></td><td>Redistribute freely — release binaries &amp; slim container are MIT-clean.</td></tr>
+            <tr><td><code>acadrust</code> (DWG reader)</td><td><span class="tag mpl">MPL-2.0</span></td><td>File-level copyleft; binary distribution is unrestricted, no effect on dwg2geo's source.</td></tr>
+            <tr><td>LibreDWG (external backend)</td><td><span class="tag gpl">GPL-3.0</span></td><td>Invoked as a separate process, never bundled — installed by the user, so no GPL propagation.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot-inner">
+    <div><strong>dwg2geo</strong> · MIT-licensed · built with 🦀 Rust</div>
+    <div class="foot-links">
+      <a href="https://github.com/milkway/dwg2geo">Repository</a>
+      <a href="https://github.com/milkway/dwg2geo/releases">Releases</a>
+      <a href="https://github.com/milkway/dwg2geo/blob/main/docs/LICENSING.md">Licensing</a>
+      <a href="https://github.com/milkway/dwg2geo/blob/main/docs/ARCHITECTURE.md">Architecture</a>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

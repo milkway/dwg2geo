@@ -1,6 +1,15 @@
 # dwg2geo
 
+[![CI](https://github.com/milkway/dwg2geo/actions/workflows/ci.yml/badge.svg)](https://github.com/milkway/dwg2geo/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/milkway/dwg2geo?sort=semver)](https://github.com/milkway/dwg2geo/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-informational.svg)](https://github.com/milkway/dwg2geo/releases)
+[![Website](https://img.shields.io/badge/website-milkway.github.io%2Fdwg2geo-8A2BE2.svg)](https://milkway.github.io/dwg2geo/)
+
 An open-source CLI that converts engineering DWG drawings to GeoJSON with explicit coordinate-reference handling, diagnostics, and traceable conversion reports.
+
+**Website & docs:** <https://milkway.github.io/dwg2geo/>
 
 ## Current scope
 
