@@ -107,8 +107,8 @@ Exit condition: output positioning is explicit, reproducible, and sanity checked
 - [x] Validate polygon ring closure and orientation. (Same pass: every Polygon/MultiPolygon ring is checked for closure, CCW shells/CW holes, and minimum size.)
 - [x] Add golden GeoJSON tests with coordinate tolerances. (A synthetic AC1027 fixture pins seven native features; coordinates compare recursively within 1e-9; `UPDATE_GOLDEN=1` regenerates, and a sensitivity test proves the comparator catches 1e-6 drift.)
 - [ ] Add property-based tests for arc tessellation and affine transforms.
-- [ ] Differentially compare native output with LibreDWG/GDAL on a fixture corpus.
-- [ ] Establish acceptable loss thresholds per entity class.
+- [x] Differentially compare native output with LibreDWG/GDAL on a fixture corpus. (Three generated AC1027 drawings exercise primitive, curve, text, and block/INSERT behavior in `tests/differential.rs`; the real tools are probed and the tests skip gracefully without them.)
+- [x] Establish acceptable loss thresholds per entity class. (Exact count and spatial thresholds are established in `docs/DIFFERENTIAL.md`; any new divergence is a release blocker.)
 - [x] Detect spatial outliers relative to the main coordinate cluster (dispersion/percentile based). (Report `native.spatial_outliers`: robust median-center + 100x-MAD scan on drawing coordinates flags features far from the cluster, with sample ids and a warning; informational, never a failure. On the reference drawing it flags exactly the 2984 title-block/legend features found manually.)
 - [x] Validate output containment against a reference boundary polygon. (`--validate-boundary <GEOJSON>` accepts a Polygon/MultiPolygon in the output CRS — e.g. the IBGE municipal boundary fetched by `scripts/fetch-sorocaba-boundary.sh`, whose containment test conclusively identified the reference drawing's CRS — and reports inside/partial/outside counts with samples and a warning. Even-odd containment honors holes.)
 
