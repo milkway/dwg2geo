@@ -20,6 +20,10 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+# Opt every bundled JS action into the Node.js 24 runtime.
+env:
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
 jobs:
   deploy:
     environment:

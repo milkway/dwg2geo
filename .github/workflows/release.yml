@@ -16,6 +16,10 @@ on:
 permissions:
   contents: write
 
+# Opt every bundled JS action into the Node.js 24 runtime.
+env:
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
 jobs:
   build:
     name: build (${{ matrix.target }})
