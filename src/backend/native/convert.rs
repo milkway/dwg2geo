@@ -1062,20 +1062,27 @@ fn build_reprojection_plan(
             unit.name
         ));
     }
-    if (unit.meters_per_unit - 1.0).abs() > f64::EPSILON {
+    let reprojector = Reprojector::new(source_crs, request.target_crs, unit.meters_per_unit)?;
+    if reprojector.crs_unit.is_angular {
         warnings.push(format!(
-            "drawing coordinates are scaled by {} meters per drawing unit ({}) before the CRS transform, assuming a meter-based projected source CRS",
-            unit.meters_per_unit, unit.name
+            "source CRS {source_crs} is geographic with angular unit {}; the drawing unit declaration {} is treated only as an explicit declaration to trust coordinates already in CRS units, so linear units are ignored and coordinate scale 1 is applied",
+            reprojector.crs_unit.name, unit.name
+        ));
+    } else {
+        warnings.push(format!(
+            "source CRS {source_crs} horizontal unit resolved by PROJ as {}; applying coordinate scale {} CRS units per drawing unit ({})",
+            reprojector.crs_unit.name, reprojector.coordinate_scale, unit.name
         ));
     }
 
-    let reprojector = Reprojector::new(source_crs, request.target_crs, unit.meters_per_unit)?;
     let info = report::ReprojectionInfo {
         source_crs: source_crs.to_string(),
         target_crs: request.target_crs.to_string(),
         drawing_unit: unit.name.to_string(),
         unit_source: unit_source.to_string(),
         meters_per_drawing_unit: unit.meters_per_unit,
+        crs_unit: reprojector.crs_unit.name.clone(),
+        coordinate_scale: reprojector.coordinate_scale,
         axis_order: super::reproject::AXIS_ORDER.to_string(),
         pipeline: reprojector.pipeline(),
         proj_version: reprojector.proj_version(),

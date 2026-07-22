@@ -301,6 +301,7 @@ dependencies = [
  "geo-types",
  "geojson",
  "proj",
+ "proj-sys",
  "proptest",
  "serde",
  "serde_json",

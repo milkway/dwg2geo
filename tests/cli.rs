@@ -881,6 +881,8 @@ fn native_reprojection_transforms_and_records_provenance() {
     assert_eq!(reprojection["unit_source"], "override");
     assert_eq!(reprojection["drawing_unit"], "meters");
     assert_eq!(reprojection["meters_per_drawing_unit"], 1.0);
+    assert_eq!(reprojection["crs_unit"], "metre");
+    assert_eq!(reprojection["coordinate_scale"], 1.0);
     assert!(
         reprojection["proj_version"]
             .as_str()
@@ -1071,14 +1073,13 @@ fn calibration_validation_fails_closed() {
 
 #[cfg(feature = "native-reproject")]
 #[test]
-fn implausible_wgs84_extents_fail_closed_unless_overridden() {
+fn geographic_source_crs_rejects_linear_drawing_units() {
     let dir = TempDir::new().expect("temporary directory");
     let fixture = write_convert_fixture(dir.path());
     let out = dir.path().join("out.geojson");
 
-    // Degrees scaled by 1000: the identity transform then yields longitudes
-    // in the tens of thousands — exactly the wrong-units mistake the check
-    // exists to catch.
+    // Linear units cannot describe angular coordinates. This now fails before
+    // transformation instead of relying on the WGS84 extent backstop.
     let args = [
         "--backend",
         "native",
@@ -1099,13 +1100,12 @@ fn implausible_wgs84_extents_fail_closed_unless_overridden() {
         .expect("run binary");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("implausible"), "stderr: {stderr}");
-    assert!(
-        stderr.contains("--allow-suspect-extents"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("geographic"), "stderr: {stderr}");
+    assert!(stderr.contains("--source-units m"), "stderr: {stderr}");
     assert!(!out.exists());
 
+    // The suspect-extents override cannot override a dimensionally invalid
+    // unit declaration.
     let output = binary()
         .arg("convert")
         .arg(&fixture)
@@ -1116,6 +1116,40 @@ fn implausible_wgs84_extents_fail_closed_unless_overridden() {
         .output()
         .expect("run binary");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("geographic"), "stderr: {stderr}");
+    assert!(!out.exists());
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args([
+            "--backend",
+            "native",
+            "--source-crs",
+            "EPSG:4326",
+            "--target-crs",
+            "EPSG:4326",
+            "--source-units",
+            "m",
+        ])
+        .output()
+        .expect("run binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
-    assert!(out.exists());
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("out.geojson.report.json")).expect("read report"),
+    )
+    .expect("valid report");
+    assert_eq!(report["native"]["reprojection"]["coordinate_scale"], 1.0);
+    assert_eq!(report["native"]["reprojection"]["crs_unit"], "degree");
+    let warnings = report["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("geographic") && text.contains("ignored"))),
+        "{warnings:?}"
+    );
 }
