@@ -11,6 +11,11 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Build the authoritative clap command tree used by help and packaging assets.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
+}
+
 // The Convert variant dwarfs the others; a single Command is parsed once
 // per process, so boxing it would only add noise.
 #[allow(clippy::large_enum_variant)]
