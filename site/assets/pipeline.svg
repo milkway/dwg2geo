@@ -65,16 +65,14 @@
   <text class="sub" x="762" y="142" text-anchor="middle" font-size="11">WGS84 extent (fail-safe)</text>
   <text class="flag" x="762" y="170" text-anchor="middle" font-size="12">--validate-boundary</text>
 
-  <!-- to output -->
-  <path class="edge" d="M762,194 L762,224" marker-end="url(#p)"/>
-
-  <!-- Stage 5: output -->
-  <text class="tag" x="452" y="244" font-size="11">5 · OUTPUT — deterministic</text>
-  <rect class="box out" x="452" y="254" width="230" height="60" rx="12"/>
-  <text class="lbl" x="567" y="280" text-anchor="middle" font-size="13">GeoJSON / GeoJSONSeq</text>
-  <text class="sub" x="567" y="300" text-anchor="middle" font-size="11">via --output-format</text>
-  <path class="edge" d="M682,284 L706,284" marker-end="url(#p)"/>
-  <rect class="box out" x="710" y="254" width="150" height="60" rx="12"/>
-  <text class="lbl" x="785" y="280" text-anchor="middle" font-size="13">report.json</text>
-  <text class="sub" x="785" y="300" text-anchor="middle" font-size="11">options · checks · hash</text>
+  <!-- Stage 5: validate writes BOTH outputs -->
+  <text class="tag" x="452" y="242" font-size="11">5 · OUTPUT — deterministic</text>
+  <path class="edge" d="M726,194 C726,224 560,222 545,248" marker-end="url(#p)"/>
+  <path class="edge" d="M798,194 C798,226 780,224 778,248" marker-end="url(#p)"/>
+  <rect class="box out" x="452" y="252" width="180" height="60" rx="12"/>
+  <text class="lbl" x="542" y="278" text-anchor="middle" font-size="13">report.json</text>
+  <text class="sub" x="542" y="298" text-anchor="middle" font-size="11">options · checks · hash</text>
+  <rect class="box out" x="672" y="252" width="212" height="60" rx="12"/>
+  <text class="lbl" x="778" y="278" text-anchor="middle" font-size="13">GeoJSON / GeoJSONSeq</text>
+  <text class="sub" x="778" y="298" text-anchor="middle" font-size="11">via --output-format</text>
 </svg>
