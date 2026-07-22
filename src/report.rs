@@ -103,6 +103,9 @@ pub struct ConversionOptions {
     /// How INSERT references were handled: "explode" or "preserve-inserts".
     /// `None` on routes that do not resolve blocks themselves.
     pub block_mode: Option<String>,
+    /// Native output format: "geojson" or "geojson-seq". `None` on routes
+    /// that do not choose the output representation themselves.
+    pub output_format: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +169,7 @@ mod tests {
                 polygonize_closed: false,
                 curve_tolerance: None,
                 block_mode: None,
+                output_format: None,
             },
             external_tools: Vec::new(),
             steps: vec![Step {
@@ -188,6 +192,8 @@ mod tests {
         let first = serde_json::to_string_pretty(&sample()).expect("serialize");
         let second = serde_json::to_string_pretty(&sample()).expect("serialize");
         assert_eq!(first, second);
+        let serialized: serde_json::Value = serde_json::from_str(&first).expect("valid JSON");
+        assert!(serialized["options"]["output_format"].is_null());
 
         let order = [
             "\"report_version\"",

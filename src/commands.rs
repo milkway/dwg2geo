@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::{
-    backend::{self, ConvertRequest},
+    backend::{self, ConvertRequest, OutputFormat},
     cli::{BackendChoice, Command},
     dwg,
 };
@@ -98,6 +98,7 @@ pub fn execute(command: Command) -> Result<()> {
             keep_intermediate,
             include_layers,
             exclude_layers,
+            output_format,
             polygonize_closed,
             curve_tolerance,
             explode_blocks,
@@ -113,6 +114,12 @@ pub fn execute(command: Command) -> Result<()> {
             {
                 bail!(
                     "layer filtering runs on the GDAL route and requires --source-crs; it cannot be combined with --allow-local-coordinates"
+                );
+            }
+
+            if output_format == OutputFormat::GeoJsonSeq && backend != BackendChoice::Native {
+                bail!(
+                    "--output-format geojson-seq is only supported by the native backend; pass --backend native"
                 );
             }
 
@@ -155,6 +162,7 @@ pub fn execute(command: Command) -> Result<()> {
                 keep_intermediate,
                 include_layers: &include_layers,
                 exclude_layers: &exclude_layers,
+                output_format,
                 polygonize_closed,
                 curve_tolerance,
                 preserve_inserts,

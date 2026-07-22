@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::{TempDir, tempdir};
 
 use super::{
-    ConvertRequest, append_suffix, check_output_collision, ensure_nonempty_output,
+    ConvertRequest, OutputFormat, append_suffix, check_output_collision, ensure_nonempty_output,
     ensure_parent_directory, remove_stale,
     tools::{self, ToolInfo},
     validate_input,
@@ -64,8 +64,9 @@ pub fn doctor(json: bool) -> Result<()> {
 pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let started = Instant::now();
 
-    // The CLI rejects the native-only block-mode flags before reaching here.
+    // The CLI rejects the native-only block-mode and output-format flags before reaching here.
     debug_assert!(!request.preserve_inserts);
+    debug_assert_eq!(request.output_format, OutputFormat::GeoJson);
 
     validate_input(request.input)?;
     check_output_collision(request.output, request.force)?;
@@ -144,6 +145,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             // and block-mode flags for the external backend.
             curve_tolerance: request.curve_tolerance,
             block_mode: None,
+            output_format: None,
         },
         external_tools,
         steps,

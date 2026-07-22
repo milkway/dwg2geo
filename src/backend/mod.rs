@@ -9,6 +9,25 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    #[value(name = "geojson")]
+    GeoJson,
+
+    #[value(name = "geojson-seq")]
+    GeoJsonSeq,
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::GeoJson => "geojson",
+            Self::GeoJsonSeq => "geojson-seq",
+        })
+    }
+}
 
 pub struct ConvertRequest<'a> {
     pub input: &'a Path,
@@ -20,6 +39,7 @@ pub struct ConvertRequest<'a> {
     pub keep_intermediate: bool,
     pub include_layers: &'a [String],
     pub exclude_layers: &'a [String],
+    pub output_format: OutputFormat,
     pub polygonize_closed: bool,
     pub curve_tolerance: Option<f64>,
     pub preserve_inserts: bool,
