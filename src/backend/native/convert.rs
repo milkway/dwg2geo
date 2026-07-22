@@ -8,7 +8,12 @@
 //! features follow model-space document order, identifiers come from entity
 //! handles, and all curve approximation uses pure arithmetic on the inputs.
 
-use std::{collections::BTreeMap, fs, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufWriter, Write},
+    time::Instant,
+};
 
 use acadrust::{
     CadDocument,
@@ -23,8 +28,8 @@ use geojson::{
 use super::{ReadMode, read_document};
 use crate::{
     backend::{
-        ConvertRequest, append_suffix, check_output_collision, ensure_nonempty_output,
-        ensure_parent_directory, remove_stale, validate_input,
+        ConvertRequest, OutputFormat, append_suffix, check_output_collision,
+        ensure_nonempty_output, ensure_parent_directory, remove_stale, validate_input,
     },
     dwg,
     report::{
@@ -354,22 +359,45 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     }
 
     let features_written = extraction.features.len();
-    let collection = FeatureCollection {
-        bbox: None,
-        features: extraction.features,
-        foreign_members: Some(foreign_members(&source)),
-    };
+    let features = extraction.features;
 
     let partial = append_suffix(request.output, ".partial");
     remove_stale(&partial)?;
 
-    let mut json = serde_json::to_string_pretty(&collection)
-        .context("cannot serialize GeoJSON feature collection")?;
-    json.push('\n');
-    if let Err(error) = fs::write(&partial, json)
-        .with_context(|| format!("cannot write output {}", partial.display()))
-        .and_then(|()| ensure_nonempty_output(&partial))
-    {
+    let write_result = match request.output_format {
+        OutputFormat::GeoJson => {
+            let collection = FeatureCollection {
+                bbox: None,
+                features,
+                foreign_members: Some(foreign_members(&source)),
+            };
+            serde_json::to_string_pretty(&collection)
+                .context("cannot serialize GeoJSON feature collection")
+                .and_then(|mut json| {
+                    json.push('\n');
+                    fs::write(&partial, json)
+                        .with_context(|| format!("cannot write output {}", partial.display()))
+                })
+        }
+        OutputFormat::GeoJsonSeq => {
+            let file = fs::File::create(&partial)
+                .with_context(|| format!("cannot write output {}", partial.display()));
+            file.and_then(|file| {
+                let mut writer = BufWriter::new(file);
+                for feature in features {
+                    serde_json::to_writer(&mut writer, &feature)
+                        .context("cannot serialize GeoJSONSeq feature")?;
+                    writer
+                        .write_all(b"\n")
+                        .with_context(|| format!("cannot write output {}", partial.display()))?;
+                }
+                writer
+                    .flush()
+                    .with_context(|| format!("cannot write output {}", partial.display()))
+            })
+        }
+    };
+    if let Err(error) = write_result.and_then(|()| ensure_nonempty_output(&partial)) {
         let _ = fs::remove_file(&partial);
         return Err(error);
     }
@@ -405,6 +433,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
                 }
                 .to_string(),
             ),
+            output_format: Some(request.output_format.to_string()),
         },
         external_tools: Vec::new(),
         steps,

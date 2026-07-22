@@ -462,6 +462,29 @@ fn polygonize_closed_requires_native_backend() {
 }
 
 #[test]
+fn geojson_seq_requires_native_backend() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojsonseq"))
+        .args([
+            "--allow-local-coordinates",
+            "--output-format",
+            "geojson-seq",
+        ])
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--backend native"), "stderr: {stderr}");
+}
+
+#[test]
 fn block_modes_require_native_backend_and_are_mutually_exclusive() {
     let dir = TempDir::new().expect("temporary directory");
     let fixture = write_fixture(dir.path(), "fixture.dwg");
@@ -572,6 +595,24 @@ fn run_native_convert(fixture: &Path, out: &Path) -> std::process::Output {
 }
 
 #[cfg(feature = "native-backend")]
+fn run_native_geojson_seq_convert(fixture: &Path, out: &Path) -> std::process::Output {
+    binary()
+        .arg("convert")
+        .arg(fixture)
+        .arg("--output")
+        .arg(out)
+        .args([
+            "--backend",
+            "native",
+            "--allow-local-coordinates",
+            "--output-format",
+            "geojson-seq",
+        ])
+        .output()
+        .expect("run binary")
+}
+
+#[cfg(feature = "native-backend")]
 #[test]
 fn native_convert_writes_geojson_and_accounted_report() {
     let dir = TempDir::new().expect("temporary directory");
@@ -657,6 +698,67 @@ fn native_convert_output_is_deterministic() {
     let first = fs::read(&first_out).expect("first output");
     let second = fs::read(&second_out).expect("second output");
     assert_eq!(first, second, "GeoJSON output must be byte-identical");
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_convert_writes_geojson_seq_and_records_format() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let out = dir.path().join("saída ç.geojsonseq");
+
+    let output = run_native_geojson_seq_convert(&fixture, &out);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    let contents = fs::read_to_string(&out).expect("output exists");
+    let lines: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(!lines.is_empty());
+    for line in &lines {
+        let feature: serde_json::Value =
+            serde_json::from_str(line).expect("each line must be valid JSON");
+        assert!(feature.is_object());
+        assert_eq!(feature["type"], "Feature");
+    }
+
+    let report_path = dir.path().join("saída ç.geojsonseq.report.json");
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("report exists"))
+            .expect("report is JSON");
+    assert_eq!(report["options"]["output_format"], "geojson-seq");
+    assert_eq!(
+        lines.len() as u64,
+        report["native"]["features_written"]
+            .as_u64()
+            .expect("features_written")
+    );
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn native_geojson_seq_output_is_deterministic() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let first_out = dir.path().join("first.geojsonseq");
+    let second_out = dir.path().join("second.geojsonseq");
+
+    assert!(
+        run_native_geojson_seq_convert(&fixture, &first_out)
+            .status
+            .success()
+    );
+    assert!(
+        run_native_geojson_seq_convert(&fixture, &second_out)
+            .status
+            .success()
+    );
+
+    let first = fs::read(&first_out).expect("first output");
+    let second = fs::read(&second_out).expect("second output");
+    assert_eq!(first, second, "GeoJSONSeq output must be byte-identical");
 }
 
 #[cfg(feature = "native-backend")]

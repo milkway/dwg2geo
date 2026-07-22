@@ -72,7 +72,7 @@ Cross-cutting tasks:
 - [x] stable feature IDs; entity handles, with a document-order fallback for null handles.
 - [x] per-entity error isolation; failures and skips are per-entity outcomes with reasons and sample handles, never command aborts.
 - [x] geometry-validity checks — non-finite coordinates, degenerate lines, sub-minimal rings. (Deeper checks — self-intersection, duplicate vertices — belong to Milestone 6.)
-- [ ] `GeoJSONSeq` streaming mode for large drawings.
+- [x] `GeoJSONSeq` streaming mode for large drawings. (`--output-format geojson-seq` writes one Feature per line with deterministic ordering; the sidecar report preserves output-format and local-coordinate metadata.)
 
 Exit condition: common civil/utility plan geometry converts natively with quantified losses.
 

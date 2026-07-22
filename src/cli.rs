@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::backend::OutputFormat;
+
 #[derive(Debug, Parser)]
 #[command(name = "dwg2geo", version, about)]
 pub struct Cli {
@@ -83,6 +85,10 @@ pub enum Command {
             conflicts_with = "include_layers"
         )]
         exclude_layers: Vec<String>,
+
+        /// Output format (native backend only).
+        #[arg(long, value_enum, default_value = "geojson")]
+        output_format: OutputFormat,
 
         /// Emit closed polylines as Polygons instead of closed LineStrings
         /// (native backend only; see ADR-006).
