@@ -6,8 +6,10 @@
 
 pub mod calibrate;
 pub mod convert;
+pub mod model;
 #[cfg(feature = "native-reproject")]
 pub mod reproject;
+pub mod writer;
 // Consumed by the reproject path; compiled (and unit-tested) without it so
 // the units policy cannot bitrot behind the optional feature.
 #[cfg_attr(not(feature = "native-reproject"), allow(dead_code))]

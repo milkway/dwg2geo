@@ -162,7 +162,7 @@ Contract and completeness:
 - [x] B5: commit a non-sensitive aggregate entity histogram of the reference drawing. (`samples/corredor-sul-histogram.json`: 17 entity types by space, unit metadata, source sha256 — the "8/17 match" and outlier claims are now auditable.)
 - [x] B7: emit text alignment/layout semantics (alignment modes, width factor, oblique; MTEXT attachment/columns). (Non-default-only emission keeps golden output unchanged; anchor selection now follows DXF rules — left/baseline uses the insertion point even with a stray alignment point.)
 - [x] B8: tolerance-driven spline sampling; implement or explicitly re-roadmap curve-fit/spline-fit polylines and meshes. (SPLINE and hatch spline edges double segment counts from a span floor until the midpoint chord-error estimate meets `--curve-tolerance`, capped at 256 with a warning. Curve-fit/spline-fit polylines and meshes are re-roadmapped in ENTITY_MAPPING's not-yet-converted table.)
-- [ ] B9: introduce the CAD-neutral internal model promised by ADR-004 before expanding entity coverage further.
+- [x] B9: introduce the CAD-neutral internal model promised by ADR-004. (`model.rs` defines `CadFeature`/`CadGeometry` with no acadrust or geojson types; converters produce them, the whole pipeline — transforms, validity checks, bbox, outliers, boundary — operates on them, and `writer.rs` is the single place they become GeoJSON.)
 - [x] B10: reader-to-output integration fixtures per entity class (supported and deliberately unsupported). (tests/entity_e2e.rs: 9 supported classes end-to-end plus XLINE/3DSOLID/LEADER skip-and-account; Surface cannot round-trip through the acadrust writer, documented in-file.)
 - [x] B11: refresh stale CLI help/README claims; record disposition of `entities`/`validate`/`calibrate` future commands. (README current-scope rewritten; `--backend native` help updated; dispositions in docs/DECISIONS-FUTURE-COMMANDS.md.)
 - [x] B12: make `doctor` health reflect per-route capability. (Per-route capability in JSON and human output; healthy/exit 0 requires both tools; ADR-013.)
@@ -170,7 +170,7 @@ Contract and completeness:
 Performance and robustness:
 
 - [x] C2: profile and fix the quadratic scaling in hatch-heavy drawings (measured 4x time per 2x hatches). (Root cause: all-pairs even-odd nesting inside a single hatch with many loops. Ring-bbox pre-check plus a uniform x-grid over loop bboxes: 16k loops in one hatch went from ~3.4 s to 23 ms release, byte-identical output.)
-- [ ] C3: streaming extraction for geojson-seq so memory is not O(total features) (~2.5 GB per million features today).
+- [x] C3: streaming extraction for geojson-seq so memory is not O(total features). (Extraction hands each `CadFeature` to a sink; the geojson-seq route writes it to disk immediately instead of retaining it. Measured on 400k points: peak RSS 522 MB streaming vs 1175 MB collected.)
 - [x] C4: adopt a versioning rule for the report schema (bump on any addition, or add a minor version). (REPORT_VERSION = 2 with a documented bump-on-addition rule.)
 
 Exit condition: A- and C-class findings closed; B-class findings closed or explicitly re-scoped with ADRs.

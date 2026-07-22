@@ -21,15 +21,14 @@ use acadrust::{
     types::{Color, Matrix3, Vector3},
 };
 use anyhow::{Context, Result, bail};
-use geojson::{
-    Feature, FeatureCollection, Geometry, GeometryValue, JsonObject, JsonValue, feature::Id,
-};
+use geojson::{Feature, FeatureCollection, GeometryValue, JsonObject, JsonValue};
 
+use super::model::{CadFeature, CadGeometry};
 #[cfg(feature = "native-reproject")]
 use super::reproject::Reprojector;
 #[cfg(feature = "native-reproject")]
 use super::units;
-use super::{ReadMode, read_document};
+use super::{ReadMode, read_document, writer};
 use crate::{
     backend::{
         ConvertRequest, OutputFormat, append_suffix, check_output_collision,
@@ -424,57 +423,106 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             .collect(),
     };
 
+    // Per-feature pipeline (model -> stats -> transform -> checks -> write).
+    // The geojson-seq route streams every feature to disk immediately, so
+    // memory stays bounded by the parsed document rather than the feature
+    // count; the pretty FeatureCollection route must hold the features to
+    // emit one JSON document.
+    let partial = append_suffix(request.output, ".partial");
+    remove_stale(&partial)?;
+
+    let boundary_index = match request.validate_boundary {
+        Some(path) => Some(BoundaryIndex::load(path)?),
+        None => None,
+    };
+    let mut boundary_tally = BoundaryTally::default();
+
+    let georeferenced = request.source_crs.is_some() || calibration_plan.is_some();
+    let enforce_wgs84_extents =
+        georeferenced && crs_is_wgs84(request.target_crs) && !request.allow_suspect_extents;
+
+    let mut collected: Vec<Feature> = Vec::new();
+    let mut seq_writer = match request.output_format {
+        OutputFormat::GeoJsonSeq => Some(BufWriter::new(
+            fs::File::create(&partial)
+                .with_context(|| format!("cannot write output {}", partial.display()))?,
+        )),
+        OutputFormat::GeoJson => None,
+    };
+
+    let mut bbox_drawing: Option<[f64; 4]> = None;
+    let mut bbox_output: Option<[f64; 4]> = None;
+    let mut geometry_checks = empty_geometry_checks();
+    let mut centers: Vec<(String, f64, f64)> = Vec::new();
+    let mut features_written = 0usize;
+
     let extract_started = Instant::now();
-    let extraction = extract(&document, &geometry_options)?;
+    let extraction = {
+        let mut sink = |mut feature: CadFeature| -> Result<()> {
+            accumulate_bbox(&mut bbox_drawing, &feature);
+            if let Some(center) = feature_center(&feature) {
+                centers.push((feature.id.clone(), center.0, center.1));
+            }
+            #[cfg(feature = "native-reproject")]
+            if let Some(plan) = &reprojection_plan {
+                let reprojector = &plan.reprojector;
+                feature
+                    .geometry
+                    .transform(&|x, y| reprojector.transform(x, y))
+                    .with_context(|| format!("while reprojecting feature {}", feature.id))?;
+            }
+            if let Some((calibration, _)) = &calibration_plan {
+                feature
+                    .geometry
+                    .transform(&|x, y| Ok(calibration.apply((x, y))))
+                    .with_context(|| format!("while calibrating feature {}", feature.id))?;
+            }
+            if enforce_wgs84_extents {
+                if let Some((x, y)) = wgs84_violation(&feature) {
+                    bail!(
+                        "output contains implausible WGS 84 coordinates (feature {}: {x}, {y}); the source CRS, --source-units, or control points are probably wrong for this drawing. Pass --allow-suspect-extents to deliver anyway",
+                        feature.id
+                    );
+                }
+            }
+            accumulate_bbox(&mut bbox_output, &feature);
+            update_geometry_checks(&mut geometry_checks, &feature);
+            if let Some(index) = &boundary_index {
+                index.classify(&feature, &mut boundary_tally);
+            }
+            match &mut seq_writer {
+                Some(writer_handle) => {
+                    serde_json::to_writer(&mut *writer_handle, &writer::to_geojson(&feature))
+                        .context("cannot serialize GeoJSONSeq feature")?;
+                    writer_handle
+                        .write_all(b"\n")
+                        .with_context(|| format!("cannot write output {}", partial.display()))?;
+                }
+                None => collected.push(writer::to_geojson(&feature)),
+            }
+            features_written += 1;
+            Ok(())
+        };
+        match extract_with_sink(&document, &geometry_options, &mut sink) {
+            Ok(extraction) => extraction,
+            Err(error) => {
+                let _ = fs::remove_file(&partial);
+                return Err(error);
+            }
+        }
+    };
     steps.push(Step {
         purpose: "entity extraction and GeoJSON mapping".to_string(),
         command: "(in-process converter)".to_string(),
         duration_ms: extract_started.elapsed().as_millis() as u64,
     });
 
-    if extraction.features.is_empty() {
+    if features_written == 0 {
         warnings.push(
             "no features were converted; see the native section of the report for reasons"
                 .to_string(),
         );
     }
-
-    let features_written = extraction.features.len();
-    let mut features = extraction.features;
-    let bbox_drawing = features_bbox(&features);
-    // Outlier scan runs on drawing coordinates, before any transform.
-    let spatial_outliers = detect_spatial_outliers(&features);
-
-    #[cfg(feature = "native-reproject")]
-    if let Some(plan) = &reprojection_plan {
-        let transform_started = Instant::now();
-        let reprojector = &plan.reprojector;
-        transform_features(&mut features, &|x, y| reprojector.transform(x, y))?;
-        steps.push(Step {
-            purpose: "coordinate reprojection".to_string(),
-            command: format!("(in-process PROJ {})", plan.info.proj_version),
-            duration_ms: transform_started.elapsed().as_millis() as u64,
-        });
-    }
-    if let Some((calibration, _)) = &calibration_plan {
-        let transform_started = Instant::now();
-        transform_features(&mut features, &|x, y| Ok(calibration.apply((x, y))))?;
-        steps.push(Step {
-            purpose: "control-point calibration".to_string(),
-            command: "(in-process similarity transform)".to_string(),
-            duration_ms: transform_started.elapsed().as_millis() as u64,
-        });
-    }
-
-    let georeferenced = request.source_crs.is_some() || calibration_plan.is_some();
-    if georeferenced && crs_is_wgs84(request.target_crs) && !request.allow_suspect_extents {
-        if let Some((id, x, y)) = wgs84_out_of_range(&features) {
-            bail!(
-                "output contains implausible WGS 84 coordinates (feature {id}: {x}, {y}); the source CRS, --source-units, or control points are probably wrong for this drawing. Pass --allow-suspect-extents to deliver anyway"
-            );
-        }
-    }
-    let features = features;
 
     #[cfg(feature = "native-reproject")]
     let reprojection_info = reprojection_plan.map(|plan| plan.info);
@@ -482,8 +530,8 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let reprojection_info: Option<report::ReprojectionInfo> = None;
     let calibration_info = calibration_plan.map(|(_, info)| info);
 
-    let bbox_output = features_bbox(&features);
-    let geometry_checks = check_geometries(&features);
+    let spatial_outliers = finalize_spatial_outliers(&centers);
+    drop(centers);
     let accounting = report::AccountingInfo {
         model_space_entities: extraction.model_space_entities,
         top_level_accounted: extraction.top_level_accounted,
@@ -513,29 +561,22 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             spatial_outliers.outlier_features, spatial_outliers.features_checked
         ));
     }
-    let boundary_check = match request.validate_boundary {
-        Some(path) => Some(check_boundary(&features, path)?),
-        None => None,
-    };
+    let boundary_check = boundary_index.map(|index| index.into_report(boundary_tally));
     if let Some(check) = &boundary_check {
         let not_inside = check.features_partial + check.features_outside;
         if not_inside != 0 {
             warnings.push(format!(
-                "{not_inside} of {} features are not fully inside the reference boundary {} (see the report's boundary_check)",
-                features.len(),
+                "{not_inside} of {features_written} features are not fully inside the reference boundary {} (see the report's boundary_check)",
                 check.boundary_path
             ));
         }
     }
 
-    let partial = append_suffix(request.output, ".partial");
-    remove_stale(&partial)?;
-
     let write_result = match request.output_format {
         OutputFormat::GeoJson => {
             let collection = FeatureCollection {
                 bbox: None,
-                features,
+                features: collected,
                 foreign_members: Some(foreign_members(
                     &source,
                     reprojection_info.as_ref(),
@@ -550,23 +591,11 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
                         .with_context(|| format!("cannot write output {}", partial.display()))
                 })
         }
-        OutputFormat::GeoJsonSeq => {
-            let file = fs::File::create(&partial)
-                .with_context(|| format!("cannot write output {}", partial.display()));
-            file.and_then(|file| {
-                let mut writer = BufWriter::new(file);
-                for feature in features {
-                    serde_json::to_writer(&mut writer, &feature)
-                        .context("cannot serialize GeoJSONSeq feature")?;
-                    writer
-                        .write_all(b"\n")
-                        .with_context(|| format!("cannot write output {}", partial.display()))?;
-                }
-                writer
-                    .flush()
-                    .with_context(|| format!("cannot write output {}", partial.display()))
-            })
-        }
+        OutputFormat::GeoJsonSeq => seq_writer
+            .take()
+            .expect("seq writer exists in geojson-seq mode")
+            .flush()
+            .with_context(|| format!("cannot write output {}", partial.display())),
     };
     if let Err(error) = write_result.and_then(|()| ensure_nonempty_output(&partial)) {
         let _ = fs::remove_file(&partial);
@@ -708,30 +737,16 @@ fn crs_is_wgs84(crs: &str) -> bool {
     normalized == "EPSG:4326" || normalized == "OGC:CRS84" || normalized == "CRS84"
 }
 
-/// First coordinate outside the plausible WGS 84 longitude/latitude range,
-/// with the id of the feature carrying it.
-fn wgs84_out_of_range(features: &[Feature]) -> Option<(String, f64, f64)> {
-    for feature in features {
-        let Some(geometry) = &feature.geometry else {
-            continue;
-        };
-        let mut offending = None;
-        visit_positions(&geometry.value, &mut |x, y| {
-            if offending.is_none()
-                && (!(-180.0..=180.0).contains(&x) || !(-90.0..=90.0).contains(&y))
-            {
-                offending = Some((x, y));
-            }
-        });
-        if let Some((x, y)) = offending {
-            let id = match &feature.id {
-                Some(Id::String(id)) => id.clone(),
-                other => format!("{other:?}"),
-            };
-            return Some((id, x, y));
+/// First coordinate of one feature outside the plausible WGS 84
+/// longitude/latitude range.
+fn wgs84_violation(feature: &CadFeature) -> Option<(f64, f64)> {
+    let mut offending = None;
+    feature.geometry.visit_positions(&mut |x, y| {
+        if offending.is_none() && (!(-180.0..=180.0).contains(&x) || !(-90.0..=90.0).contains(&y)) {
+            offending = Some((x, y));
         }
-    }
-    None
+    });
+    offending
 }
 
 /// Deviation factor for the robust outlier scan: a feature is an outlier
@@ -750,34 +765,25 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
-/// Robust scan for features far from the main coordinate cluster; see
-/// [`report::SpatialOutliers`]. Informational only.
-fn detect_spatial_outliers(features: &[Feature]) -> report::SpatialOutliers {
-    let mut centers: Vec<(String, f64, f64)> = Vec::with_capacity(features.len());
-    for feature in features {
-        let Some(geometry) = &feature.geometry else {
-            continue;
-        };
-        let mut bbox: Option<[f64; 4]> = None;
-        visit_positions(&geometry.value, &mut |x, y| {
-            if x.is_finite() && y.is_finite() {
-                bbox = Some(match bbox {
-                    None => [x, y, x, y],
-                    Some([min_x, min_y, max_x, max_y]) => {
-                        [min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y)]
-                    }
-                });
-            }
-        });
-        if let Some([min_x, min_y, max_x, max_y]) = bbox {
-            let id = match &feature.id {
-                Some(Id::String(id)) => id.clone(),
-                other => format!("{other:?}"),
-            };
-            centers.push((id, (min_x + max_x) / 2.0, (min_y + max_y) / 2.0));
+/// The feature's finite bbox center, for the outlier scan.
+fn feature_center(feature: &CadFeature) -> Option<(f64, f64)> {
+    let mut bbox: Option<[f64; 4]> = None;
+    feature.geometry.visit_positions(&mut |x, y| {
+        if x.is_finite() && y.is_finite() {
+            bbox = Some(match bbox {
+                None => [x, y, x, y],
+                Some([min_x, min_y, max_x, max_y]) => {
+                    [min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y)]
+                }
+            });
         }
-    }
+    });
+    bbox.map(|[min_x, min_y, max_x, max_y]| ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0))
+}
 
+/// Robust scan over the collected (id, center) pairs; see
+/// [`report::SpatialOutliers`]. Informational only.
+fn finalize_spatial_outliers(centers: &[(String, f64, f64)]) -> report::SpatialOutliers {
     if centers.is_empty() {
         return report::SpatialOutliers {
             features_checked: 0,
@@ -811,7 +817,7 @@ fn detect_spatial_outliers(features: &[Feature]) -> report::SpatialOutliers {
 
     let mut outliers = 0usize;
     let mut sample_ids = Vec::new();
-    for (id, x, y) in &centers {
+    for (id, x, y) in centers {
         if (x - median_x).abs() > threshold_x || (y - median_y).abs() > threshold_y {
             outliers += 1;
             if sample_ids.len() < MAX_HANDLE_SAMPLES {
@@ -829,94 +835,111 @@ fn detect_spatial_outliers(features: &[Feature]) -> report::SpatialOutliers {
     }
 }
 
-/// Load a boundary GeoJSON (Polygon/MultiPolygon in Feature,
-/// FeatureCollection, or bare Geometry form) and classify every output
-/// feature's containment; see [`report::BoundaryCheck`].
-fn check_boundary(features: &[Feature], path: &std::path::Path) -> Result<report::BoundaryCheck> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("cannot read boundary file {}", path.display()))?;
-    let boundary: geojson::GeoJson = text
-        .parse()
-        .with_context(|| format!("boundary file {} is not valid GeoJSON", path.display()))?;
+/// A reference boundary loaded from GeoJSON, validated once and reused for
+/// every feature classification.
+struct BoundaryIndex {
+    path: String,
+    polygons: Vec<Vec<Vec<(f64, f64)>>>,
+}
 
-    // Convert one boundary ring defensively: GeoJSON accepted by serde can
-    // still carry short positions, open rings, or non-finite numbers, and a
-    // reference boundary must be rejected loudly rather than panicking or
-    // classifying against garbage.
-    let convert_ring = |ring: &Vec<geojson::Position>| -> Result<Vec<(f64, f64)>> {
-        let mut points = Vec::with_capacity(ring.len());
-        for position in ring {
-            if position.len() < 2 {
-                bail!("a boundary position has fewer than two coordinates");
-            }
-            let (x, y) = (position[0], position[1]);
-            if !x.is_finite() || !y.is_finite() {
-                bail!("a boundary position is not finite");
-            }
-            points.push((x, y));
-        }
-        if points.len() < 4 {
-            bail!("a boundary ring has fewer than four positions");
-        }
-        if points.first() != points.last() {
-            bail!("a boundary ring is not closed (first and last positions differ)");
-        }
-        Ok(points)
-    };
+/// Running containment tally over streamed features.
+#[derive(Default)]
+struct BoundaryTally {
+    inside: usize,
+    partial: usize,
+    outside: usize,
+    sample_not_inside_ids: Vec<String>,
+}
 
-    let mut polygons: Vec<Vec<Vec<(f64, f64)>>> = Vec::new();
-    let mut collect = |value: &GeometryValue| -> Result<()> {
-        match value {
-            GeometryValue::Polygon { coordinates } => {
-                if !coordinates.is_empty() {
-                    polygons.push(
-                        coordinates
-                            .iter()
-                            .map(&convert_ring)
-                            .collect::<Result<Vec<_>>>()?,
-                    );
+impl BoundaryIndex {
+    /// Load a boundary GeoJSON (Polygon/MultiPolygon in Feature,
+    /// FeatureCollection, or bare Geometry form), rejecting malformed
+    /// content loudly rather than panicking or classifying against garbage.
+    fn load(path: &std::path::Path) -> Result<BoundaryIndex> {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("cannot read boundary file {}", path.display()))?;
+        let boundary: geojson::GeoJson = text
+            .parse()
+            .with_context(|| format!("boundary file {} is not valid GeoJSON", path.display()))?;
+
+        let convert_ring = |ring: &Vec<geojson::Position>| -> Result<Vec<(f64, f64)>> {
+            let mut points = Vec::with_capacity(ring.len());
+            for position in ring {
+                if position.len() < 2 {
+                    bail!("a boundary position has fewer than two coordinates");
                 }
+                let (x, y) = (position[0], position[1]);
+                if !x.is_finite() || !y.is_finite() {
+                    bail!("a boundary position is not finite");
+                }
+                points.push((x, y));
             }
-            GeometryValue::MultiPolygon { coordinates } => {
-                for polygon in coordinates {
-                    if !polygon.is_empty() {
+            if points.len() < 4 {
+                bail!("a boundary ring has fewer than four positions");
+            }
+            if points.first() != points.last() {
+                bail!("a boundary ring is not closed (first and last positions differ)");
+            }
+            Ok(points)
+        };
+
+        let mut polygons: Vec<Vec<Vec<(f64, f64)>>> = Vec::new();
+        let mut collect = |value: &GeometryValue| -> Result<()> {
+            match value {
+                GeometryValue::Polygon { coordinates } => {
+                    if !coordinates.is_empty() {
                         polygons.push(
-                            polygon
+                            coordinates
                                 .iter()
                                 .map(&convert_ring)
                                 .collect::<Result<Vec<_>>>()?,
                         );
                     }
                 }
+                GeometryValue::MultiPolygon { coordinates } => {
+                    for polygon in coordinates {
+                        if !polygon.is_empty() {
+                            polygons.push(
+                                polygon
+                                    .iter()
+                                    .map(&convert_ring)
+                                    .collect::<Result<Vec<_>>>()?,
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+            Ok(())
+        };
+        let collected: Result<()> = match &boundary {
+            geojson::GeoJson::Geometry(geometry) => collect(&geometry.value),
+            geojson::GeoJson::Feature(feature) => match &feature.geometry {
+                Some(geometry) => collect(&geometry.value),
+                None => Ok(()),
+            },
+            geojson::GeoJson::FeatureCollection(collection) => collection
+                .features
+                .iter()
+                .filter_map(|feature| feature.geometry.as_ref())
+                .try_for_each(|geometry| collect(&geometry.value)),
+        };
+        collected.with_context(|| format!("invalid boundary file {}", path.display()))?;
+        if polygons.is_empty() {
+            bail!(
+                "boundary file {} contains no Polygon or MultiPolygon geometry",
+                path.display()
+            );
         }
-        Ok(())
-    };
-    let collected: Result<()> = match &boundary {
-        geojson::GeoJson::Geometry(geometry) => collect(&geometry.value),
-        geojson::GeoJson::Feature(feature) => match &feature.geometry {
-            Some(geometry) => collect(&geometry.value),
-            None => Ok(()),
-        },
-        geojson::GeoJson::FeatureCollection(collection) => collection
-            .features
-            .iter()
-            .filter_map(|feature| feature.geometry.as_ref())
-            .try_for_each(|geometry| collect(&geometry.value)),
-    };
-    collected.with_context(|| format!("invalid boundary file {}", path.display()))?;
-    if polygons.is_empty() {
-        bail!(
-            "boundary file {} contains no Polygon or MultiPolygon geometry",
-            path.display()
-        );
+        Ok(BoundaryIndex {
+            path: path.display().to_string(),
+            polygons,
+        })
     }
 
-    // Even-odd across a polygon's rings handles holes; a point is inside
-    // the boundary when it is inside any polygon.
-    let inside = |x: f64, y: f64| -> bool {
-        polygons.iter().any(|rings| {
+    /// Even-odd containment of one point (holes honored, any polygon).
+    fn contains(&self, x: f64, y: f64) -> bool {
+        self.polygons.iter().any(|rings| {
             rings
                 .iter()
                 .filter(|ring| ring_contains_point(ring, (x, y)))
@@ -924,19 +947,13 @@ fn check_boundary(features: &[Feature], path: &std::path::Path) -> Result<report
                 % 2
                 == 1
         })
-    };
+    }
 
-    let mut features_inside = 0usize;
-    let mut features_partial = 0usize;
-    let mut features_outside = 0usize;
-    let mut sample_not_inside_ids = Vec::new();
-    for feature in features {
-        let Some(geometry) = &feature.geometry else {
-            continue;
-        };
+    /// Classify one feature into the running tally.
+    fn classify(&self, feature: &CadFeature, tally: &mut BoundaryTally) {
         let (mut in_count, mut out_count) = (0usize, 0usize);
-        visit_positions(&geometry.value, &mut |x, y| {
-            if inside(x, y) {
+        feature.geometry.visit_positions(&mut |x, y| {
+            if self.contains(x, y) {
                 in_count += 1;
             } else {
                 out_count += 1;
@@ -945,9 +962,9 @@ fn check_boundary(features: &[Feature], path: &std::path::Path) -> Result<report
         // A segment can leave and re-enter the boundary between two inside
         // vertices (concavities, holes); a proper crossing forces partial.
         let mut crossed = false;
-        visit_segments(&geometry.value, &mut |a, b| {
+        feature.geometry.visit_segments(&mut |a, b| {
             if !crossed {
-                crossed = polygons.iter().any(|rings| {
+                crossed = self.polygons.iter().any(|rings| {
                     rings.iter().any(|ring| {
                         ring.windows(2)
                             .any(|edge| segments_cross(a, b, edge[0], edge[1]))
@@ -956,52 +973,94 @@ fn check_boundary(features: &[Feature], path: &std::path::Path) -> Result<report
             }
         });
         let bucket = match (in_count, out_count, crossed) {
-            (_, _, true) => &mut features_partial,
-            (_, 0, false) => &mut features_inside,
-            (0, _, false) => &mut features_outside,
-            _ => &mut features_partial,
+            (_, _, true) => &mut tally.partial,
+            (_, 0, false) => &mut tally.inside,
+            (0, _, false) => &mut tally.outside,
+            _ => &mut tally.partial,
         };
         *bucket += 1;
-        if (out_count > 0 || crossed) && sample_not_inside_ids.len() < MAX_HANDLE_SAMPLES {
-            if let Some(Id::String(id)) = &feature.id {
-                sample_not_inside_ids.push(id.clone());
-            }
+        if (out_count > 0 || crossed) && tally.sample_not_inside_ids.len() < MAX_HANDLE_SAMPLES {
+            tally.sample_not_inside_ids.push(feature.id.clone());
         }
     }
 
-    Ok(report::BoundaryCheck {
-        boundary_path: path.display().to_string(),
-        polygons: polygons.len(),
-        features_inside,
-        features_partial,
-        features_outside,
-        sample_not_inside_ids,
-    })
-}
-
-/// Bounding box [min_x, min_y, max_x, max_y] over all feature geometry.
-fn features_bbox(features: &[Feature]) -> Option<[f64; 4]> {
-    let mut bbox: Option<[f64; 4]> = None;
-    for feature in features {
-        let Some(geometry) = &feature.geometry else {
-            continue;
-        };
-        visit_positions(&geometry.value, &mut |x, y| {
-            bbox = Some(match bbox {
-                None => [x, y, x, y],
-                Some([min_x, min_y, max_x, max_y]) => {
-                    [min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y)]
-                }
-            });
-        });
+    fn into_report(self, tally: BoundaryTally) -> report::BoundaryCheck {
+        report::BoundaryCheck {
+            boundary_path: self.path,
+            polygons: self.polygons.len(),
+            features_inside: tally.inside,
+            features_partial: tally.partial,
+            features_outside: tally.outside,
+            sample_not_inside_ids: tally.sample_not_inside_ids,
+        }
     }
-    bbox
 }
 
-/// Output-side geometry validity pass; see [`report::GeometryChecks`].
-fn check_geometries(features: &[Feature]) -> report::GeometryChecks {
-    let mut checks = report::GeometryChecks {
-        features_checked: features.len(),
+/// Fold one feature into a running bounding box.
+fn accumulate_bbox(bbox: &mut Option<[f64; 4]>, feature: &CadFeature) {
+    feature.geometry.visit_positions(&mut |x, y| {
+        *bbox = Some(match *bbox {
+            None => [x, y, x, y],
+            Some([min_x, min_y, max_x, max_y]) => {
+                [min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y)]
+            }
+        });
+    });
+}
+
+/// Fold one feature into the output-side validity counters; see
+/// [`report::GeometryChecks`].
+fn update_geometry_checks(checks: &mut report::GeometryChecks, feature: &CadFeature) {
+    checks.features_checked += 1;
+    let mut positions = 0usize;
+    feature.geometry.visit_positions(&mut |x, y| {
+        positions += 1;
+        if !x.is_finite() || !y.is_finite() {
+            checks.non_finite_coordinates += 1;
+        }
+    });
+    if positions == 0 {
+        checks.empty_geometries += 1;
+    }
+    let mut duplicates = false;
+    feature.geometry.visit_segments(&mut |a, b| {
+        duplicates |= a == b;
+    });
+    if duplicates {
+        checks.duplicate_vertex_features += 1;
+    }
+    for rings in feature.geometry.polygon_rings() {
+        for (index, ring) in rings.iter().enumerate() {
+            checks.rings_checked += 1;
+            if ring.len() < 4 {
+                checks.degenerate_rings += 1;
+                continue;
+            }
+            if ring.first() != ring.last() {
+                checks.unclosed_rings += 1;
+            }
+            let area = signed_area(ring);
+            let first = ring[0];
+            let extent = ring.iter().fold(0.0f64, |extent, point| {
+                extent
+                    .max((point.0 - first.0).abs())
+                    .max((point.1 - first.1).abs())
+            });
+            if !extent.is_finite() || area.abs() <= 1e-12 * extent * extent {
+                checks.degenerate_rings += 1;
+                continue;
+            }
+            let is_shell = index == 0;
+            if is_shell != (area > 0.0) {
+                checks.misoriented_rings += 1;
+            }
+        }
+    }
+}
+
+fn empty_geometry_checks() -> report::GeometryChecks {
+    report::GeometryChecks {
+        features_checked: 0,
         empty_geometries: 0,
         non_finite_coordinates: 0,
         duplicate_vertex_features: 0,
@@ -1009,129 +1068,6 @@ fn check_geometries(features: &[Feature]) -> report::GeometryChecks {
         unclosed_rings: 0,
         misoriented_rings: 0,
         degenerate_rings: 0,
-    };
-    for feature in features {
-        let Some(geometry) = &feature.geometry else {
-            checks.empty_geometries += 1;
-            continue;
-        };
-        let mut positions = 0usize;
-        visit_positions(&geometry.value, &mut |x, y| {
-            positions += 1;
-            if !x.is_finite() || !y.is_finite() {
-                checks.non_finite_coordinates += 1;
-            }
-        });
-        if positions == 0 {
-            checks.empty_geometries += 1;
-        }
-        if geometry_has_duplicate_vertices(&geometry.value) {
-            checks.duplicate_vertex_features += 1;
-        }
-        check_rings(&geometry.value, &mut checks);
-    }
-    checks
-}
-
-/// Identical consecutive positions in any line or ring of the geometry.
-fn geometry_has_duplicate_vertices(value: &GeometryValue) -> bool {
-    let has_duplicates = |line: &[geojson::Position]| {
-        line.windows(2)
-            .any(|pair| pair[0][0] == pair[1][0] && pair[0][1] == pair[1][1])
-    };
-    match value {
-        GeometryValue::Point { .. } | GeometryValue::MultiPoint { .. } => false,
-        GeometryValue::LineString { coordinates } => has_duplicates(coordinates),
-        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
-            coordinates.iter().any(|line| has_duplicates(line))
-        }
-        GeometryValue::MultiPolygon { coordinates } => coordinates
-            .iter()
-            .any(|polygon| polygon.iter().any(|ring| has_duplicates(ring))),
-        GeometryValue::GeometryCollection { geometries } => geometries
-            .iter()
-            .any(|geometry| geometry_has_duplicate_vertices(&geometry.value)),
-    }
-}
-
-/// Closure, orientation (CCW shells, CW holes), and minimum size of every
-/// polygon ring.
-fn check_rings(value: &GeometryValue, checks: &mut report::GeometryChecks) {
-    let mut check_polygon = |rings: &Vec<Vec<geojson::Position>>| {
-        for (index, ring) in rings.iter().enumerate() {
-            checks.rings_checked += 1;
-            if ring.len() < 4 {
-                checks.degenerate_rings += 1;
-                continue;
-            }
-            let first = &ring[0];
-            let last = &ring[ring.len() - 1];
-            if first[0] != last[0] || first[1] != last[1] {
-                checks.unclosed_rings += 1;
-            }
-            let mut area = 0.0;
-            let mut extent: f64 = 0.0;
-            let first_position = &ring[0];
-            for pair in ring.windows(2) {
-                area -= (pair[1][0] - pair[0][0]) * (pair[1][1] + pair[0][1]);
-                extent = extent
-                    .max((pair[1][0] - first_position[0]).abs())
-                    .max((pair[1][1] - first_position[1]).abs());
-            }
-            if !extent.is_finite() || area.abs() <= 1e-12 * extent * extent {
-                checks.degenerate_rings += 1;
-                continue;
-            }
-            let ccw = area > 0.0;
-            let is_shell = index == 0;
-            if is_shell != ccw {
-                checks.misoriented_rings += 1;
-            }
-        }
-    };
-    match value {
-        GeometryValue::Polygon { coordinates } => check_polygon(coordinates),
-        GeometryValue::MultiPolygon { coordinates } => {
-            for polygon in coordinates {
-                check_polygon(polygon);
-            }
-        }
-        GeometryValue::GeometryCollection { geometries } => {
-            for geometry in geometries {
-                check_rings(&geometry.value, checks);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Visit every consecutive-position segment of a geometry's lines and rings.
-fn visit_segments(value: &GeometryValue, visit: &mut impl FnMut((f64, f64), (f64, f64))) {
-    let mut walk_line = |line: &[geojson::Position]| {
-        for pair in line.windows(2) {
-            visit((pair[0][0], pair[0][1]), (pair[1][0], pair[1][1]));
-        }
-    };
-    match value {
-        GeometryValue::Point { .. } | GeometryValue::MultiPoint { .. } => {}
-        GeometryValue::LineString { coordinates } => walk_line(coordinates),
-        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
-            for line in coordinates {
-                walk_line(line);
-            }
-        }
-        GeometryValue::MultiPolygon { coordinates } => {
-            for polygon in coordinates {
-                for ring in polygon {
-                    walk_line(ring);
-                }
-            }
-        }
-        GeometryValue::GeometryCollection { geometries } => {
-            for geometry in geometries {
-                visit_segments(&geometry.value, visit);
-            }
-        }
     }
 }
 
@@ -1150,40 +1086,6 @@ fn segments_cross(a1: (f64, f64), a2: (f64, f64), b1: (f64, f64), b2: (f64, f64)
         && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
 }
 
-/// Visit every (x, y) position of a geometry.
-fn visit_positions(value: &GeometryValue, visit: &mut impl FnMut(f64, f64)) {
-    match value {
-        GeometryValue::Point { coordinates } => visit(coordinates[0], coordinates[1]),
-        GeometryValue::MultiPoint { coordinates } | GeometryValue::LineString { coordinates } => {
-            for position in coordinates {
-                visit(position[0], position[1]);
-            }
-        }
-        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
-            for line in coordinates {
-                for position in line {
-                    visit(position[0], position[1]);
-                }
-            }
-        }
-        GeometryValue::MultiPolygon { coordinates } => {
-            for polygon in coordinates {
-                for ring in polygon {
-                    for position in ring {
-                        visit(position[0], position[1]);
-                    }
-                }
-            }
-        }
-        GeometryValue::GeometryCollection { geometries } => {
-            for geometry in geometries {
-                visit_positions(&geometry.value, visit);
-            }
-        }
-    }
-}
-
-/// The resolved unit, PROJ transform, and report provenance for one run.
 #[cfg(feature = "native-reproject")]
 struct ReprojectionPlan {
     reprojector: Reprojector,
@@ -1246,69 +1148,6 @@ fn build_reprojection_plan(
     Ok(ReprojectionPlan { reprojector, info })
 }
 
-/// Transform every feature geometry in place. A transform failure aborts the
-/// conversion: a vertex the transform rejects means the CRS or units are
-/// wrong for the whole drawing, and delivering a partial mix would be silent
-/// loss.
-fn transform_features(
-    features: &mut [Feature],
-    transform: &impl Fn(f64, f64) -> Result<(f64, f64)>,
-) -> Result<()> {
-    for feature in features.iter_mut() {
-        let id = match &feature.id {
-            Some(Id::String(id)) => id.clone(),
-            other => format!("{other:?}"),
-        };
-        if let Some(geometry) = &mut feature.geometry {
-            transform_positions(&mut geometry.value, transform)
-                .with_context(|| format!("while transforming feature {id}"))?;
-        }
-    }
-    Ok(())
-}
-
-fn transform_positions(
-    value: &mut GeometryValue,
-    transform: &impl Fn(f64, f64) -> Result<(f64, f64)>,
-) -> Result<()> {
-    let transform_one = |position: &mut geojson::Position| -> Result<()> {
-        let (x, y) = transform(position[0], position[1])?;
-        position[0] = x;
-        position[1] = y;
-        Ok(())
-    };
-    match value {
-        GeometryValue::Point { coordinates } => transform_one(coordinates)?,
-        GeometryValue::MultiPoint { coordinates } | GeometryValue::LineString { coordinates } => {
-            for position in coordinates {
-                transform_one(position)?;
-            }
-        }
-        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
-            for line in coordinates {
-                for position in line {
-                    transform_one(position)?;
-                }
-            }
-        }
-        GeometryValue::MultiPolygon { coordinates } => {
-            for polygon in coordinates {
-                for ring in polygon {
-                    for position in ring {
-                        transform_one(position)?;
-                    }
-                }
-            }
-        }
-        GeometryValue::GeometryCollection { geometries } => {
-            for geometry in geometries {
-                transform_positions(&mut geometry.value, transform)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Parse and solve the control-point calibration, producing the transform
 /// and its report block.
 fn build_calibration_plan(
@@ -1343,7 +1182,10 @@ struct HandleSamples {
 
 #[derive(Default)]
 struct Extraction {
-    features: Vec<Feature>,
+    /// Populated only by the collecting test wrapper [`extract`]; the
+    /// streaming path hands features to a sink instead.
+    #[cfg(test)]
+    features: Vec<CadFeature>,
     converted: BTreeMap<String, usize>,
     skipped: BTreeMap<(String, String), HandleSamples>,
     failed: BTreeMap<(String, String), HandleSamples>,
@@ -1376,7 +1218,7 @@ fn outcome_counts(map: BTreeMap<(String, String), HandleSamples>) -> Vec<Outcome
 #[derive(Debug)]
 enum EntityOutcome {
     Converted {
-        geometry: GeometryValue,
+        geometry: CadGeometry,
         extra_properties: Vec<(&'static str, JsonValue)>,
         warnings: Vec<String>,
     },
@@ -1387,7 +1229,25 @@ enum EntityOutcome {
 /// Convert every model-space entity in document order; count paper-space,
 /// block-definition, and unowned entities as excluded by the documented
 /// model-space filter.
+/// Collecting wrapper over [`extract_with_sink`], used by unit tests.
+#[cfg(test)]
 fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extraction> {
+    let mut features = Vec::new();
+    let mut extraction = extract_with_sink(document, options, &mut |feature| {
+        features.push(feature);
+        Ok(())
+    })?;
+    extraction.features = features;
+    Ok(extraction)
+}
+
+/// Convert every model-space entity in document order, handing each finished
+/// [`CadFeature`] to `sink` immediately (no feature retention here).
+fn extract_with_sink(
+    document: &CadDocument,
+    options: &GeometryOptions,
+    sink: &mut dyn FnMut(CadFeature) -> Result<()>,
+) -> Result<Extraction> {
     let mut extraction = Extraction::default();
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut model_index: usize = 0;
@@ -1441,9 +1301,10 @@ fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extracti
                 model_index,
                 options,
                 &mut extraction,
+                sink,
                 &model_placement,
                 0,
-            );
+            )?;
             model_index += 1;
             extraction.model_space_entities += 1;
         }
@@ -1469,14 +1330,14 @@ fn process_entity(
     index: usize,
     options: &GeometryOptions,
     extraction: &mut Extraction,
+    sink: &mut dyn FnMut(CadFeature) -> Result<()>,
     placement: &Placement,
     depth: usize,
-) {
+) -> Result<()> {
     if let EntityType::Insert(insert) = entity {
-        process_insert(
-            document, entity, insert, index, options, extraction, placement, depth,
+        return process_insert(
+            document, entity, insert, index, options, extraction, sink, placement, depth,
         );
-        return;
     }
 
     // Every non-INSERT entity reaches exactly one outcome below.
@@ -1508,7 +1369,7 @@ fn process_entity(
                 extraction.approximated_features += 1;
             }
             *extraction.converted.entry(entity_type.clone()).or_default() += 1;
-            extraction.features.push(build_feature(
+            sink(build_feature(
                 entity,
                 feature_id,
                 &entity_type,
@@ -1516,7 +1377,7 @@ fn process_entity(
                 extra_properties,
                 warnings,
                 placement,
-            ));
+            ))?;
         }
         EntityOutcome::Skipped(reason) => {
             record_outcome(&mut extraction.skipped, entity_type, reason, &feature_id);
@@ -1525,6 +1386,7 @@ fn process_entity(
             record_outcome(&mut extraction.failed, entity_type, reason, &feature_id);
         }
     }
+    Ok(())
 }
 
 /// Unique, stable feature id: the insert-handle chain plus the entity's own
@@ -1546,9 +1408,10 @@ fn process_insert(
     index: usize,
     options: &GeometryOptions,
     extraction: &mut Extraction,
+    sink: &mut dyn FnMut(CadFeature) -> Result<()>,
     placement: &Placement,
     depth: usize,
-) {
+) -> Result<()> {
     let id = feature_id(entity, index, placement);
 
     if !valid_normal(&insert.normal) {
@@ -1558,7 +1421,7 @@ fn process_insert(
             "zero or non-finite extrusion normal".to_string(),
             &id,
         );
-        return;
+        return Ok(());
     }
 
     // Every INSERT reaches a terminal outcome (anchor, expansion, or a
@@ -1586,16 +1449,16 @@ fn process_insert(
         .collect();
 
     if options.preserve_inserts {
-        emit_insert_anchor(
+        return emit_insert_anchor(
             document,
             entity,
             insert,
             index,
             &attributes,
             extraction,
+            sink,
             placement,
         );
-        return;
     }
 
     let Some(record) = document.block_records.get(&insert.block_name) else {
@@ -1608,7 +1471,7 @@ fn process_insert(
             ),
             &id,
         );
-        return;
+        return Ok(());
     };
     if placement
         .block_path
@@ -1621,7 +1484,7 @@ fn process_insert(
             format!("recursive reference to block {:?}", insert.block_name),
             &id,
         );
-        return;
+        return Ok(());
     }
     if depth >= MAX_BLOCK_DEPTH {
         record_outcome(
@@ -1630,7 +1493,7 @@ fn process_insert(
             format!("block nesting deeper than {MAX_BLOCK_DEPTH} levels"),
             &id,
         );
-        return;
+        return Ok(());
     }
 
     let columns = insert.column_count.max(1);
@@ -1696,9 +1559,10 @@ fn process_insert(
                     child_index,
                     options,
                     extraction,
+                    sink,
                     &child_placement,
                     depth + 1,
-                );
+                )?;
             }
         }
     }
@@ -1712,13 +1576,16 @@ fn process_insert(
             index,
             &attributes,
             extraction,
+            sink,
             placement,
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// Point feature at the (transformed) insertion point carrying the block
 /// name and attribute values.
+#[allow(clippy::too_many_arguments)]
 fn emit_insert_anchor(
     document: &CadDocument,
     entity: &EntityType,
@@ -1726,8 +1593,9 @@ fn emit_insert_anchor(
     index: usize,
     attributes: &BTreeMap<String, String>,
     extraction: &mut Extraction,
+    sink: &mut dyn FnMut(CadFeature) -> Result<()>,
     placement: &Placement,
-) {
+) -> Result<()> {
     let id = feature_id(entity, index, placement);
     // The insertion point is OCS; lift it before the placement transform.
     let anchor = Matrix3::arbitrary_axis(insert.normal).transform_point(insert.insert_point);
@@ -1739,7 +1607,7 @@ fn emit_insert_anchor(
             "non-finite coordinates".to_string(),
             &id,
         );
-        return;
+        return Ok(());
     };
 
     let mut warnings = Vec::new();
@@ -1772,15 +1640,15 @@ fn emit_insert_anchor(
         .converted
         .entry("INSERT".to_string())
         .or_default() += 1;
-    extraction.features.push(build_feature(
+    sink(build_feature(
         entity,
         id,
         "INSERT",
-        GeometryValue::new_point(position),
+        CadGeometry::Point(position),
         extra_properties,
         warnings,
         placement,
-    ));
+    ))
 }
 
 fn record_outcome(
@@ -1800,49 +1668,26 @@ fn build_feature(
     entity: &EntityType,
     feature_id: String,
     entity_type: &str,
-    geometry: GeometryValue,
+    geometry: CadGeometry,
     extra_properties: Vec<(&'static str, JsonValue)>,
     warnings: Vec<String>,
     placement: &Placement,
-) -> Feature {
+) -> CadFeature {
     let common = entity.common();
 
     let source_layer = common.layer.clone();
     let layer = effective_layer(&source_layer, placement);
 
-    let mut properties = JsonObject::new();
-    properties.insert("layer".to_string(), JsonValue::from(layer.clone()));
-    if layer != source_layer {
-        properties.insert("source_layer".to_string(), JsonValue::from(source_layer));
-    }
-    properties.insert(
-        "entity_type".to_string(),
-        JsonValue::from(entity_type.to_string()),
-    );
-    properties.insert("space".to_string(), JsonValue::from("model"));
-    properties.insert(
-        "handle".to_string(),
-        JsonValue::from(format!("{}", common.handle)),
-    );
-    if !placement.block_path.is_empty() {
-        properties.insert(
-            "block_path".to_string(),
-            JsonValue::from(placement.block_path.join("/")),
-        );
-    }
-    for (key, value) in extra_properties {
-        properties.insert(key.to_string(), value);
-    }
-    if !warnings.is_empty() {
-        properties.insert("warnings".to_string(), JsonValue::from(warnings));
-    }
-
-    Feature {
-        bbox: None,
-        geometry: Some(Geometry::new(geometry)),
-        id: Some(Id::String(feature_id)),
-        properties: Some(properties),
-        foreign_members: None,
+    CadFeature {
+        id: feature_id,
+        entity_type: entity_type.to_string(),
+        handle: format!("{}", common.handle),
+        source_layer: (layer != source_layer).then_some(source_layer),
+        layer,
+        block_path: placement.block_path.clone(),
+        extra_properties,
+        warnings,
+        geometry,
     }
 }
 
@@ -1886,7 +1731,7 @@ fn convert_point(point: &acadrust::entities::Point, placement: &Placement) -> En
     push_z_warning(&mut warnings, max_abs_z);
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_point(position),
+        geometry: CadGeometry::Point(position),
         extra_properties: Vec::new(),
         warnings,
     }
@@ -1911,7 +1756,7 @@ fn convert_line(line: &acadrust::entities::Line, placement: &Placement) -> Entit
     push_z_warning(&mut warnings, max_abs_z);
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_line_string(vec![start, end]),
+        geometry: CadGeometry::Line(vec![start, end]),
         extra_properties: Vec::new(),
         warnings,
     }
@@ -1954,7 +1799,7 @@ fn convert_face3d(face: &acadrust::entities::Face3D, placement: &Placement) -> E
     push_z_warning(&mut warnings, max_abs_z);
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_polygon(vec![ring]),
+        geometry: CadGeometry::Polygon(vec![ring]),
         extra_properties: vec![("is_closed", JsonValue::from(true))],
         warnings,
     }
@@ -2005,7 +1850,7 @@ fn convert_solid(solid: &acadrust::entities::Solid, placement: &Placement) -> En
     push_z_warning(&mut warnings, max_abs_z);
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_polygon(vec![ring]),
+        geometry: CadGeometry::Polygon(vec![ring]),
         extra_properties: vec![("is_closed", JsonValue::from(true))],
         warnings,
     }
@@ -2397,7 +2242,7 @@ fn edge_sweep(
 /// MultiPolygon. Deterministic: input order is preserved.
 type ShellRings = (usize, Vec<Vec<(f64, f64)>>);
 
-fn assemble_hatch_polygons(mut rings: Vec<Vec<(f64, f64)>>) -> GeometryValue {
+fn assemble_hatch_polygons(mut rings: Vec<Vec<(f64, f64)>>) -> CadGeometry {
     for ring in &mut rings {
         if signed_area(ring) < 0.0 {
             ring.reverse();
@@ -2487,11 +2332,11 @@ fn assemble_hatch_polygons(mut rings: Vec<Vec<(f64, f64)>>) -> GeometryValue {
     }
 
     if polygons.len() == 1 {
-        GeometryValue::new_polygon(polygons.remove(0).1)
+        CadGeometry::Polygon(polygons.remove(0).1)
     } else {
         let coordinates: Vec<Vec<Vec<(f64, f64)>>> =
             polygons.into_iter().map(|(_, rings)| rings).collect();
-        GeometryValue::new_multi_polygon(coordinates)
+        CadGeometry::MultiPolygon(coordinates)
     }
 }
 
@@ -2787,7 +2632,7 @@ fn finish_coordinates(
             ring.reverse();
         }
         return EntityOutcome::Converted {
-            geometry: GeometryValue::new_polygon(vec![ring]),
+            geometry: CadGeometry::Polygon(vec![ring]),
             extra_properties,
             warnings,
         };
@@ -2798,7 +2643,7 @@ fn finish_coordinates(
     }
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_line_string(coordinates),
+        geometry: CadGeometry::Line(coordinates),
         extra_properties,
         warnings,
     }
@@ -3358,7 +3203,7 @@ fn convert_text(text: &acadrust::entities::Text, placement: &Placement) -> Entit
     }
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_point(position),
+        geometry: CadGeometry::Point(position),
         extra_properties,
         warnings,
     }
@@ -3503,7 +3348,7 @@ fn convert_mtext(mtext: &acadrust::entities::MText, placement: &Placement) -> En
     }
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_point(position),
+        geometry: CadGeometry::Point(position),
         extra_properties,
         warnings,
     }
@@ -3667,12 +3512,12 @@ fn signed_area(ring: &[(f64, f64)]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::CadGeometry;
     use acadrust::{
         CadDocument, DxfVersion,
         entities::{Circle, EntityType, Line, LwPolyline, Point},
         types::Vector2,
     };
-    use geojson::GeometryValue;
 
     use super::{
         DEFAULT_CURVE_TOLERANCE, EntityOutcome, GeometryOptions, Placement, extract, signed_area,
@@ -3708,7 +3553,7 @@ mod tests {
         let point = EntityType::Point(Point::from_coords(1.0, 2.0, 0.0));
         match convert_entity(&point, &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => {
-                assert_eq!(geometry, GeometryValue::new_point((1.0, 2.0)));
+                assert_eq!(geometry, CadGeometry::Point((1.0, 2.0)));
             }
             _ => panic!("point must convert"),
         }
@@ -3718,10 +3563,7 @@ mod tests {
             EntityOutcome::Converted {
                 geometry, warnings, ..
             } => {
-                assert_eq!(
-                    geometry,
-                    GeometryValue::new_line_string(vec![(0.0, 0.0), (4.0, 5.0)])
-                );
+                assert_eq!(geometry, CadGeometry::Line(vec![(0.0, 0.0), (4.0, 5.0)]));
                 assert_eq!(warnings.len(), 1, "z must be reported as dropped");
             }
             _ => panic!("line must convert"),
@@ -3743,7 +3585,7 @@ mod tests {
             EntityType::LwPolyline(lwpolyline(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], true));
         match convert_entity(&polyline, &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::LineString { coordinates } => {
+                CadGeometry::Line(coordinates) => {
                     assert_eq!(coordinates.len(), 4);
                     assert_eq!(coordinates.first(), coordinates.last());
                 }
@@ -3762,13 +3604,13 @@ mod tests {
         ));
         match convert_entity(&polyline, &opts(true)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::Polygon { coordinates } => {
+                CadGeometry::Polygon(coordinates) => {
                     assert_eq!(coordinates.len(), 1);
                     let ring = &coordinates[0];
                     assert_eq!(ring.first(), ring.last());
                     let tuples: Vec<(f64, f64)> = ring
                         .iter()
-                        .map(|position| (position[0], position[1]))
+                        .map(|position| (position.0, position.1))
                         .collect();
                     assert!(signed_area(&tuples) > 0.0, "ring must be CCW");
                 }
@@ -3830,7 +3672,7 @@ mod tests {
                 warnings,
             } => {
                 match geometry {
-                    GeometryValue::LineString { coordinates } => {
+                    CadGeometry::Line(coordinates) => {
                         assert!(coordinates.len() > 3, "arc must add interior points");
                     }
                     other => panic!("expected LineString, got {other:?}"),
@@ -3854,11 +3696,11 @@ mod tests {
         polyline.vertices[1].bulge = 1.0;
         match convert_entity(&EntityType::LwPolyline(polyline), &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::LineString { coordinates } => {
+                CadGeometry::Line(coordinates) => {
                     assert_eq!(coordinates.first(), coordinates.last(), "ring must close");
                     assert!(coordinates.len() > 12);
                     for position in &coordinates {
-                        let radius = ((position[0] - 5.0).powi(2) + position[1].powi(2)).sqrt();
+                        let radius = ((position.0 - 5.0).powi(2) + position.1.powi(2)).sqrt();
                         assert!((radius - 5.0).abs() < 1e-9);
                     }
                 }
@@ -3878,12 +3720,12 @@ mod tests {
                 warnings,
             } => {
                 match geometry {
-                    GeometryValue::LineString { coordinates } => {
+                    CadGeometry::Line(coordinates) => {
                         assert_eq!(coordinates.first(), coordinates.last());
                         assert!(coordinates.len() >= 25, "got {}", coordinates.len());
                         for position in &coordinates {
                             let radius =
-                                ((position[0] - 5.0).powi(2) + (position[1] + 2.0).powi(2)).sqrt();
+                                ((position.0 - 5.0).powi(2) + (position.1 + 2.0).powi(2)).sqrt();
                             assert!((radius - 5.0).abs() < 1e-9);
                         }
                     }
@@ -3906,10 +3748,10 @@ mod tests {
         let circle = EntityType::Circle(Circle::from_coords(0.0, 0.0, 0.0, 2.0));
         match convert_entity(&circle, &opts(true)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::Polygon { coordinates } => {
+                CadGeometry::Polygon(coordinates) => {
                     let ring = &coordinates[0];
                     assert_eq!(ring.first(), ring.last());
-                    let tuples: Vec<(f64, f64)> = ring.iter().map(|p| (p[0], p[1])).collect();
+                    let tuples: Vec<(f64, f64)> = ring.iter().map(|p| (p.0, p.1)).collect();
                     assert!(signed_area(&tuples) > 0.0, "ring must be CCW");
                 }
                 other => panic!("expected Polygon, got {other:?}"),
@@ -3933,15 +3775,15 @@ mod tests {
         ));
         match convert_entity(&arc, &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::LineString { coordinates } => {
+                CadGeometry::Line(coordinates) => {
                     let first = coordinates.first().expect("start");
                     let last = coordinates.last().expect("end");
-                    assert!((first[0] - 0.0).abs() < 1e-9 && (first[1] + 1.0).abs() < 1e-9);
-                    assert!((last[0] - 0.0).abs() < 1e-9 && (last[1] - 1.0).abs() < 1e-9);
+                    assert!((first.0 - 0.0).abs() < 1e-9 && (first.1 + 1.0).abs() < 1e-9);
+                    assert!((last.0 - 0.0).abs() < 1e-9 && (last.1 - 1.0).abs() < 1e-9);
                     // Passes through (1, 0), never through (-1, 0).
-                    assert!(coordinates.iter().all(|p| p[0] > -1e-9));
+                    assert!(coordinates.iter().all(|p| p.0 > -1e-9));
                     for position in &coordinates {
-                        let radius = (position[0].powi(2) + position[1].powi(2)).sqrt();
+                        let radius = (position.0.powi(2) + position.1.powi(2)).sqrt();
                         assert!((radius - 1.0).abs() < 1e-9);
                     }
                 }
@@ -3964,12 +3806,12 @@ mod tests {
         ellipse.end_parameter = std::f64::consts::TAU;
         match convert_entity(&EntityType::Ellipse(ellipse), &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::LineString { coordinates } => {
+                CadGeometry::Line(coordinates) => {
                     assert_eq!(coordinates.first(), coordinates.last());
                     assert!(coordinates.len() > 20);
                     for position in &coordinates {
-                        let ellipse_eq = ((position[0] - 10.0) / 4.0).powi(2)
-                            + ((position[1] - 5.0) / 2.0).powi(2);
+                        let ellipse_eq = ((position.0 - 10.0) / 4.0).powi(2)
+                            + ((position.1 - 5.0) / 2.0).powi(2);
                         assert!((ellipse_eq - 1.0).abs() < 1e-9, "off ellipse: {position:?}");
                     }
                 }
@@ -3991,11 +3833,11 @@ mod tests {
         ellipse.end_parameter = std::f64::consts::PI / 2.0;
         match convert_entity(&EntityType::Ellipse(ellipse), &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::LineString { coordinates } => {
+                CadGeometry::Line(coordinates) => {
                     let first = coordinates.first().expect("start");
                     let last = coordinates.last().expect("end");
-                    assert!((first[0] - 4.0).abs() < 1e-9 && first[1].abs() < 1e-9);
-                    assert!(last[0].abs() < 1e-9 && (last[1] - 2.0).abs() < 1e-9);
+                    assert!((first.0 - 4.0).abs() < 1e-9 && first.1.abs() < 1e-9);
+                    assert!(last.0.abs() < 1e-9 && (last.1 - 2.0).abs() < 1e-9);
                 }
                 other => panic!("expected LineString, got {other:?}"),
             },
@@ -4022,14 +3864,14 @@ mod tests {
                 geometry, warnings, ..
             } => {
                 match geometry {
-                    GeometryValue::LineString { coordinates } => {
+                    CadGeometry::Line(coordinates) => {
                         let first = coordinates.first().expect("start");
                         let last = coordinates.last().expect("end");
-                        assert!(first[0].abs() < 1e-9 && first[1].abs() < 1e-9);
-                        assert!((last[0] - 3.0).abs() < 1e-9 && (last[1] - 3.0).abs() < 1e-9);
+                        assert!(first.0.abs() < 1e-9 && first.1.abs() < 1e-9);
+                        assert!((last.0 - 3.0).abs() < 1e-9 && (last.1 - 3.0).abs() < 1e-9);
                         for position in &coordinates {
                             assert!(
-                                (position[0] - position[1]).abs() < 1e-9,
+                                (position.0 - position.1).abs() < 1e-9,
                                 "off line: {position:?}"
                             );
                         }
@@ -4085,7 +3927,7 @@ mod tests {
                 extra_properties,
                 ..
             } => {
-                assert_eq!(geometry, GeometryValue::new_point((7.0, 8.0)));
+                assert_eq!(geometry, CadGeometry::Point((7.0, 8.0)));
                 let get = |key: &str| {
                     extra_properties
                         .iter()
@@ -4114,7 +3956,7 @@ mod tests {
                 extra_properties,
                 ..
             } => {
-                assert_eq!(geometry, GeometryValue::new_point((1.0, 2.0)));
+                assert_eq!(geometry, CadGeometry::Point((1.0, 2.0)));
                 let text = extra_properties
                     .iter()
                     .find(|(k, _)| *k == "text")
@@ -4161,7 +4003,7 @@ mod tests {
         plain.flags = PolylineFlags::from_bits(PolylineFlags::CLOSED.bits());
         match convert_entity(&EntityType::Polyline2D(plain), &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::LineString { coordinates } => {
+                CadGeometry::Line(coordinates) => {
                     assert_eq!(coordinates.len(), 4);
                     assert_eq!(coordinates.first(), coordinates.last());
                 }
@@ -4203,7 +4045,7 @@ mod tests {
                 geometry, warnings, ..
             } => {
                 match geometry {
-                    GeometryValue::LineString { coordinates } => {
+                    CadGeometry::Line(coordinates) => {
                         assert_eq!(coordinates.len(), 4);
                         assert_eq!(coordinates.first(), coordinates.last());
                     }
@@ -4233,7 +4075,7 @@ mod tests {
                 extra_properties,
                 warnings,
             } => {
-                let GeometryValue::Polygon { coordinates } = geometry else {
+                let CadGeometry::Polygon(coordinates) = geometry else {
                     panic!("expected Polygon, got {geometry:?}");
                 };
                 assert_eq!(coordinates.len(), 1);
@@ -4242,7 +4084,7 @@ mod tests {
                 assert_eq!(ring.first(), ring.last());
                 let tuples: Vec<(f64, f64)> = ring
                     .iter()
-                    .map(|position| (position[0], position[1]))
+                    .map(|position| (position.0, position.1))
                     .collect();
                 assert!(signed_area(&tuples) > 0.0, "ring must be CCW");
                 assert_eq!(
@@ -4270,7 +4112,7 @@ mod tests {
         ));
         match convert_entity(&face, &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
-                GeometryValue::Polygon { coordinates } => {
+                CadGeometry::Polygon(coordinates) => {
                     assert_eq!(coordinates.len(), 1);
                     assert_eq!(coordinates[0].len(), 4);
                     assert_eq!(coordinates[0].first(), coordinates[0].last());
@@ -4388,11 +4230,73 @@ mod tests {
         }
     }
 
-    fn string_id(feature: &geojson::Feature) -> String {
-        match &feature.id {
-            Some(geojson::feature::Id::String(id)) => id.clone(),
-            other => panic!("expected string feature id, got {other:?}"),
+    fn string_id(feature: &super::CadFeature) -> String {
+        feature.id.clone()
+    }
+
+    /// Rendered GeoJSON properties of a CAD feature (via the writer), for
+    /// property-assertion tests.
+    fn props(feature: &super::CadFeature) -> geojson::JsonObject {
+        super::writer::to_geojson(feature)
+            .properties
+            .expect("properties")
+    }
+
+    /// Minimal CAD feature for pipeline-helper unit tests.
+    fn cad_feature(id: &str, geometry: CadGeometry) -> super::CadFeature {
+        super::CadFeature {
+            id: id.to_string(),
+            entity_type: "TEST".to_string(),
+            handle: "0x0".to_string(),
+            layer: "0".to_string(),
+            source_layer: None,
+            block_path: Vec::new(),
+            extra_properties: Vec::new(),
+            warnings: Vec::new(),
+            geometry,
         }
+    }
+
+    /// Fold features through the incremental geometry-check helper.
+    fn check_all(features: &[super::CadFeature]) -> crate::report::GeometryChecks {
+        let mut checks = super::empty_geometry_checks();
+        for feature in features {
+            super::update_geometry_checks(&mut checks, feature);
+        }
+        checks
+    }
+
+    /// Bounding box over features via the incremental accumulator.
+    fn bbox_all(features: &[super::CadFeature]) -> Option<[f64; 4]> {
+        let mut bbox = None;
+        for feature in features {
+            super::accumulate_bbox(&mut bbox, feature);
+        }
+        bbox
+    }
+
+    /// Outlier scan over features via the collect-then-finalize helpers.
+    fn outliers_all(features: &[super::CadFeature]) -> crate::report::SpatialOutliers {
+        let mut centers = Vec::new();
+        for feature in features {
+            if let Some((x, y)) = super::feature_center(feature) {
+                centers.push((feature.id.clone(), x, y));
+            }
+        }
+        super::finalize_spatial_outliers(&centers)
+    }
+
+    /// Classify features against a boundary file via the streaming index.
+    fn boundary_all(
+        features: &[super::CadFeature],
+        path: &std::path::Path,
+    ) -> anyhow::Result<crate::report::BoundaryCheck> {
+        let index = super::BoundaryIndex::load(path)?;
+        let mut tally = super::BoundaryTally::default();
+        for feature in features {
+            index.classify(feature, &mut tally);
+        }
+        Ok(index.into_report(tally))
     }
 
     #[test]
@@ -4426,15 +4330,15 @@ mod tests {
         assert_eq!(extraction.features.len(), 1);
         assert_eq!(extraction.converted.get("LINE"), Some(&1));
         let feature = &extraction.features[0];
-        let geometry = feature.geometry.as_ref().expect("geometry");
-        let GeometryValue::LineString { coordinates } = &geometry.value else {
-            panic!("expected LineString, got {:?}", geometry.value);
+        let geometry = &feature.geometry;
+        let CadGeometry::Line(coordinates) = geometry else {
+            panic!("expected LineString, got {geometry:?}");
         };
         // (0,0) maps to the insertion point; (1,0) scales to (2,0), rotates
         // 90 degrees to (0,2), and shifts to (10,2).
-        assert!((coordinates[0][0] - 10.0).abs() < 1e-9 && coordinates[0][1].abs() < 1e-9);
-        assert!((coordinates[1][0] - 10.0).abs() < 1e-9 && (coordinates[1][1] - 2.0).abs() < 1e-9);
-        let properties = feature.properties.as_ref().expect("properties");
+        assert!((coordinates[0].0 - 10.0).abs() < 1e-9 && coordinates[0].1.abs() < 1e-9);
+        assert!((coordinates[1].0 - 10.0).abs() < 1e-9 && (coordinates[1].1 - 2.0).abs() < 1e-9);
+        let properties = props(feature);
         assert_eq!(properties.get("block_path"), Some(&JsonValue::from("PART")));
         let id = string_id(feature);
         assert!(
@@ -4471,13 +4375,13 @@ mod tests {
 
         assert_eq!(extraction.features.len(), 1);
         assert_eq!(extraction.converted.get("3DFACE"), Some(&1));
-        let geometry = extraction.features[0].geometry.as_ref().expect("geometry");
-        let GeometryValue::Polygon { coordinates } = &geometry.value else {
-            panic!("expected Polygon, got {:?}", geometry.value);
+        let geometry = &extraction.features[0].geometry;
+        let CadGeometry::Polygon(coordinates) = geometry else {
+            panic!("expected Polygon, got {geometry:?}");
         };
         let ring: Vec<(f64, f64)> = coordinates[0]
             .iter()
-            .map(|position| (position[0], position[1]))
+            .map(|position| (position.0, position.1))
             .collect();
         assert_eq!(
             ring,
@@ -4525,9 +4429,9 @@ mod tests {
         assert_eq!(extraction.inserts_expanded, 2);
         assert_eq!(extraction.features.len(), 1);
         let feature = &extraction.features[0];
-        let geometry = feature.geometry.as_ref().expect("geometry");
-        assert_eq!(geometry.value, GeometryValue::new_point((13.0, 0.0)));
-        let properties = feature.properties.as_ref().expect("properties");
+        let geometry = &feature.geometry;
+        assert_eq!(*geometry, CadGeometry::Point((13.0, 0.0)));
+        let properties = props(feature);
         assert_eq!(
             properties.get("block_path"),
             Some(&JsonValue::from("OUTER/INNER"))
@@ -4555,10 +4459,7 @@ mod tests {
         let extraction = extract(&document, &opts(false)).expect("extract");
 
         assert_eq!(extraction.features.len(), 1);
-        let properties = extraction.features[0]
-            .properties
-            .as_ref()
-            .expect("properties");
+        let properties = props(&extraction.features[0]);
         assert_eq!(properties.get("layer"), Some(&JsonValue::from("PIPES")));
         assert_eq!(properties.get("source_layer"), Some(&JsonValue::from("0")));
     }
@@ -4593,9 +4494,9 @@ mod tests {
         assert_eq!(extraction.features.len(), 1);
         assert_eq!(extraction.converted.get("INSERT"), Some(&1));
         let feature = &extraction.features[0];
-        let geometry = feature.geometry.as_ref().expect("geometry");
-        assert_eq!(geometry.value, GeometryValue::new_point((5.0, 6.0)));
-        let properties = feature.properties.as_ref().expect("properties");
+        let geometry = &feature.geometry;
+        assert_eq!(*geometry, CadGeometry::Point((5.0, 6.0)));
+        let properties = props(feature);
         assert_eq!(properties.get("block_name"), Some(&JsonValue::from("SYM")));
         let attributes = properties.get("attributes").expect("attributes");
         assert_eq!(attributes.get("TAG"), Some(&JsonValue::from("V1")));
@@ -4680,10 +4581,10 @@ mod tests {
         let points: Vec<_> = extraction
             .features
             .iter()
-            .map(|feature| feature.geometry.as_ref().expect("geometry").value.clone())
+            .map(|feature| feature.geometry.clone())
             .collect();
-        assert_eq!(points[0], GeometryValue::new_point((0.0, 0.0)));
-        assert_eq!(points[1], GeometryValue::new_point((5.0, 0.0)));
+        assert_eq!(points[0], CadGeometry::Point((0.0, 0.0)));
+        assert_eq!(points[1], CadGeometry::Point((5.0, 0.0)));
         let ids: Vec<String> = extraction.features.iter().map(string_id).collect();
         assert!(
             ids[0].contains("[0,0]") && ids[1].contains("[0,1]"),
@@ -4710,10 +4611,7 @@ mod tests {
 
         let extraction = extract(&document, &opts(false)).expect("extract");
 
-        let properties = extraction.features[0]
-            .properties
-            .as_ref()
-            .expect("properties");
+        let properties = props(&extraction.features[0]);
         assert_eq!(properties.get("color_index"), Some(&JsonValue::from(3)));
         assert_eq!(
             properties.get("color_rgb"),
@@ -4749,10 +4647,7 @@ mod tests {
         let extraction = extract(&document, &opts(false)).expect("extract");
 
         assert_eq!(extraction.features.len(), 2);
-        let block_properties = extraction.features[0]
-            .properties
-            .as_ref()
-            .expect("properties");
+        let block_properties = props(&extraction.features[0]);
         assert_eq!(
             block_properties.get("color_index"),
             Some(&JsonValue::from(1))
@@ -4761,10 +4656,7 @@ mod tests {
             block_properties.get("linetype"),
             Some(&JsonValue::from("DASHED"))
         );
-        let loose_properties = extraction.features[1]
-            .properties
-            .as_ref()
-            .expect("properties");
+        let loose_properties = props(&extraction.features[1]);
         assert_eq!(
             loose_properties.get("color"),
             Some(&JsonValue::from("ByBlock"))
@@ -4801,10 +4693,7 @@ mod tests {
 
         let extraction = extract(&document, &opts(false)).expect("extract");
 
-        let properties = extraction.features[0]
-            .properties
-            .as_ref()
-            .expect("properties");
+        let properties = props(&extraction.features[0]);
         let Some(JsonValue::Number(rotation)) = properties.get("text_rotation_deg") else {
             panic!("text_rotation_deg must be present");
         };
@@ -4832,10 +4721,8 @@ mod tests {
         path
     }
 
-    fn ring_tuples(ring: &[geojson::Position]) -> Vec<(f64, f64)> {
-        ring.iter()
-            .map(|position| (position[0], position[1]))
-            .collect()
+    fn ring_tuples(ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        ring.to_vec()
     }
 
     #[test]
@@ -4853,7 +4740,7 @@ mod tests {
                 extra_properties,
                 ..
             } => {
-                let GeometryValue::Polygon { coordinates } = geometry else {
+                let CadGeometry::Polygon(coordinates) = geometry else {
                     panic!("expected Polygon");
                 };
                 assert_eq!(coordinates.len(), 2, "one shell and one hole");
@@ -4885,7 +4772,7 @@ mod tests {
 
         match convert_entity(&EntityType::Hatch(hatch), &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => {
-                let GeometryValue::MultiPolygon { coordinates } = geometry else {
+                let CadGeometry::MultiPolygon(coordinates) = geometry else {
                     panic!("expected MultiPolygon");
                 };
                 assert_eq!(coordinates.len(), 2);
@@ -4923,7 +4810,7 @@ mod tests {
                 extra_properties,
                 warnings,
             } => {
-                let GeometryValue::Polygon { coordinates } = geometry else {
+                let CadGeometry::Polygon(coordinates) = geometry else {
                     panic!("expected Polygon");
                 };
                 let shell = ring_tuples(&coordinates[0]);
@@ -5040,7 +4927,7 @@ mod tests {
         );
         match convert_entity(&EntityType::Solid(solid), &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => {
-                let GeometryValue::Polygon { coordinates } = geometry else {
+                let CadGeometry::Polygon(coordinates) = geometry else {
                     panic!("expected Polygon");
                 };
                 let ring = ring_tuples(&coordinates[0]);
@@ -5071,7 +4958,7 @@ mod tests {
         );
         match convert_entity(&EntityType::Solid(triangle), &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => {
-                let GeometryValue::Polygon { coordinates } = geometry else {
+                let CadGeometry::Polygon(coordinates) = geometry else {
                     panic!("expected Polygon");
                 };
                 assert_eq!(coordinates[0].len(), 4, "triangle ring has 4 positions");
@@ -5093,27 +4980,14 @@ mod tests {
 
     #[test]
     fn wgs84_extent_check_flags_out_of_range_coordinates() {
-        use super::{crs_is_wgs84, wgs84_out_of_range};
-        use geojson::{Feature, Geometry, feature::Id};
+        use super::{crs_is_wgs84, wgs84_violation};
 
-        let feature = |id: &str, x: f64, y: f64| Feature {
-            bbox: None,
-            geometry: Some(Geometry::new(GeometryValue::new_point((x, y)))),
-            id: Some(Id::String(id.to_string())),
-            properties: None,
-            foreign_members: None,
-        };
-
-        let plausible = vec![feature("A", -51.2, -23.4), feature("B", 180.0, 90.0)];
-        assert!(wgs84_out_of_range(&plausible).is_none());
+        assert!(wgs84_violation(&cad_feature("A", CadGeometry::Point((-51.2, -23.4)))).is_none());
+        assert!(wgs84_violation(&cad_feature("B", CadGeometry::Point((180.0, 90.0)))).is_none());
 
         // UTM-magnitude coordinates delivered as "WGS 84" must be flagged.
-        let implausible = vec![
-            feature("A", -51.2, -23.4),
-            feature("B", 248_000.0, 7_396_000.0),
-        ];
-        let (id, x, _y) = wgs84_out_of_range(&implausible).expect("must flag");
-        assert_eq!(id, "B");
+        let bad = cad_feature("B", CadGeometry::Point((248_000.0, 7_396_000.0)));
+        let (x, _y) = wgs84_violation(&bad).expect("must flag");
         assert_eq!(x, 248_000.0);
 
         assert!(crs_is_wgs84("epsg:4326"));
@@ -5123,29 +4997,21 @@ mod tests {
 
     #[test]
     fn geometry_checks_count_violations_and_pass_valid_output() {
-        use super::{check_geometries, features_bbox};
-        use geojson::{Feature, Geometry};
-
-        let feature = |value: GeometryValue| Feature {
-            bbox: None,
-            geometry: Some(Geometry::new(value)),
-            id: None,
-            properties: None,
-            foreign_members: None,
-        };
-
         // A valid CCW closed square and a line: no violations.
         let valid = vec![
-            feature(GeometryValue::new_polygon(vec![vec![
-                (0.0, 0.0),
-                (10.0, 0.0),
-                (10.0, 10.0),
-                (0.0, 10.0),
-                (0.0, 0.0),
-            ]])),
-            feature(GeometryValue::new_line_string(vec![(0.0, 0.0), (5.0, 5.0)])),
+            cad_feature(
+                "sq",
+                CadGeometry::Polygon(vec![vec![
+                    (0.0, 0.0),
+                    (10.0, 0.0),
+                    (10.0, 10.0),
+                    (0.0, 10.0),
+                    (0.0, 0.0),
+                ]]),
+            ),
+            cad_feature("ln", CadGeometry::Line(vec![(0.0, 0.0), (5.0, 5.0)])),
         ];
-        let checks = check_geometries(&valid);
+        let checks = check_all(&valid);
         assert_eq!(checks.features_checked, 2);
         assert_eq!(checks.rings_checked, 1);
         assert_eq!(
@@ -5157,32 +5023,25 @@ mod tests {
                 + checks.degenerate_rings,
             0
         );
-        assert_eq!(features_bbox(&valid), Some([0.0, 0.0, 10.0, 10.0]));
+        assert_eq!(bbox_all(&valid), Some([0.0, 0.0, 10.0, 10.0]));
 
         // A CW shell that is also unclosed, a degenerate ring, a NaN line
         // with a duplicate vertex, and an empty line.
         let invalid = vec![
-            feature(GeometryValue::Polygon {
-                coordinates: vec![
-                    vec![
-                        vec![0.0, 0.0].into(),
-                        vec![0.0, 10.0].into(),
-                        vec![10.0, 10.0].into(),
-                        vec![10.0, 0.0].into(),
-                    ],
-                    vec![vec![1.0, 1.0].into(), vec![2.0, 2.0].into()],
-                ],
-            }),
-            feature(GeometryValue::new_line_string(vec![
-                (f64::NAN, 0.0),
-                (1.0, 1.0),
-                (1.0, 1.0),
-            ])),
-            feature(GeometryValue::LineString {
-                coordinates: Vec::new(),
-            }),
+            cad_feature(
+                "cw",
+                CadGeometry::Polygon(vec![
+                    vec![(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)],
+                    vec![(1.0, 1.0), (2.0, 2.0)],
+                ]),
+            ),
+            cad_feature(
+                "nan",
+                CadGeometry::Line(vec![(f64::NAN, 0.0), (1.0, 1.0), (1.0, 1.0)]),
+            ),
+            cad_feature("empty", CadGeometry::Line(Vec::new())),
         ];
-        let checks = check_geometries(&invalid);
+        let checks = check_all(&invalid);
         assert_eq!(checks.rings_checked, 2);
         assert_eq!(checks.unclosed_rings, 1);
         assert_eq!(checks.misoriented_rings, 1);
@@ -5194,31 +5053,22 @@ mod tests {
 
     #[test]
     fn spatial_outliers_flag_far_features_only() {
-        use super::detect_spatial_outliers;
-        use geojson::{Feature, Geometry, feature::Id};
-
-        let feature = |id: &str, x: f64, y: f64| Feature {
-            bbox: None,
-            geometry: Some(Geometry::new(GeometryValue::new_point((x, y)))),
-            id: Some(Id::String(id.to_string())),
-            properties: None,
-            foreign_members: None,
-        };
-
         // A tight cluster around (248000, 7396000) plus one title block at
         // the drawing origin.
-        let mut features: Vec<Feature> = (0..20)
+        let mut features: Vec<super::CadFeature> = (0..20)
             .map(|i| {
-                feature(
+                cad_feature(
                     &format!("C{i}"),
-                    248_000.0 + f64::from(i) * 10.0,
-                    7_396_000.0 + f64::from(i) * 5.0,
+                    CadGeometry::Point((
+                        248_000.0 + f64::from(i) * 10.0,
+                        7_396_000.0 + f64::from(i) * 5.0,
+                    )),
                 )
             })
             .collect();
-        features.push(feature("SHEET", 0.0, 0.0));
+        features.push(cad_feature("SHEET", CadGeometry::Point((0.0, 0.0))));
 
-        let scan = detect_spatial_outliers(&features);
+        let scan = outliers_all(&features);
         assert_eq!(scan.features_checked, 21);
         assert_eq!(scan.outlier_features, 1);
         assert_eq!(scan.sample_ids, vec!["SHEET".to_string()]);
@@ -5230,14 +5080,12 @@ mod tests {
 
         // Without the outlier nothing is flagged.
         features.pop();
-        let scan = detect_spatial_outliers(&features);
+        let scan = outliers_all(&features);
         assert_eq!(scan.outlier_features, 0);
     }
 
     #[test]
     fn boundary_check_classifies_containment_with_holes() {
-        use super::check_boundary;
-        use geojson::{Feature, Geometry, feature::Id};
         use std::io::Write;
 
         // Boundary: 0..10 square with a 4..6 hole.
@@ -5255,24 +5103,14 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("temp boundary");
         write!(file, "{boundary}").expect("write boundary");
 
-        let feature = |id: &str, value: GeometryValue| Feature {
-            bbox: None,
-            geometry: Some(Geometry::new(value)),
-            id: Some(Id::String(id.to_string())),
-            properties: None,
-            foreign_members: None,
-        };
         let features = vec![
-            feature("IN", GeometryValue::new_point((2.0, 2.0))),
-            feature("IN-HOLE", GeometryValue::new_point((5.0, 5.0))),
-            feature("OUT", GeometryValue::new_point((20.0, 20.0))),
-            feature(
-                "PARTIAL",
-                GeometryValue::new_line_string(vec![(2.0, 2.0), (20.0, 2.0)]),
-            ),
+            cad_feature("IN", CadGeometry::Point((2.0, 2.0))),
+            cad_feature("IN-HOLE", CadGeometry::Point((5.0, 5.0))),
+            cad_feature("OUT", CadGeometry::Point((20.0, 20.0))),
+            cad_feature("PARTIAL", CadGeometry::Line(vec![(2.0, 2.0), (20.0, 2.0)])),
         ];
 
-        let check = check_boundary(&features, file.path()).expect("boundary check");
+        let check = boundary_all(&features, file.path()).expect("boundary check");
         assert_eq!(check.polygons, 1);
         assert_eq!(check.features_inside, 1);
         assert_eq!(check.features_partial, 1);
@@ -5284,7 +5122,7 @@ mod tests {
         let mut bad = tempfile::NamedTempFile::new().expect("temp boundary");
         write!(bad, r#"{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[0,0]}}}}"#)
             .expect("write");
-        let Err(error) = check_boundary(&features, bad.path()) else {
+        let Err(error) = boundary_all(&features, bad.path()) else {
             panic!("polygon-free boundary must fail");
         };
         assert!(format!("{error:#}").contains("no Polygon"));
@@ -5350,15 +5188,13 @@ mod tests {
 
         let extraction = extract(&document, &opts(false)).expect("extract");
         assert_eq!(extraction.features.len(), 1);
-        let geometry = extraction.features[0].geometry.as_ref().expect("geometry");
-        let GeometryValue::Point { coordinates } = &geometry.value else {
+        let geometry = &extraction.features[0].geometry;
+        let CadGeometry::Point((x, y)) = geometry else {
             panic!("expected Point");
         };
         assert!(
-            (coordinates[0] - -10.0).abs() < 1e-9 && (coordinates[1] - 30.0).abs() < 1e-9,
-            "got ({}, {})",
-            coordinates[0],
-            coordinates[1]
+            (x - -10.0).abs() < 1e-9 && (y - 30.0).abs() < 1e-9,
+            "got ({x}, {y})"
         );
     }
 
@@ -5384,7 +5220,7 @@ mod tests {
         full.end_angle = std::f64::consts::TAU;
         match convert_entity(&EntityType::Arc(full), &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => {
-                let GeometryValue::LineString { coordinates } = geometry else {
+                let CadGeometry::Line(coordinates) = geometry else {
                     panic!("expected LineString");
                 };
                 assert!(coordinates.len() > 8, "full turn must tessellate");
@@ -5429,7 +5265,7 @@ mod tests {
                 extra_properties,
                 warnings,
             } => {
-                let GeometryValue::Polygon { coordinates } = geometry else {
+                let CadGeometry::Polygon(coordinates) = geometry else {
                     panic!("expected Polygon");
                 };
                 assert_eq!(coordinates.len(), 1, "zero-area hole must be dropped");
@@ -5498,8 +5334,6 @@ mod tests {
 
     #[test]
     fn boundary_segments_crossing_the_boundary_force_partial() {
-        use super::check_boundary;
-        use geojson::{Feature, Geometry, feature::Id};
         use std::io::Write;
 
         // U-shaped boundary: a 4x4 square with a notch cut from the top
@@ -5516,24 +5350,14 @@ mod tests {
 
         // Both endpoints are inside the arms of the U, but the segment
         // crosses the notch.
-        let feature = Feature {
-            bbox: None,
-            geometry: Some(Geometry::new(GeometryValue::new_line_string(vec![
-                (0.5, 3.0),
-                (3.5, 3.0),
-            ]))),
-            id: Some(Id::String("BRIDGE".to_string())),
-            properties: None,
-            foreign_members: None,
-        };
-        let check = check_boundary(&[feature], file.path()).expect("boundary check");
+        let feature = cad_feature("BRIDGE", CadGeometry::Line(vec![(0.5, 3.0), (3.5, 3.0)]));
+        let check = boundary_all(&[feature], file.path()).expect("boundary check");
         assert_eq!(check.features_partial, 1, "{check:?}");
         assert_eq!(check.features_inside, 0);
     }
 
     #[test]
     fn malformed_boundaries_error_instead_of_panicking() {
-        use super::check_boundary;
         use std::io::Write;
 
         let cases = [
@@ -5550,7 +5374,7 @@ mod tests {
             let mut file = tempfile::NamedTempFile::new().expect("temp boundary");
             write!(file, "{case}").expect("write");
             assert!(
-                check_boundary(&[], file.path()).is_err(),
+                boundary_all(&[], file.path()).is_err(),
                 "must reject: {case}"
             );
         }
@@ -5558,22 +5382,13 @@ mod tests {
 
     #[test]
     fn millimeter_neighbors_in_tight_clusters_are_not_outliers() {
-        use super::detect_spatial_outliers;
-        use geojson::{Feature, Geometry, feature::Id};
-
-        let feature = |id: &str, x: f64, y: f64| Feature {
-            bbox: None,
-            geometry: Some(Geometry::new(GeometryValue::new_point((x, y)))),
-            id: Some(Id::String(id.to_string())),
-            properties: None,
-            foreign_members: None,
-        };
-        let mut features: Vec<Feature> = (0..20)
+        let feature = |id: &str, x: f64, y: f64| cad_feature(id, CadGeometry::Point((x, y)));
+        let mut features: Vec<super::CadFeature> = (0..20)
             .map(|i| feature(&format!("C{i}"), 248_000.0, 7_396_000.0))
             .collect();
         features.push(feature("NEAR", 248_000.001, 7_396_000.0));
 
-        let scan = detect_spatial_outliers(&features);
+        let scan = outliers_all(&features);
         assert_eq!(scan.outlier_features, 0, "{scan:?}");
     }
 
@@ -5598,10 +5413,7 @@ mod tests {
         let extraction = extract(&document, &options).expect("extract");
         assert_eq!(extraction.features.len(), 1);
         assert_eq!(extraction.excluded_by_layer_filter, 1);
-        let properties = extraction.features[0]
-            .properties
-            .as_ref()
-            .expect("properties");
+        let properties = props(&extraction.features[0]);
         assert_eq!(
             properties.get("layer"),
             Some(&geojson::JsonValue::from("EIXO"))
@@ -5629,7 +5441,7 @@ mod tests {
             options.curve_tolerance = tolerance;
             match convert_entity(&EntityType::Spline(make()), &options) {
                 EntityOutcome::Converted { geometry, .. } => match geometry {
-                    GeometryValue::LineString { coordinates } => coordinates.len(),
+                    CadGeometry::Line(coordinates) => coordinates.len(),
                     other => panic!("expected LineString, got {other:?}"),
                 },
                 other => panic!("spline must convert, got {other:?}"),
@@ -5696,7 +5508,7 @@ mod tests {
                 extra_properties,
                 ..
             } => {
-                assert_eq!(geometry, GeometryValue::new_point((7.0, 8.0)));
+                assert_eq!(geometry, CadGeometry::Point((7.0, 8.0)));
                 assert_eq!(
                     extra_property(&extra_properties, "text_anchor"),
                     Some(&geojson::JsonValue::from("alignment"))
@@ -5714,7 +5526,7 @@ mod tests {
                 extra_properties,
                 ..
             } => {
-                assert_eq!(geometry, GeometryValue::new_point((3.0, 4.0)));
+                assert_eq!(geometry, CadGeometry::Point((3.0, 4.0)));
                 assert_eq!(
                     extra_property(&extra_properties, "text_anchor"),
                     Some(&geojson::JsonValue::from("insertion"))
