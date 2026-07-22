@@ -20,8 +20,8 @@
     text { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
   </style>
   <defs>
-    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-      <path d="M0,1.5 L9,5 L0,8.5 z" fill="#9aa8cc"/>
+    <marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="#9aa8cc"/>
     </marker>
   </defs>
 
@@ -39,24 +39,24 @@
   <text class="tag p" x="224" y="272" font-size="11">NATIVE BACKEND · pure Rust, in-process</text>
 
   <!-- Edges from input -->
-  <path class="edge" d="M174,204 C194,204 196,84 222,84"   marker-end="url(#a)"/>
-  <path class="edge" d="M174,220 C194,220 196,196 222,196" marker-end="url(#a)"/>
-  <path class="edge" d="M174,236 C194,236 196,318 222,318" marker-end="url(#a)"/>
+  <path class="edge" d="M174,204 C196,204 206,84 218,84 L230,84"   marker-end="url(#a)"/>
+  <path class="edge" d="M174,220 C196,220 206,196 218,196 L230,196" marker-end="url(#a)"/>
+  <path class="edge" d="M174,236 C196,236 206,318 218,318 L230,318" marker-end="url(#a)"/>
 
   <!-- Lane 1 -->
   <rect class="box" x="230" y="64" width="180" height="44" rx="10"/>
   <text class="lbl" x="320" y="91" text-anchor="middle" font-size="13.5">Header inspector</text>
-  <path class="edge" d="M410,86 L436,86" marker-end="url(#a)"/>
+  <path class="edge" d="M410,86 L440,86" marker-end="url(#a)"/>
   <rect class="box" x="440" y="64" width="250" height="44" rx="10"/>
   <text class="sub" x="565" y="91" text-anchor="middle" font-size="12.5">signature · size · SHA-256</text>
 
   <!-- Lane 2 -->
   <rect class="box" x="230" y="176" width="150" height="44" rx="10"/>
   <text class="lbl" x="305" y="203" text-anchor="middle" font-size="13">dwgread → DXF</text>
-  <path class="edge" d="M380,198 L406,198" marker-end="url(#a)"/>
+  <path class="edge" d="M380,198 L410,198" marker-end="url(#a)"/>
   <rect class="box" x="410" y="176" width="160" height="44" rx="10"/>
   <text class="lbl" x="490" y="203" text-anchor="middle" font-size="13">ogr2ogr (GDAL)</text>
-  <path class="edge" d="M570,198 L596,198" marker-end="url(#a)"/>
+  <path class="edge" d="M570,198 L600,198" marker-end="url(#a)"/>
   <rect class="box io" x="600" y="176" width="110" height="44" rx="10"/>
   <text class="lbl" x="655" y="203" text-anchor="middle" font-size="13">GeoJSON</text>
 
@@ -64,15 +64,15 @@
   <rect class="box native" x="230" y="286" width="130" height="52" rx="10"/>
   <text class="lbl" x="295" y="309" text-anchor="middle" font-size="13">acadrust</text>
   <text class="sub" x="295" y="326" text-anchor="middle" font-size="11.5">DWG reader</text>
-  <path class="edge" d="M360,312 L388,312" marker-end="url(#a)"/>
+  <path class="edge" d="M360,312 L392,312" marker-end="url(#a)"/>
   <rect class="box native" x="392" y="286" width="176" height="52" rx="10"/>
   <text class="lbl" x="480" y="309" text-anchor="middle" font-size="13">CAD-neutral model</text>
   <text class="sub" x="480" y="326" text-anchor="middle" font-size="11.5">CadFeature / CadGeometry</text>
-  <path class="edge" d="M568,312 L596,312" marker-end="url(#a)"/>
+  <path class="edge" d="M568,312 L600,312" marker-end="url(#a)"/>
   <rect class="box native" x="600" y="286" width="130" height="52" rx="10"/>
   <text class="lbl" x="665" y="309" text-anchor="middle" font-size="13">Writer</text>
   <text class="sub" x="665" y="326" text-anchor="middle" font-size="11.5">single GeoJSON exit</text>
-  <path class="edge" d="M730,312 L758,312" marker-end="url(#a)"/>
+  <path class="edge" d="M730,312 L762,312" marker-end="url(#a)"/>
   <rect class="box io" x="762" y="286" width="140" height="52" rx="10"/>
   <text class="lbl" x="832" y="309" text-anchor="middle" font-size="13">GeoJSON</text>
   <text class="sub" x="832" y="326" text-anchor="middle" font-size="11.5">+ report.json</text>

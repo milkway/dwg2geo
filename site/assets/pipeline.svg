@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 340" role="img" aria-label="dwg2geo conversion pipeline: choose a coordinate policy (source CRS, control points, or local), resolve units, tessellate and transform, validate and account, then write GeoJSON or GeoJSONSeq with a deterministic report.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 350" role="img" aria-label="dwg2geo conversion pipeline: choose a coordinate policy (source CRS, control points, or local), resolve units, tessellate and transform, validate and account, then write GeoJSON or GeoJSONSeq with a deterministic report.">
   <style>
     .box { fill: #ffffff; stroke: #dbe3f4; }
     .box.pol { fill: #f4f1ff; stroke: #c9bcff; }
@@ -18,8 +18,8 @@
     text { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
   </style>
   <defs>
-    <marker id="p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-      <path d="M0,1.5 L9,5 L0,8.5 z" fill="#9aa8cc"/>
+    <marker id="p" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="#9aa8cc"/>
     </marker>
   </defs>
 
@@ -31,7 +31,7 @@
   <text class="flag" x="40" y="138" font-size="12">--control-point</text><text class="sub" x="40" y="154" font-size="11">local calibration</text>
   <text class="flag" x="40" y="178" font-size="12">--allow-local-coordinates</text>
 
-  <path class="edge" d="M240,119 L268,119" marker-end="url(#p)"/>
+  <path class="edge" d="M242,119 L272,119" marker-end="url(#p)"/>
 
   <!-- Stage 2: units -->
   <text class="tag" x="272" y="34" font-size="11">2 · UNITS</text>
@@ -43,7 +43,7 @@
   <text class="sub" x="347" y="158" text-anchor="middle" font-size="11">else require</text>
   <text class="flag" x="347" y="176" text-anchor="middle" font-size="12">--source-units</text>
 
-  <path class="edge" d="M422,119 L450,119" marker-end="url(#p)"/>
+  <path class="edge" d="M424,119 L454,119" marker-end="url(#p)"/>
 
   <!-- Stage 3: geometry -->
   <text class="tag" x="454" y="34" font-size="11">3 · GEOMETRY</text>
@@ -54,7 +54,7 @@
   <text class="flag" x="544" y="144" text-anchor="middle" font-size="12">--curve-tolerance</text>
   <text class="sub" x="544" y="168" text-anchor="middle" font-size="11">transform coordinates</text>
 
-  <path class="edge" d="M634,119 L662,119" marker-end="url(#p)"/>
+  <path class="edge" d="M636,119 L666,119" marker-end="url(#p)"/>
 
   <!-- Stage 4: validate -->
   <text class="tag" x="666" y="34" font-size="11">4 · VALIDATE</text>
@@ -65,14 +65,15 @@
   <text class="sub" x="762" y="142" text-anchor="middle" font-size="11">WGS84 extent (fail-safe)</text>
   <text class="flag" x="762" y="170" text-anchor="middle" font-size="12">--validate-boundary</text>
 
-  <!-- Stage 5: validate writes BOTH outputs -->
-  <text class="tag" x="452" y="242" font-size="11">5 · OUTPUT — deterministic</text>
-  <path class="edge" d="M726,194 C726,224 560,222 545,248" marker-end="url(#p)"/>
-  <path class="edge" d="M798,194 C798,226 780,224 778,248" marker-end="url(#p)"/>
+  <!-- Stage 5: validate writes BOTH outputs; each edge ends with a straight
+       vertical drop so the arrowhead is in line with the box. -->
+  <path class="edge" d="M712,194 C700,220 545,214 542,234 L542,252" marker-end="url(#p)"/>
+  <path class="edge" d="M800,194 C800,224 778,224 778,234 L778,252" marker-end="url(#p)"/>
   <rect class="box out" x="452" y="252" width="180" height="60" rx="12"/>
   <text class="lbl" x="542" y="278" text-anchor="middle" font-size="13">report.json</text>
   <text class="sub" x="542" y="298" text-anchor="middle" font-size="11">options · checks · hash</text>
   <rect class="box out" x="672" y="252" width="212" height="60" rx="12"/>
   <text class="lbl" x="778" y="278" text-anchor="middle" font-size="13">GeoJSON / GeoJSONSeq</text>
   <text class="sub" x="778" y="298" text-anchor="middle" font-size="11">via --output-format</text>
+  <text class="tag" x="452" y="334" font-size="11">5 · OUTPUT — deterministic, same bytes for same input</text>
 </svg>
