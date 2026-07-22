@@ -101,10 +101,10 @@ Exit condition: output positioning is explicit, reproducible, and sanity checked
 
 ## Milestone 6 — validation and quality gates
 
-- [ ] Compare source entity histogram against converted/skipped histogram.
-- [ ] Report bounding boxes before and after transformation.
-- [ ] Detect NaN, infinite, duplicate, empty, and degenerate geometries.
-- [ ] Validate polygon ring closure and orientation.
+- [x] Compare source entity histogram against converted/skipped histogram. (Report `native.accounting`: every top-level model-space entity must reach exactly one outcome — converted, skipped, failed, or INSERT expansion; a nonzero `unaccounted` is surfaced as a converter-bug warning, never hidden.)
+- [x] Report bounding boxes before and after transformation. (`native.bbox_drawing` and `native.bbox_output` as [min_x, min_y, max_x, max_y]; identical for local-coordinate output.)
+- [x] Detect NaN, infinite, duplicate, empty, and degenerate geometries. (Output-side `native.geometry_checks` pass over the final features; non-finite/empty/degenerate counts raise converter-bug warnings, duplicate consecutive vertices are counted as informational.)
+- [x] Validate polygon ring closure and orientation. (Same pass: every Polygon/MultiPolygon ring is checked for closure, CCW shells/CW holes, and minimum size.)
 - [ ] Add golden GeoJSON tests with coordinate tolerances.
 - [ ] Add property-based tests for arc tessellation and affine transforms.
 - [ ] Differentially compare native output with LibreDWG/GDAL on a fixture corpus.

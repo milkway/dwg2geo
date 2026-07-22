@@ -54,6 +54,49 @@ pub struct NativeConversionSummary {
     /// calibration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration: Option<CalibrationInfo>,
+    /// Entity accounting: every top-level model-space entity must land in
+    /// exactly one outcome bucket.
+    pub accounting: AccountingInfo,
+    /// Feature bounding box in drawing coordinates, before any transform:
+    /// [min_x, min_y, max_x, max_y]. None when no feature has geometry.
+    pub bbox_drawing: Option<[f64; 4]>,
+    /// Feature bounding box in output coordinates, after reprojection or
+    /// calibration; equals `bbox_drawing` for local-coordinate output.
+    pub bbox_output: Option<[f64; 4]>,
+    /// Output-side geometry validity counters.
+    pub geometry_checks: GeometryChecks,
+}
+
+/// Histogram accounting between what model space contains and what the
+/// conversion did with it. `unaccounted` must be zero; a nonzero value is a
+/// converter bug surfaced as a warning, never hidden.
+#[derive(Debug, Serialize)]
+pub struct AccountingInfo {
+    /// Top-level model-space entities encountered.
+    pub model_space_entities: usize,
+    /// Top-level entities that reached an outcome (converted, skipped,
+    /// failed, or expanded as an INSERT).
+    pub top_level_accounted: usize,
+    pub unaccounted: usize,
+}
+
+/// Validity counters computed on the final output features. Construction
+/// invariants make most of these zero; nonzero values of anything except
+/// `duplicate_vertex_features` are converter bugs and raise warnings.
+#[derive(Debug, Serialize)]
+pub struct GeometryChecks {
+    pub features_checked: usize,
+    pub empty_geometries: usize,
+    pub non_finite_coordinates: usize,
+    /// Features containing at least one pair of identical consecutive
+    /// vertices (informational; can occur in legitimate linework).
+    pub duplicate_vertex_features: usize,
+    pub rings_checked: usize,
+    pub unclosed_rings: usize,
+    /// Shells that are not CCW or holes that are not CW.
+    pub misoriented_rings: usize,
+    /// Rings with fewer than four positions.
+    pub degenerate_rings: usize,
 }
 
 /// How a control-point calibration fit the drawing to the target CRS.

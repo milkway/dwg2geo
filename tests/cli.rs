@@ -683,6 +683,28 @@ fn native_convert_writes_geojson_and_accounted_report() {
     assert_eq!(native["approximated_features"], 2);
     assert_eq!(native["excluded"]["paper_space"], 1);
     assert_eq!(native["skipped"].as_array().expect("skipped").len(), 0);
+
+    // Milestone 6: histogram accounting must balance, bounding boxes are
+    // reported (identical without a transform), and the geometry validity
+    // pass finds no invariant violations.
+    let accounting = &native["accounting"];
+    assert_eq!(accounting["unaccounted"], 0);
+    assert_eq!(
+        accounting["model_space_entities"],
+        accounting["top_level_accounted"]
+    );
+    let bbox = native["bbox_drawing"].as_array().expect("bbox_drawing");
+    assert_eq!(bbox.len(), 4);
+    assert_eq!(native["bbox_drawing"], native["bbox_output"]);
+    assert!(bbox[0].as_f64().expect("min x") <= bbox[2].as_f64().expect("max x"));
+    let checks = &native["geometry_checks"];
+    assert_eq!(checks["features_checked"], 5);
+    assert_eq!(checks["non_finite_coordinates"], 0);
+    assert_eq!(checks["empty_geometries"], 0);
+    assert_eq!(checks["unclosed_rings"], 0);
+    assert_eq!(checks["misoriented_rings"], 0);
+    assert_eq!(checks["degenerate_rings"], 0);
+    assert!(checks["rings_checked"].as_u64().expect("rings") >= 2);
 }
 
 #[cfg(feature = "native-backend")]

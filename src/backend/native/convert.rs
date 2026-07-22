@@ -389,6 +389,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
 
     let features_written = extraction.features.len();
     let mut features = extraction.features;
+    let bbox_drawing = features_bbox(&features);
 
     #[cfg(feature = "native-reproject")]
     if let Some(plan) = &reprojection_plan {
@@ -426,6 +427,32 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     #[cfg(not(feature = "native-reproject"))]
     let reprojection_info: Option<report::ReprojectionInfo> = None;
     let calibration_info = calibration_plan.map(|(_, info)| info);
+
+    let bbox_output = features_bbox(&features);
+    let geometry_checks = check_geometries(&features);
+    let accounting = report::AccountingInfo {
+        model_space_entities: extraction.model_space_entities,
+        top_level_accounted: extraction.top_level_accounted,
+        unaccounted: extraction
+            .model_space_entities
+            .saturating_sub(extraction.top_level_accounted),
+    };
+    if accounting.unaccounted != 0 {
+        warnings.push(format!(
+            "{} model-space entities did not reach any conversion outcome; this is a converter bug — please report it",
+            accounting.unaccounted
+        ));
+    }
+    let invariant_violations = geometry_checks.empty_geometries
+        + geometry_checks.non_finite_coordinates
+        + geometry_checks.unclosed_rings
+        + geometry_checks.misoriented_rings
+        + geometry_checks.degenerate_rings;
+    if invariant_violations != 0 {
+        warnings.push(format!(
+            "{invariant_violations} geometry validity violations in the output (see the report's geometry_checks); this is a converter bug — please report it"
+        ));
+    }
 
     let partial = append_suffix(request.output, ".partial");
     remove_stale(&partial)?;
@@ -534,6 +561,10 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             feature_warnings: extraction.feature_warnings,
             reprojection: reprojection_info,
             calibration: calibration_info,
+            accounting,
+            bbox_drawing,
+            bbox_output,
+            geometry_checks,
         }),
         output: OutputInfo {
             path: request.output.display().to_string(),
@@ -624,6 +655,123 @@ fn wgs84_out_of_range(features: &[Feature]) -> Option<(String, f64, f64)> {
         }
     }
     None
+}
+
+/// Bounding box [min_x, min_y, max_x, max_y] over all feature geometry.
+fn features_bbox(features: &[Feature]) -> Option<[f64; 4]> {
+    let mut bbox: Option<[f64; 4]> = None;
+    for feature in features {
+        let Some(geometry) = &feature.geometry else {
+            continue;
+        };
+        visit_positions(&geometry.value, &mut |x, y| {
+            bbox = Some(match bbox {
+                None => [x, y, x, y],
+                Some([min_x, min_y, max_x, max_y]) => {
+                    [min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y)]
+                }
+            });
+        });
+    }
+    bbox
+}
+
+/// Output-side geometry validity pass; see [`report::GeometryChecks`].
+fn check_geometries(features: &[Feature]) -> report::GeometryChecks {
+    let mut checks = report::GeometryChecks {
+        features_checked: features.len(),
+        empty_geometries: 0,
+        non_finite_coordinates: 0,
+        duplicate_vertex_features: 0,
+        rings_checked: 0,
+        unclosed_rings: 0,
+        misoriented_rings: 0,
+        degenerate_rings: 0,
+    };
+    for feature in features {
+        let Some(geometry) = &feature.geometry else {
+            checks.empty_geometries += 1;
+            continue;
+        };
+        let mut positions = 0usize;
+        visit_positions(&geometry.value, &mut |x, y| {
+            positions += 1;
+            if !x.is_finite() || !y.is_finite() {
+                checks.non_finite_coordinates += 1;
+            }
+        });
+        if positions == 0 {
+            checks.empty_geometries += 1;
+        }
+        if geometry_has_duplicate_vertices(&geometry.value) {
+            checks.duplicate_vertex_features += 1;
+        }
+        check_rings(&geometry.value, &mut checks);
+    }
+    checks
+}
+
+/// Identical consecutive positions in any line or ring of the geometry.
+fn geometry_has_duplicate_vertices(value: &GeometryValue) -> bool {
+    let has_duplicates = |line: &[geojson::Position]| {
+        line.windows(2)
+            .any(|pair| pair[0][0] == pair[1][0] && pair[0][1] == pair[1][1])
+    };
+    match value {
+        GeometryValue::Point { .. } | GeometryValue::MultiPoint { .. } => false,
+        GeometryValue::LineString { coordinates } => has_duplicates(coordinates),
+        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
+            coordinates.iter().any(|line| has_duplicates(line))
+        }
+        GeometryValue::MultiPolygon { coordinates } => coordinates
+            .iter()
+            .any(|polygon| polygon.iter().any(|ring| has_duplicates(ring))),
+        GeometryValue::GeometryCollection { geometries } => geometries
+            .iter()
+            .any(|geometry| geometry_has_duplicate_vertices(&geometry.value)),
+    }
+}
+
+/// Closure, orientation (CCW shells, CW holes), and minimum size of every
+/// polygon ring.
+fn check_rings(value: &GeometryValue, checks: &mut report::GeometryChecks) {
+    let mut check_polygon = |rings: &Vec<Vec<geojson::Position>>| {
+        for (index, ring) in rings.iter().enumerate() {
+            checks.rings_checked += 1;
+            if ring.len() < 4 {
+                checks.degenerate_rings += 1;
+                continue;
+            }
+            let first = &ring[0];
+            let last = &ring[ring.len() - 1];
+            if first[0] != last[0] || first[1] != last[1] {
+                checks.unclosed_rings += 1;
+            }
+            let mut area = 0.0;
+            for pair in ring.windows(2) {
+                area -= (pair[1][0] - pair[0][0]) * (pair[1][1] + pair[0][1]);
+            }
+            let ccw = area > 0.0;
+            let is_shell = index == 0;
+            if is_shell != ccw {
+                checks.misoriented_rings += 1;
+            }
+        }
+    };
+    match value {
+        GeometryValue::Polygon { coordinates } => check_polygon(coordinates),
+        GeometryValue::MultiPolygon { coordinates } => {
+            for polygon in coordinates {
+                check_polygon(polygon);
+            }
+        }
+        GeometryValue::GeometryCollection { geometries } => {
+            for geometry in geometries {
+                check_rings(&geometry.value, checks);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Visit every (x, y) position of a geometry.
@@ -822,6 +970,11 @@ struct Extraction {
     feature_warnings: usize,
     approximated_features: usize,
     inserts_expanded: usize,
+    /// Top-level model-space entities encountered.
+    model_space_entities: usize,
+    /// Top-level entities that reached an outcome; must equal
+    /// `model_space_entities` (checked in the report accounting).
+    top_level_accounted: usize,
 }
 
 fn outcome_counts(map: BTreeMap<(String, String), HandleSamples>) -> Vec<OutcomeCount> {
@@ -897,6 +1050,7 @@ fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extracti
                 0,
             );
             model_index += 1;
+            extraction.model_space_entities += 1;
         }
     }
 
@@ -928,6 +1082,11 @@ fn process_entity(
             document, entity, insert, options, extraction, placement, depth,
         );
         return;
+    }
+
+    // Every non-INSERT entity reaches exactly one outcome below.
+    if placement.block_path.is_empty() {
+        extraction.top_level_accounted += 1;
     }
 
     let entity_type = entity.as_entity().entity_type().to_string();
@@ -995,6 +1154,12 @@ fn process_insert(
     depth: usize,
 ) {
     let id = feature_id(entity, 0, placement);
+
+    // Every INSERT reaches a terminal outcome (anchor, expansion, or a
+    // failure) on all paths below.
+    if placement.block_path.is_empty() {
+        extraction.top_level_accounted += 1;
+    }
 
     // Entities on layer "0" inside a block conventionally take the insert's
     // layer; resolve the insert's own effective layer, color, and linetype
@@ -4165,5 +4330,113 @@ mod tests {
         assert!(crs_is_wgs84("epsg:4326"));
         assert!(crs_is_wgs84(" OGC:CRS84 "));
         assert!(!crs_is_wgs84("EPSG:31982"));
+    }
+
+    #[test]
+    fn geometry_checks_count_violations_and_pass_valid_output() {
+        use super::{check_geometries, features_bbox};
+        use geojson::{Feature, Geometry};
+
+        let feature = |value: GeometryValue| Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(value)),
+            id: None,
+            properties: None,
+            foreign_members: None,
+        };
+
+        // A valid CCW closed square and a line: no violations.
+        let valid = vec![
+            feature(GeometryValue::new_polygon(vec![vec![
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (10.0, 10.0),
+                (0.0, 10.0),
+                (0.0, 0.0),
+            ]])),
+            feature(GeometryValue::new_line_string(vec![(0.0, 0.0), (5.0, 5.0)])),
+        ];
+        let checks = check_geometries(&valid);
+        assert_eq!(checks.features_checked, 2);
+        assert_eq!(checks.rings_checked, 1);
+        assert_eq!(
+            checks.empty_geometries
+                + checks.non_finite_coordinates
+                + checks.duplicate_vertex_features
+                + checks.unclosed_rings
+                + checks.misoriented_rings
+                + checks.degenerate_rings,
+            0
+        );
+        assert_eq!(features_bbox(&valid), Some([0.0, 0.0, 10.0, 10.0]));
+
+        // A CW shell that is also unclosed, a degenerate ring, a NaN line
+        // with a duplicate vertex, and an empty line.
+        let invalid = vec![
+            feature(GeometryValue::Polygon {
+                coordinates: vec![
+                    vec![
+                        vec![0.0, 0.0].into(),
+                        vec![0.0, 10.0].into(),
+                        vec![10.0, 10.0].into(),
+                        vec![10.0, 0.0].into(),
+                    ],
+                    vec![vec![1.0, 1.0].into(), vec![2.0, 2.0].into()],
+                ],
+            }),
+            feature(GeometryValue::new_line_string(vec![
+                (f64::NAN, 0.0),
+                (1.0, 1.0),
+                (1.0, 1.0),
+            ])),
+            feature(GeometryValue::LineString {
+                coordinates: Vec::new(),
+            }),
+        ];
+        let checks = check_geometries(&invalid);
+        assert_eq!(checks.rings_checked, 2);
+        assert_eq!(checks.unclosed_rings, 1);
+        assert_eq!(checks.misoriented_rings, 1);
+        assert_eq!(checks.degenerate_rings, 1);
+        assert_eq!(checks.non_finite_coordinates, 1);
+        assert_eq!(checks.duplicate_vertex_features, 1);
+        assert_eq!(checks.empty_geometries, 1);
+    }
+
+    #[test]
+    fn accounting_balances_across_outcomes_and_insert_expansion() {
+        use acadrust::entities::{Insert, Ray};
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "SYM",
+            Vector3::ZERO,
+            vec![EntityType::Point(Point::from_coords(1.0, 1.0, 0.0))],
+        );
+        document
+            .add_entity(EntityType::Point(Point::from_coords(0.0, 0.0, 0.0)))
+            .expect("add point");
+        document
+            .add_entity(EntityType::Ray(Ray::new(
+                Vector3::ZERO,
+                Vector3::new(1.0, 0.0, 0.0),
+            )))
+            .expect("add unsupported ray");
+        document
+            .add_entity(EntityType::Insert(Insert::new("SYM", Vector3::ZERO)))
+            .expect("add insert");
+        document
+            .add_entity(EntityType::Insert(Insert::new("MISSING", Vector3::ZERO)))
+            .expect("add broken insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.model_space_entities, 4);
+        assert_eq!(
+            extraction.top_level_accounted, extraction.model_space_entities,
+            "every top-level entity must reach exactly one outcome"
+        );
     }
 }
