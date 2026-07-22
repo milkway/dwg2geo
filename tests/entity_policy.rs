@@ -97,7 +97,14 @@ fn every_acadrust_entity_type_has_exactly_one_documented_policy() {
         .count();
 
     assert_eq!(converted, 16, "converted variant count changed");
-    assert_eq!(unsupported, 11, "deliberately-unsupported variant count changed");
+    assert_eq!(
+        unsupported, 11,
+        "deliberately-unsupported variant count changed"
+    );
     assert_eq!(not_yet, 17, "not-yet-converted variant count changed");
-    assert_eq!(converted + unsupported + not_yet, 44, "policy must cover all 44 variants");
+    assert_eq!(
+        converted + unsupported + not_yet,
+        44,
+        "policy must cover all 44 variants"
+    );
 }
