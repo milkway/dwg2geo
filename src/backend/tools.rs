@@ -55,7 +55,7 @@ pub fn probe_external_tools() -> Vec<ToolInfo> {
         probe(
             "ogr2ogr",
             "GDAL vector converter; required when --source-crs reprojection is requested",
-            false,
+            true,
         ),
     ]
 }

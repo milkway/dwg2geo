@@ -135,16 +135,25 @@ fn convert_refuses_existing_output_without_force() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn doctor_json_reports_both_tools() {
+    let stub_dir = TempDir::new().expect("stub directory");
+    install_stub(stub_dir.path(), "dwgread");
+    install_stub(stub_dir.path(), "ogr2ogr");
+
     let output = binary()
         .args(["doctor", "--json"])
+        .env("PATH", stub_dir.path())
         .output()
         .expect("run binary");
+    assert!(output.status.success());
 
     let parsed: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("doctor --json must emit valid JSON");
-    assert!(parsed["healthy"].is_boolean());
+    assert_eq!(parsed["healthy"], true);
+    assert_eq!(parsed["routes"]["local_coordinates"]["available"], true);
+    assert_eq!(parsed["routes"]["reprojection"]["available"], true);
 
     let tools = parsed["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools
@@ -154,7 +163,7 @@ fn doctor_json_reports_both_tools() {
     assert_eq!(names, ["dwgread", "ogr2ogr"]);
     for tool in tools {
         assert!(tool["status"].is_string());
-        assert!(tool["required"].is_boolean());
+        assert_eq!(tool["required"], true);
     }
 }
 
@@ -200,6 +209,8 @@ if [ "$1" = "--version" ]; then
   echo "{name} stub 1.0.0"
   exit 0
 fi
+echo "{name} conversion diagnostic"
+echo "{name} conversion warning" >&2
 printf '%s\n' "$@" > "$0.args"
 prev=""
 dst=""
@@ -207,7 +218,7 @@ for a in "$@"; do
   dst="$prev"
   prev="$a"
 done
-printf '{{"type":"FeatureCollection","features":[]}}' > "$dst"
+printf '{{"type":"FeatureCollection","features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[1,2]}}}},{{"type":"Feature","properties":{{}},"geometry":{{"type":"LineString","coordinates":[[0,0],[1,1]]}}}},{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[3,4]}}}}]}}' > "$dst"
 "#
     );
     fs::write(&path, script).expect("write stub");
@@ -249,7 +260,9 @@ fn stubbed_conversion_writes_output_report_and_intermediate() {
     assert!(output.status.success(), "stderr: {stderr}");
 
     let geojson = fs::read_to_string(&out).expect("output exists");
-    assert_eq!(geojson, r#"{"type":"FeatureCollection","features":[]}"#);
+    let output_geojson: serde_json::Value =
+        serde_json::from_str(&geojson).expect("stub output is GeoJSON");
+    assert_eq!(output_geojson["features"].as_array().map(Vec::len), Some(3));
     assert!(
         workspace
             .join("corredor sul.geojson.intermediate.dxf")
@@ -260,13 +273,56 @@ fn stubbed_conversion_writes_output_report_and_intermediate() {
     let report_text = fs::read_to_string(workspace.join("corredor sul.geojson.report.json"))
         .expect("report exists");
     let report: serde_json::Value = serde_json::from_str(&report_text).expect("report is JSON");
-    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["report_version"], 2);
     assert_eq!(report["source"]["signature"], "AC1027");
     assert_eq!(report["source"]["sha256"].as_str().expect("hash").len(), 64);
     assert_eq!(report["options"]["source_crs"], "EPSG:31985");
     assert_eq!(report["options"]["target_crs"], "EPSG:4326");
     assert_eq!(report["options"]["include_layers"][1], "PISTA SUL");
     assert_eq!(report["steps"].as_array().expect("steps").len(), 2);
+    assert!(
+        report["steps"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains(
+                workspace
+                    .join("corredor sul.geojson.intermediate.dxf")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+    );
+    assert_eq!(report["external_summary"]["total_features"], 3);
+    assert_eq!(
+        report["external_summary"]["geometry_type_counts"]["Point"],
+        2
+    );
+    assert_eq!(
+        report["external_summary"]["geometry_type_counts"]["LineString"],
+        1
+    );
+    let diagnostics = report["external_diagnostics"]
+        .as_array()
+        .expect("external diagnostics");
+    assert_eq!(diagnostics.len(), 2);
+    assert!(
+        diagnostics[0]["stdout_excerpt"]
+            .as_str()
+            .expect("stdout excerpt")
+            .contains("conversion diagnostic")
+    );
+    assert!(
+        diagnostics[0]["stderr_excerpt"]
+            .as_str()
+            .expect("stderr excerpt")
+            .contains("conversion warning")
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning.as_str().is_some_and(|text| text.contains("stderr")))
+    );
     assert_eq!(
         report["output"]["size_bytes"].as_u64(),
         Some(geojson.len() as u64)
@@ -286,6 +342,117 @@ fn stubbed_conversion_writes_output_report_and_intermediate() {
     assert!(
         ogr_args.contains("Layer IN ('EIXO', 'PISTA SUL')"),
         "ogr2ogr args: {ogr_args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_degraded_routes_when_ogr2ogr_is_missing() {
+    let stub_dir = TempDir::new().expect("stub directory");
+    install_stub(stub_dir.path(), "dwgread");
+
+    let json_output = binary()
+        .args(["doctor", "--json"])
+        .env("PATH", stub_dir.path())
+        .output()
+        .expect("run doctor JSON");
+    assert_eq!(json_output.status.code(), Some(1));
+    let report: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("doctor JSON report");
+    assert_eq!(report["healthy"], false);
+    assert_eq!(report["routes"]["local_coordinates"]["available"], true);
+    assert_eq!(report["routes"]["reprojection"]["available"], false);
+    assert_eq!(report["tools"][1]["name"], "ogr2ogr");
+    assert_eq!(report["tools"][1]["status"], "missing");
+
+    let human_output = binary()
+        .arg("doctor")
+        .env("PATH", stub_dir.path())
+        .output()
+        .expect("run human doctor");
+    assert_eq!(human_output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&human_output.stdout);
+    assert!(
+        stdout.contains("local-coordinates route: available"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("reprojection route: unavailable"),
+        "stdout: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn external_reports_are_deterministic_apart_from_durations() {
+    let stub_dir = TempDir::new().expect("stub directory");
+    install_stub(stub_dir.path(), "dwgread");
+    install_stub(stub_dir.path(), "ogr2ogr");
+
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+    let output_path = dir.path().join("out.geojson");
+    let report_path = dir.path().join("out.geojson.report.json");
+
+    let run_conversion = || {
+        binary()
+            .arg("convert")
+            .arg(&fixture)
+            .arg("--output")
+            .arg(&output_path)
+            .args(["--source-crs", "EPSG:31985", "--force"])
+            .env("PATH", stub_dir.path())
+            .output()
+            .expect("run conversion")
+    };
+
+    let first_output = run_conversion();
+    assert!(
+        first_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let mut first: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).expect("read first report"))
+            .expect("first report JSON");
+
+    let second_output = run_conversion();
+    assert!(
+        second_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    let mut second: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).expect("read second report"))
+            .expect("second report JSON");
+
+    fn null_durations(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(values) => values.iter_mut().for_each(null_durations),
+            serde_json::Value::Object(fields) => {
+                for (name, value) in fields {
+                    if name.ends_with("duration_ms") {
+                        *value = serde_json::Value::Null;
+                    } else {
+                        null_durations(value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    null_durations(&mut first);
+    null_durations(&mut second);
+    assert_eq!(
+        serde_json::to_vec_pretty(&first).expect("serialize first report"),
+        serde_json::to_vec_pretty(&second).expect("serialize second report")
+    );
+    assert!(
+        first["steps"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("<tmp>/intermediate.dxf")
     );
 }
 
