@@ -11,6 +11,9 @@ pub struct Cli {
     pub command: Command,
 }
 
+// The Convert variant dwarfs the others; a single Command is parsed once
+// per process, so boxing it would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Check optional external conversion tools.
@@ -133,6 +136,13 @@ pub enum Command {
             conflicts_with_all = ["source_crs", "allow_local_coordinates"]
         )]
         control_points: Vec<String>,
+
+        /// Check every output feature against a reference boundary polygon
+        /// (GeoJSON Polygon/MultiPolygon in the OUTPUT coordinate system,
+        /// e.g. an IBGE municipal boundary) and report containment counts
+        /// (native backend only; informational, never fails the conversion).
+        #[arg(long, value_name = "GEOJSON")]
+        validate_boundary: Option<PathBuf>,
     },
 }
 

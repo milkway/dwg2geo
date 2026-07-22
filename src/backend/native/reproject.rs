@@ -96,9 +96,9 @@ mod tests {
 
     #[test]
     fn unknown_crs_is_an_actionable_error() {
-        let error = Reprojector::new("EPSG:999999999", "EPSG:4326", 1.0)
-            .err()
-            .expect("unknown CRS must fail");
+        let Err(error) = Reprojector::new("EPSG:999999999", "EPSG:4326", 1.0) else {
+            panic!("unknown CRS must fail");
+        };
         assert!(format!("{error:#}").contains("EPSG:999999999"));
     }
 

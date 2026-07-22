@@ -43,6 +43,7 @@ pub struct ConvertRequest<'a> {
     pub source_units: Option<&'a str>,
     pub allow_suspect_extents: bool,
     pub control_points: &'a [String],
+    pub validate_boundary: Option<&'a Path>,
     pub polygonize_closed: bool,
     pub curve_tolerance: Option<f64>,
     pub preserve_inserts: bool,

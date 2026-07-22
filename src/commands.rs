@@ -106,6 +106,7 @@ pub fn execute(command: Command) -> Result<()> {
             source_units,
             allow_suspect_extents,
             control_points,
+            validate_boundary,
         } => {
             if source_crs.is_none() && !allow_local_coordinates && control_points.is_empty() {
                 bail!(
@@ -125,6 +126,11 @@ pub fn execute(command: Command) -> Result<()> {
             if allow_suspect_extents && source_crs.is_none() && control_points.is_empty() {
                 bail!(
                     "--allow-suspect-extents only applies to georeferenced output; pass --source-crs or --control-point"
+                );
+            }
+            if validate_boundary.is_some() && backend != BackendChoice::Native {
+                bail!(
+                    "--validate-boundary is only supported by the native backend; pass --backend native"
                 );
             }
 
@@ -194,6 +200,7 @@ pub fn execute(command: Command) -> Result<()> {
                 source_units: source_units.as_deref(),
                 allow_suspect_extents,
                 control_points: &control_points,
+                validate_boundary: validate_boundary.as_deref(),
             };
 
             match backend {

@@ -65,6 +65,45 @@ pub struct NativeConversionSummary {
     pub bbox_output: Option<[f64; 4]>,
     /// Output-side geometry validity counters.
     pub geometry_checks: GeometryChecks,
+    /// Features whose location is far from the main coordinate cluster
+    /// (computed on drawing coordinates, before any transform).
+    pub spatial_outliers: SpatialOutliers,
+    /// Present when --validate-boundary was passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_check: Option<BoundaryCheck>,
+}
+
+/// Robust-statistics outlier scan: a feature is an outlier when its bbox
+/// center deviates from the median center by more than 100x the median
+/// absolute deviation on either axis. Informational — title blocks and
+/// legends drawn near the drawing origin are the typical hit.
+#[derive(Debug, Serialize)]
+pub struct SpatialOutliers {
+    pub features_checked: usize,
+    pub outlier_features: usize,
+    /// Median feature center in drawing coordinates.
+    pub center: [f64; 2],
+    /// Per-axis deviation thresholds (100 x MAD).
+    pub axis_thresholds: [f64; 2],
+    /// Up to ten outlier feature ids.
+    pub sample_ids: Vec<String>,
+}
+
+/// Containment of the output features in a reference boundary polygon
+/// (e.g. an IBGE municipal boundary), evaluated on output coordinates.
+#[derive(Debug, Serialize)]
+pub struct BoundaryCheck {
+    pub boundary_path: String,
+    /// Polygons read from the boundary file.
+    pub polygons: usize,
+    /// Features with every vertex inside the boundary.
+    pub features_inside: usize,
+    /// Features with some vertices inside and some outside.
+    pub features_partial: usize,
+    /// Features entirely outside the boundary.
+    pub features_outside: usize,
+    /// Up to ten ids of features not fully inside.
+    pub sample_not_inside_ids: Vec<String>,
 }
 
 /// Histogram accounting between what model space contains and what the

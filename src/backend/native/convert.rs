@@ -390,6 +390,8 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let features_written = extraction.features.len();
     let mut features = extraction.features;
     let bbox_drawing = features_bbox(&features);
+    // Outlier scan runs on drawing coordinates, before any transform.
+    let spatial_outliers = detect_spatial_outliers(&features);
 
     #[cfg(feature = "native-reproject")]
     if let Some(plan) = &reprojection_plan {
@@ -452,6 +454,26 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
         warnings.push(format!(
             "{invariant_violations} geometry validity violations in the output (see the report's geometry_checks); this is a converter bug — please report it"
         ));
+    }
+    if spatial_outliers.outlier_features != 0 {
+        warnings.push(format!(
+            "{} of {} features lie far from the main coordinate cluster (see the report's spatial_outliers); title blocks and legends drawn in model space are the typical cause",
+            spatial_outliers.outlier_features, spatial_outliers.features_checked
+        ));
+    }
+    let boundary_check = match request.validate_boundary {
+        Some(path) => Some(check_boundary(&features, path)?),
+        None => None,
+    };
+    if let Some(check) = &boundary_check {
+        let not_inside = check.features_partial + check.features_outside;
+        if not_inside != 0 {
+            warnings.push(format!(
+                "{not_inside} of {} features are not fully inside the reference boundary {} (see the report's boundary_check)",
+                features.len(),
+                check.boundary_path
+            ));
+        }
     }
 
     let partial = append_suffix(request.output, ".partial");
@@ -565,6 +587,8 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             bbox_drawing,
             bbox_output,
             geometry_checks,
+            spatial_outliers,
+            boundary_check,
         }),
         output: OutputInfo {
             path: request.output.display().to_string(),
@@ -655,6 +679,202 @@ fn wgs84_out_of_range(features: &[Feature]) -> Option<(String, f64, f64)> {
         }
     }
     None
+}
+
+/// Deviation factor for the robust outlier scan: a feature is an outlier
+/// when its center is more than this many median-absolute-deviations from
+/// the median center on either axis.
+const OUTLIER_MAD_FACTOR: f64 = 100.0;
+
+/// Median of a list (average of the two middle values for even counts).
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).expect("finite values"));
+    let count = values.len();
+    if count % 2 == 1 {
+        values[count / 2]
+    } else {
+        (values[count / 2 - 1] + values[count / 2]) / 2.0
+    }
+}
+
+/// Robust scan for features far from the main coordinate cluster; see
+/// [`report::SpatialOutliers`]. Informational only.
+fn detect_spatial_outliers(features: &[Feature]) -> report::SpatialOutliers {
+    let mut centers: Vec<(String, f64, f64)> = Vec::with_capacity(features.len());
+    for feature in features {
+        let Some(geometry) = &feature.geometry else {
+            continue;
+        };
+        let mut bbox: Option<[f64; 4]> = None;
+        visit_positions(&geometry.value, &mut |x, y| {
+            if x.is_finite() && y.is_finite() {
+                bbox = Some(match bbox {
+                    None => [x, y, x, y],
+                    Some([min_x, min_y, max_x, max_y]) => {
+                        [min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y)]
+                    }
+                });
+            }
+        });
+        if let Some([min_x, min_y, max_x, max_y]) = bbox {
+            let id = match &feature.id {
+                Some(Id::String(id)) => id.clone(),
+                other => format!("{other:?}"),
+            };
+            centers.push((id, (min_x + max_x) / 2.0, (min_y + max_y) / 2.0));
+        }
+    }
+
+    if centers.is_empty() {
+        return report::SpatialOutliers {
+            features_checked: 0,
+            outlier_features: 0,
+            center: [0.0, 0.0],
+            axis_thresholds: [0.0, 0.0],
+            sample_ids: Vec::new(),
+        };
+    }
+
+    let mut xs: Vec<f64> = centers.iter().map(|(_, x, _)| *x).collect();
+    let mut ys: Vec<f64> = centers.iter().map(|(_, _, y)| *y).collect();
+    let median_x = median(&mut xs);
+    let median_y = median(&mut ys);
+    let mut deviations_x: Vec<f64> = centers
+        .iter()
+        .map(|(_, x, _)| (x - median_x).abs())
+        .collect();
+    let mut deviations_y: Vec<f64> = centers
+        .iter()
+        .map(|(_, _, y)| (y - median_y).abs())
+        .collect();
+    // Floor the thresholds so exact-tie clusters do not flag float noise.
+    let threshold_x = (OUTLIER_MAD_FACTOR * median(&mut deviations_x)).max(1e-9);
+    let threshold_y = (OUTLIER_MAD_FACTOR * median(&mut deviations_y)).max(1e-9);
+
+    let mut outliers = 0usize;
+    let mut sample_ids = Vec::new();
+    for (id, x, y) in &centers {
+        if (x - median_x).abs() > threshold_x || (y - median_y).abs() > threshold_y {
+            outliers += 1;
+            if sample_ids.len() < MAX_HANDLE_SAMPLES {
+                sample_ids.push(id.clone());
+            }
+        }
+    }
+
+    report::SpatialOutliers {
+        features_checked: centers.len(),
+        outlier_features: outliers,
+        center: [median_x, median_y],
+        axis_thresholds: [threshold_x, threshold_y],
+        sample_ids,
+    }
+}
+
+/// Load a boundary GeoJSON (Polygon/MultiPolygon in Feature,
+/// FeatureCollection, or bare Geometry form) and classify every output
+/// feature's containment; see [`report::BoundaryCheck`].
+fn check_boundary(features: &[Feature], path: &std::path::Path) -> Result<report::BoundaryCheck> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("cannot read boundary file {}", path.display()))?;
+    let boundary: geojson::GeoJson = text
+        .parse()
+        .with_context(|| format!("boundary file {} is not valid GeoJSON", path.display()))?;
+
+    let mut polygons: Vec<Vec<Vec<(f64, f64)>>> = Vec::new();
+    let mut collect = |value: &GeometryValue| match value {
+        GeometryValue::Polygon { coordinates } => {
+            polygons.push(
+                coordinates
+                    .iter()
+                    .map(|ring| ring.iter().map(|p| (p[0], p[1])).collect())
+                    .collect(),
+            );
+        }
+        GeometryValue::MultiPolygon { coordinates } => {
+            for polygon in coordinates {
+                polygons.push(
+                    polygon
+                        .iter()
+                        .map(|ring| ring.iter().map(|p| (p[0], p[1])).collect())
+                        .collect(),
+                );
+            }
+        }
+        _ => {}
+    };
+    match &boundary {
+        geojson::GeoJson::Geometry(geometry) => collect(&geometry.value),
+        geojson::GeoJson::Feature(feature) => {
+            if let Some(geometry) = &feature.geometry {
+                collect(&geometry.value);
+            }
+        }
+        geojson::GeoJson::FeatureCollection(collection) => {
+            for feature in &collection.features {
+                if let Some(geometry) = &feature.geometry {
+                    collect(&geometry.value);
+                }
+            }
+        }
+    }
+    if polygons.is_empty() {
+        bail!(
+            "boundary file {} contains no Polygon or MultiPolygon geometry",
+            path.display()
+        );
+    }
+
+    // Even-odd across a polygon's rings handles holes; a point is inside
+    // the boundary when it is inside any polygon.
+    let inside = |x: f64, y: f64| -> bool {
+        polygons.iter().any(|rings| {
+            rings
+                .iter()
+                .filter(|ring| ring_contains_point(ring, (x, y)))
+                .count()
+                % 2
+                == 1
+        })
+    };
+
+    let mut features_inside = 0usize;
+    let mut features_partial = 0usize;
+    let mut features_outside = 0usize;
+    let mut sample_not_inside_ids = Vec::new();
+    for feature in features {
+        let Some(geometry) = &feature.geometry else {
+            continue;
+        };
+        let (mut in_count, mut out_count) = (0usize, 0usize);
+        visit_positions(&geometry.value, &mut |x, y| {
+            if inside(x, y) {
+                in_count += 1;
+            } else {
+                out_count += 1;
+            }
+        });
+        let bucket = match (in_count, out_count) {
+            (_, 0) => &mut features_inside,
+            (0, _) => &mut features_outside,
+            _ => &mut features_partial,
+        };
+        *bucket += 1;
+        if out_count > 0 && sample_not_inside_ids.len() < MAX_HANDLE_SAMPLES {
+            if let Some(Id::String(id)) = &feature.id {
+                sample_not_inside_ids.push(id.clone());
+            }
+        }
+    }
+
+    Ok(report::BoundaryCheck {
+        boundary_path: path.display().to_string(),
+        polygons: polygons.len(),
+        features_inside,
+        features_partial,
+        features_outside,
+        sample_not_inside_ids,
+    })
 }
 
 /// Bounding box [min_x, min_y, max_x, max_y] over all feature geometry.
@@ -4401,6 +4621,104 @@ mod tests {
         assert_eq!(checks.non_finite_coordinates, 1);
         assert_eq!(checks.duplicate_vertex_features, 1);
         assert_eq!(checks.empty_geometries, 1);
+    }
+
+    #[test]
+    fn spatial_outliers_flag_far_features_only() {
+        use super::detect_spatial_outliers;
+        use geojson::{Feature, Geometry, feature::Id};
+
+        let feature = |id: &str, x: f64, y: f64| Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(GeometryValue::new_point((x, y)))),
+            id: Some(Id::String(id.to_string())),
+            properties: None,
+            foreign_members: None,
+        };
+
+        // A tight cluster around (248000, 7396000) plus one title block at
+        // the drawing origin.
+        let mut features: Vec<Feature> = (0..20)
+            .map(|i| {
+                feature(
+                    &format!("C{i}"),
+                    248_000.0 + f64::from(i) * 10.0,
+                    7_396_000.0 + f64::from(i) * 5.0,
+                )
+            })
+            .collect();
+        features.push(feature("SHEET", 0.0, 0.0));
+
+        let scan = detect_spatial_outliers(&features);
+        assert_eq!(scan.features_checked, 21);
+        assert_eq!(scan.outlier_features, 1);
+        assert_eq!(scan.sample_ids, vec!["SHEET".to_string()]);
+        assert!(
+            (scan.center[0] - 248_090.0).abs() < 1e-9,
+            "{:?}",
+            scan.center
+        );
+
+        // Without the outlier nothing is flagged.
+        features.pop();
+        let scan = detect_spatial_outliers(&features);
+        assert_eq!(scan.outlier_features, 0);
+    }
+
+    #[test]
+    fn boundary_check_classifies_containment_with_holes() {
+        use super::check_boundary;
+        use geojson::{Feature, Geometry, feature::Id};
+        use std::io::Write;
+
+        // Boundary: 0..10 square with a 4..6 hole.
+        let boundary = serde_json::json!({
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]],
+                    [[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0], [4.0, 4.0]]
+                ]
+            }
+        });
+        let mut file = tempfile::NamedTempFile::new().expect("temp boundary");
+        write!(file, "{boundary}").expect("write boundary");
+
+        let feature = |id: &str, value: GeometryValue| Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(value)),
+            id: Some(Id::String(id.to_string())),
+            properties: None,
+            foreign_members: None,
+        };
+        let features = vec![
+            feature("IN", GeometryValue::new_point((2.0, 2.0))),
+            feature("IN-HOLE", GeometryValue::new_point((5.0, 5.0))),
+            feature("OUT", GeometryValue::new_point((20.0, 20.0))),
+            feature(
+                "PARTIAL",
+                GeometryValue::new_line_string(vec![(2.0, 2.0), (20.0, 2.0)]),
+            ),
+        ];
+
+        let check = check_boundary(&features, file.path()).expect("boundary check");
+        assert_eq!(check.polygons, 1);
+        assert_eq!(check.features_inside, 1);
+        assert_eq!(check.features_partial, 1);
+        assert_eq!(check.features_outside, 2, "the hole counts as outside");
+        assert!(check.sample_not_inside_ids.contains(&"OUT".to_string()));
+        assert!(check.sample_not_inside_ids.contains(&"IN-HOLE".to_string()));
+
+        // A boundary without polygons is an actionable error.
+        let mut bad = tempfile::NamedTempFile::new().expect("temp boundary");
+        write!(bad, r#"{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[0,0]}}}}"#)
+            .expect("write");
+        let Err(error) = check_boundary(&features, bad.path()) else {
+            panic!("polygon-free boundary must fail");
+        };
+        assert!(format!("{error:#}").contains("no Polygon"));
     }
 
     #[test]

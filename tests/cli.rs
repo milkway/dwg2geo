@@ -964,6 +964,70 @@ fn control_point_calibration_transforms_and_reports_residuals() {
 
 #[cfg(feature = "native-backend")]
 #[test]
+fn validate_boundary_reports_containment() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_convert_fixture(dir.path());
+    let out = dir.path().join("out.geojson");
+
+    // Boundary covering only part of the fixture (x <= 20).
+    let boundary_path = dir.path().join("boundary.geojson");
+    fs::write(
+        &boundary_path,
+        r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[-1,-1],[20,-1],[20,60],[-1,60],[-1,-1]]]}}"#,
+    )
+    .expect("write boundary");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args(["--backend", "native", "--allow-local-coordinates"])
+        .arg("--validate-boundary")
+        .arg(&boundary_path)
+        .output()
+        .expect("run binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join("out.geojson.report.json")).expect("read report"),
+    )
+    .expect("valid report");
+    let check = &report["native"]["boundary_check"];
+    assert_eq!(check["polygons"], 1);
+    let inside = check["features_inside"].as_u64().expect("inside");
+    let partial = check["features_partial"].as_u64().expect("partial");
+    let outside = check["features_outside"].as_u64().expect("outside");
+    assert_eq!(inside + partial + outside, 5);
+    assert!(inside >= 2, "square and point are inside: {check}");
+    assert!(partial + outside >= 1, "line to x=100 leaves: {check}");
+    let warnings = report["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("boundary_check")),
+        "{warnings:?}"
+    );
+
+    // Native-only flag.
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(&out)
+        .args(["--allow-local-coordinates", "--force"])
+        .arg("--validate-boundary")
+        .arg(&boundary_path)
+        .output()
+        .expect("run binary");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--backend native"), "stderr: {stderr}");
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
 fn calibration_validation_fails_closed() {
     let dir = TempDir::new().expect("temporary directory");
     let fixture = write_convert_fixture(dir.path());

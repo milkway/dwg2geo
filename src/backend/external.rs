@@ -71,6 +71,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     debug_assert!(request.source_units.is_none());
     debug_assert!(!request.allow_suspect_extents);
     debug_assert!(request.control_points.is_empty());
+    debug_assert!(request.validate_boundary.is_none());
 
     validate_input(request.input)?;
     check_output_collision(request.output, request.force)?;
