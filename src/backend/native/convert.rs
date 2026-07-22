@@ -494,6 +494,7 @@ fn outcome_counts(map: BTreeMap<(String, String), HandleSamples>) -> Vec<Outcome
         .collect()
 }
 
+#[derive(Debug)]
 enum EntityOutcome {
     Converted {
         geometry: GeometryValue,
@@ -933,6 +934,7 @@ fn convert_entity(
         EntityType::Spline(spline) => convert_spline(spline, options, placement),
         EntityType::Text(text) => convert_text(text, placement),
         EntityType::MText(mtext) => convert_mtext(mtext, placement),
+        EntityType::Hatch(hatch) => convert_hatch(hatch, options, placement),
         _ => EntityOutcome::Skipped(
             "entity type is not converted by the native backend yet".to_string(),
         ),
@@ -1024,6 +1026,433 @@ fn convert_face3d(face: &acadrust::entities::Face3D, placement: &Placement) -> E
         extra_properties: vec![("is_closed", JsonValue::from(true))],
         warnings,
     }
+}
+
+/// A hatch boundary loop tessellated in the OCS plane.
+struct BoundaryLoop {
+    ring: Vec<(f64, f64)>,
+    approximated: bool,
+}
+
+/// HATCH boundaries live in the OCS plane of the hatch normal. Each boundary
+/// path becomes a ring: polyline paths reuse the bulge tessellator; edge
+/// paths chain line/arc/elliptic-arc/spline edges, reversing edges whose far
+/// end is the better connection. Gaps within the curve tolerance snap
+/// silently; larger gaps are bridged and closed with repair warnings, never
+/// silently. Loops are nested by even-odd containment into Polygon /
+/// MultiPolygon with CCW shells and CW holes.
+fn convert_hatch(
+    hatch: &acadrust::entities::Hatch,
+    options: &GeometryOptions,
+    placement: &Placement,
+) -> EntityOutcome {
+    if hatch.paths.is_empty() {
+        return EntityOutcome::Skipped("hatch has no boundary paths".to_string());
+    }
+    if !is_finite(&hatch.normal) || !hatch.elevation.is_finite() {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+
+    let mut warnings = Vec::new();
+    let mut loops: Vec<BoundaryLoop> = Vec::new();
+    let mut any_curved = false;
+    for (path_index, path) in hatch.paths.iter().enumerate() {
+        match boundary_ring(path, options, &mut warnings, path_index) {
+            Ok(boundary) => {
+                any_curved |= boundary.approximated;
+                loops.push(boundary);
+            }
+            Err(reason) => {
+                warnings.push(format!("boundary loop {path_index} dropped: {reason}"));
+            }
+        }
+    }
+    if loops.is_empty() {
+        return EntityOutcome::Skipped(
+            "hatch has no valid boundary loops after repair".to_string(),
+        );
+    }
+    let dropped = hatch.paths.len() - loops.len();
+
+    // Lift every ring from the OCS plane to WCS, then through the placement.
+    let ocs_to_wcs = Matrix3::arbitrary_axis(hatch.normal);
+    let mut max_abs_z: f64 = 0.0;
+    let mut rings: Vec<Vec<(f64, f64)>> = Vec::with_capacity(loops.len());
+    for boundary in &loops {
+        let mut ring = Vec::with_capacity(boundary.ring.len());
+        for (x, y) in &boundary.ring {
+            let wcs = ocs_to_wcs.transform_point(Vector3::new(*x, *y, hatch.elevation));
+            let Some(position) = project(placement, wcs, &mut max_abs_z) else {
+                return EntityOutcome::Failed("non-finite coordinates".to_string());
+            };
+            ring.push(position);
+        }
+        rings.push(ring);
+    }
+
+    let geometry = assemble_hatch_polygons(rings);
+    push_z_warning(&mut warnings, max_abs_z);
+    if any_curved {
+        warnings.push(format!(
+            "arc segments tessellated with chord tolerance {} drawing units",
+            options.curve_tolerance
+        ));
+    }
+
+    let repaired = warnings
+        .iter()
+        .any(|warning| warning.contains("bridged") || warning.contains("closed across"));
+    let mut extra_properties = vec![
+        ("is_closed", JsonValue::from(true)),
+        ("hatch_pattern", JsonValue::from(hatch.pattern.name.clone())),
+        ("hatch_solid", JsonValue::from(hatch.is_solid)),
+    ];
+    if dropped > 0 {
+        extra_properties.push(("hatch_loops_dropped", JsonValue::from(dropped)));
+    }
+    if any_curved || repaired {
+        extra_properties.push(("approximated", JsonValue::from(true)));
+    }
+
+    EntityOutcome::Converted {
+        geometry,
+        extra_properties,
+        warnings,
+    }
+}
+
+/// Build one closed OCS ring from a boundary path, or a reason it is
+/// unusable. Repairs (bridged gaps, forced closure) warn but do not fail.
+fn boundary_ring(
+    path: &acadrust::entities::BoundaryPath,
+    options: &GeometryOptions,
+    warnings: &mut Vec<String>,
+    path_index: usize,
+) -> Result<BoundaryLoop, String> {
+    let tolerance = options.curve_tolerance;
+    let mut ring: Vec<(f64, f64)> = Vec::new();
+    let mut approximated = false;
+
+    for edge in &path.edges {
+        let points = boundary_edge_points(edge, options, warnings, &mut approximated)?;
+        append_connected(&mut ring, points, tolerance, warnings, path_index);
+    }
+
+    if ring.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        return Err("non-finite coordinates".to_string());
+    }
+    // Close the loop; a closure gap wider than the tolerance is a repair.
+    if let (Some(first), Some(last)) = (ring.first().copied(), ring.last().copied()) {
+        let gap = (last.0 - first.0).hypot(last.1 - first.1);
+        if gap <= tolerance {
+            if ring.len() > 1 {
+                ring.pop();
+            }
+        } else {
+            warnings.push(format!(
+                "boundary loop {path_index} closed across a gap of {gap} drawing units"
+            ));
+        }
+        ring.push(first);
+    }
+    if count_distinct(&ring) < 3 {
+        return Err("fewer than three distinct points".to_string());
+    }
+    Ok(BoundaryLoop { ring, approximated })
+}
+
+/// Append an edge's points to the ring under construction, reversing the
+/// edge when its far end is the better connection and warning when neither
+/// end meets the ring within the tolerance.
+fn append_connected(
+    ring: &mut Vec<(f64, f64)>,
+    mut points: Vec<(f64, f64)>,
+    tolerance: f64,
+    warnings: &mut Vec<String>,
+    path_index: usize,
+) {
+    if points.is_empty() {
+        return;
+    }
+    let Some(&last) = ring.last() else {
+        ring.extend(points);
+        return;
+    };
+    let distance = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1);
+    let first_point = points[0];
+    let last_point = points[points.len() - 1];
+    if distance(last, last_point) < distance(last, first_point) {
+        points.reverse();
+    }
+    let gap = distance(last, points[0]);
+    if gap <= tolerance {
+        ring.extend(points.into_iter().skip(1));
+    } else {
+        warnings.push(format!(
+            "boundary loop {path_index}: edge gap of {gap} drawing units bridged"
+        ));
+        ring.extend(points);
+    }
+}
+
+/// Tessellated points of one boundary edge in OCS, endpoints included.
+fn boundary_edge_points(
+    edge: &acadrust::entities::BoundaryEdge,
+    options: &GeometryOptions,
+    warnings: &mut Vec<String>,
+    approximated: &mut bool,
+) -> Result<Vec<(f64, f64)>, String> {
+    use acadrust::entities::BoundaryEdge;
+
+    match edge {
+        BoundaryEdge::Line(line) => {
+            Ok(vec![(line.start.x, line.start.y), (line.end.x, line.end.y)])
+        }
+        BoundaryEdge::Polyline(polyline) => {
+            let mut points: Vec<(f64, f64)> = Vec::new();
+            let vertices = &polyline.vertices;
+            if vertices.is_empty() {
+                return Err("empty polyline boundary edge".to_string());
+            }
+            *approximated |= polyline.has_bulge();
+            let segments = if polyline.is_closed {
+                vertices.len()
+            } else {
+                vertices.len() - 1
+            };
+            points.push((vertices[0].x, vertices[0].y));
+            for i in 0..segments {
+                let start = vertices[i];
+                let end = vertices[(i + 1) % vertices.len()];
+                if start.z.abs() > f64::EPSILON {
+                    points.extend(tessellate_bulge(
+                        (start.x, start.y),
+                        (end.x, end.y),
+                        start.z,
+                        options.curve_tolerance,
+                        warnings,
+                    ));
+                }
+                points.push((end.x, end.y));
+            }
+            Ok(points)
+        }
+        BoundaryEdge::CircularArc(arc) => {
+            if !arc.radius.is_finite() || arc.radius <= 0.0 {
+                return Err("circular arc edge with non-positive radius".to_string());
+            }
+            *approximated = true;
+            let (start, sweep) = edge_sweep(arc.start_angle, arc.end_angle, arc.counter_clockwise)?;
+            Ok(arc_points(
+                (arc.center.x, arc.center.y),
+                arc.radius,
+                start,
+                sweep,
+                options.curve_tolerance,
+                warnings,
+            ))
+        }
+        BoundaryEdge::EllipticArc(ellipse) => {
+            let major = (ellipse.major_axis_endpoint.x, ellipse.major_axis_endpoint.y);
+            let major_length = major.0.hypot(major.1);
+            if !major_length.is_finite()
+                || major_length <= 0.0
+                || !ellipse.minor_axis_ratio.is_finite()
+                || ellipse.minor_axis_ratio <= 0.0
+            {
+                return Err("degenerate elliptic arc edge".to_string());
+            }
+            *approximated = true;
+            let (start, sweep) = edge_sweep(
+                ellipse.start_angle,
+                ellipse.end_angle,
+                ellipse.counter_clockwise,
+            )?;
+            let minor = (
+                -major.1 * ellipse.minor_axis_ratio,
+                major.0 * ellipse.minor_axis_ratio,
+            );
+            let parameters = arc_points(
+                (0.0, 0.0),
+                1.0,
+                start,
+                sweep,
+                options.curve_tolerance / major_length,
+                warnings,
+            );
+            Ok(parameters
+                .into_iter()
+                .map(|(cos_t, sin_t)| {
+                    (
+                        ellipse.center.x + major.0 * cos_t + minor.0 * sin_t,
+                        ellipse.center.y + major.1 * cos_t + minor.1 * sin_t,
+                    )
+                })
+                .collect())
+        }
+        BoundaryEdge::Spline(spline) => {
+            let degree = spline.degree.max(0) as usize;
+            let control_count = spline.control_points.len();
+            let nurbs_valid = degree >= 1
+                && control_count > degree
+                && spline.knots.len() == control_count + degree + 1
+                && spline.knots.windows(2).all(|pair| pair[0] <= pair[1])
+                && spline.knots.iter().all(|knot| knot.is_finite())
+                && spline
+                    .control_points
+                    .iter()
+                    .all(|point| point.x.is_finite() && point.y.is_finite());
+            if !nurbs_valid {
+                if spline.fit_points.len() >= 2
+                    && spline
+                        .fit_points
+                        .iter()
+                        .all(|point| point.x.is_finite() && point.y.is_finite())
+                {
+                    *approximated = true;
+                    warnings.push(
+                        "spline boundary edge rendered as a polyline through its fit points"
+                            .to_string(),
+                    );
+                    return Ok(spline
+                        .fit_points
+                        .iter()
+                        .map(|point| (point.x, point.y))
+                        .collect());
+                }
+                return Err("invalid spline boundary edge".to_string());
+            }
+            // Control points pack (x, y, weight); weights only count when
+            // the edge is rational.
+            let homogeneous: Vec<[f64; 4]> = spline
+                .control_points
+                .iter()
+                .map(|point| {
+                    let weight =
+                        if spline.rational && point.z.is_finite() && point.z.abs() > f64::EPSILON {
+                            point.z
+                        } else {
+                            1.0
+                        };
+                    [point.x * weight, point.y * weight, 0.0, weight]
+                })
+                .collect();
+            let domain_start = spline.knots[degree];
+            let domain_end = spline.knots[control_count];
+            if domain_end <= domain_start {
+                return Err("spline boundary edge with an empty parameter domain".to_string());
+            }
+            let spans = control_count - degree;
+            let segments =
+                (spans * SPLINE_SEGMENTS_PER_SPAN).clamp(SPLINE_MIN_SEGMENTS, MAX_ARC_SEGMENTS);
+            *approximated = true;
+            let mut points = Vec::with_capacity(segments + 1);
+            for i in 0..=segments {
+                let t = domain_start + (domain_end - domain_start) * (i as f64) / (segments as f64);
+                let Some(point) = evaluate_nurbs(t, degree, &spline.knots, &homogeneous) else {
+                    return Err("spline boundary edge evaluated to a non-finite point".to_string());
+                };
+                points.push((point.0, point.1));
+            }
+            Ok(points)
+        }
+    }
+}
+
+/// Start angle and signed sweep for an arc-like boundary edge. Clockwise
+/// edges store their angles mirrored, so both the start angle and the sweep
+/// are negated. A zero sweep means a full revolution.
+fn edge_sweep(
+    start_angle: f64,
+    end_angle: f64,
+    counter_clockwise: bool,
+) -> Result<(f64, f64), String> {
+    if !start_angle.is_finite() || !end_angle.is_finite() {
+        return Err("non-finite arc edge angles".to_string());
+    }
+    let mut sweep = (end_angle - start_angle).rem_euclid(std::f64::consts::TAU);
+    if sweep <= f64::EPSILON {
+        sweep = std::f64::consts::TAU;
+    }
+    if counter_clockwise {
+        Ok((start_angle, sweep))
+    } else {
+        Ok((-start_angle, -sweep))
+    }
+}
+
+/// Nest closed rings by even-odd containment: even depth is a shell, odd
+/// depth is a hole assigned to its innermost containing shell. Shells are
+/// oriented CCW and holes CW. One shell yields a Polygon, several a
+/// MultiPolygon. Deterministic: input order is preserved.
+type ShellRings = (usize, Vec<Vec<(f64, f64)>>);
+
+fn assemble_hatch_polygons(mut rings: Vec<Vec<(f64, f64)>>) -> GeometryValue {
+    for ring in &mut rings {
+        if signed_area(ring) < 0.0 {
+            ring.reverse();
+        }
+    }
+    let depths: Vec<usize> = (0..rings.len())
+        .map(|i| {
+            (0..rings.len())
+                .filter(|&j| j != i && ring_contains_point(&rings[j], rings[i][0]))
+                .count()
+        })
+        .collect();
+
+    let mut polygons: Vec<ShellRings> = Vec::new();
+    for (index, ring) in rings.iter().enumerate() {
+        if depths[index] % 2 == 0 {
+            polygons.push((index, vec![ring.clone()]));
+        }
+    }
+    for (index, ring) in rings.iter().enumerate() {
+        if depths[index] % 2 == 0 {
+            continue;
+        }
+        // Innermost containing shell: the containing shell of greatest depth.
+        let probe = ring[0];
+        let shell = polygons
+            .iter_mut()
+            .filter(|(shell_index, _)| ring_contains_point(&rings[*shell_index], probe))
+            .max_by_key(|(shell_index, _)| depths[*shell_index]);
+        let mut hole = ring.clone();
+        hole.reverse();
+        match shell {
+            Some((_, rings_of_shell)) => rings_of_shell.push(hole),
+            // A hole with no containing shell is promoted to its own shell.
+            None => {
+                let mut promoted = hole;
+                promoted.reverse();
+                polygons.push((index, vec![promoted]));
+            }
+        }
+    }
+
+    if polygons.len() == 1 {
+        GeometryValue::new_polygon(polygons.remove(0).1)
+    } else {
+        let coordinates: Vec<Vec<Vec<(f64, f64)>>> =
+            polygons.into_iter().map(|(_, rings)| rings).collect();
+        GeometryValue::new_multi_polygon(coordinates)
+    }
+}
+
+/// Even-odd ray casting; boundary cases are treated as outside.
+fn ring_contains_point(ring: &[(f64, f64)], point: (f64, f64)) -> bool {
+    let mut inside = false;
+    for pair in ring.windows(2) {
+        let (x1, y1) = pair[0];
+        let (x2, y2) = pair[1];
+        if (y1 > point.1) != (y2 > point.1) {
+            let x_cross = x1 + (point.1 - y1) / (y2 - y1) * (x2 - x1);
+            if point.0 < x_cross {
+                inside = !inside;
+            }
+        }
+    }
+    inside
 }
 
 /// One OCS polyline vertex: 2D location plus the bulge of the segment that
@@ -3042,5 +3471,215 @@ mod tests {
             (rotation - 120.0).abs() < 1e-9,
             "expected 120 degrees, got {rotation}"
         );
+    }
+
+    fn square_path(min: (f64, f64), max: (f64, f64)) -> acadrust::entities::BoundaryPath {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, PolylineEdge};
+        use acadrust::types::Vector2;
+
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(
+            vec![
+                Vector2::new(min.0, min.1),
+                Vector2::new(max.0, min.1),
+                Vector2::new(max.0, max.1),
+                Vector2::new(min.0, max.1),
+            ],
+            true,
+        )));
+        path
+    }
+
+    fn ring_tuples(ring: &[geojson::Position]) -> Vec<(f64, f64)> {
+        ring.iter()
+            .map(|position| (position[0], position[1]))
+            .collect()
+    }
+
+    #[test]
+    fn hatch_island_becomes_polygon_with_ccw_shell_and_cw_hole() {
+        use acadrust::entities::Hatch;
+        use geojson::JsonValue;
+
+        let mut hatch = Hatch::new();
+        hatch.paths.push(square_path((0.0, 0.0), (10.0, 10.0)));
+        hatch.paths.push(square_path((2.0, 2.0), (4.0, 4.0)));
+
+        match convert_entity(&EntityType::Hatch(hatch), &opts(false)) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                ..
+            } => {
+                let GeometryValue::Polygon { coordinates } = geometry else {
+                    panic!("expected Polygon");
+                };
+                assert_eq!(coordinates.len(), 2, "one shell and one hole");
+                let shell = ring_tuples(&coordinates[0]);
+                let hole = ring_tuples(&coordinates[1]);
+                assert_eq!(shell.first(), shell.last());
+                assert!(signed_area(&shell) > 0.0, "shell must be CCW");
+                assert!(signed_area(&hole) < 0.0, "hole must be CW");
+                let get = |key: &str| {
+                    extra_properties
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.clone())
+                };
+                assert_eq!(get("hatch_solid"), Some(JsonValue::Bool(true)));
+                assert_eq!(get("is_closed"), Some(JsonValue::Bool(true)));
+            }
+            other => panic!("hatch must convert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hatch_disjoint_loops_become_a_multipolygon() {
+        use acadrust::entities::Hatch;
+
+        let mut hatch = Hatch::new();
+        hatch.paths.push(square_path((0.0, 0.0), (10.0, 10.0)));
+        hatch.paths.push(square_path((20.0, 0.0), (30.0, 10.0)));
+
+        match convert_entity(&EntityType::Hatch(hatch), &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => {
+                let GeometryValue::MultiPolygon { coordinates } = geometry else {
+                    panic!("expected MultiPolygon");
+                };
+                assert_eq!(coordinates.len(), 2);
+                assert_eq!(coordinates[0].len(), 1);
+                assert_eq!(coordinates[1].len(), 1);
+            }
+            other => panic!("hatch must convert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hatch_arc_edges_connect_and_mark_approximated() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch, LineEdge};
+        use acadrust::types::Vector2;
+        use geojson::JsonValue;
+
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::Line(LineEdge {
+            start: Vector2::new(0.0, 0.0),
+            end: Vector2::new(10.0, 0.0),
+        }));
+        path.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
+            center: Vector2::new(5.0, 0.0),
+            radius: 5.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::PI,
+            counter_clockwise: true,
+        }));
+        let mut hatch = Hatch::new();
+        hatch.paths.push(path);
+
+        match convert_entity(&EntityType::Hatch(hatch), &opts(false)) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                warnings,
+            } => {
+                let GeometryValue::Polygon { coordinates } = geometry else {
+                    panic!("expected Polygon");
+                };
+                let shell = ring_tuples(&coordinates[0]);
+                assert!(shell.len() > 4, "arc must be tessellated");
+                assert_eq!(shell.first(), shell.last());
+                assert!(
+                    !warnings.iter().any(|w| w.contains("bridged")),
+                    "edges connect without repair: {warnings:?}"
+                );
+                assert!(
+                    extra_properties
+                        .iter()
+                        .any(|(k, v)| *k == "approximated" && *v == JsonValue::Bool(true))
+                );
+            }
+            other => panic!("hatch must convert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hatch_reversed_edges_connect_without_repair_warnings() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, LineEdge};
+        use acadrust::types::Vector2;
+
+        // Second and third edges are stored backwards; connection must flip
+        // them instead of bridging gaps.
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::Line(LineEdge {
+            start: Vector2::new(0.0, 0.0),
+            end: Vector2::new(10.0, 0.0),
+        }));
+        path.add_edge(BoundaryEdge::Line(LineEdge {
+            start: Vector2::new(5.0, 8.0),
+            end: Vector2::new(10.0, 0.0),
+        }));
+        let mut hatch = Hatch::new();
+        hatch.paths.push(path);
+
+        match convert_entity(&EntityType::Hatch(hatch), &opts(false)) {
+            EntityOutcome::Converted { warnings, .. } => {
+                assert!(
+                    !warnings.iter().any(|w| w.contains("bridged")),
+                    "reversed edge must connect: {warnings:?}"
+                );
+                // The triangle is open between (5,8) and (0,0): closure is a
+                // repair and must be reported.
+                assert!(
+                    warnings.iter().any(|w| w.contains("closed across")),
+                    "open loop closure must warn: {warnings:?}"
+                );
+            }
+            other => panic!("hatch must convert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hatch_with_only_degenerate_loops_is_skipped() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, LineEdge};
+        use acadrust::types::Vector2;
+
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::Line(LineEdge {
+            start: Vector2::new(0.0, 0.0),
+            end: Vector2::new(1.0, 0.0),
+        }));
+        let mut hatch = Hatch::new();
+        hatch.paths.push(path);
+
+        match convert_entity(&EntityType::Hatch(hatch), &opts(false)) {
+            EntityOutcome::Skipped(reason) => {
+                assert!(reason.contains("no valid boundary loops"), "{reason}");
+            }
+            other => panic!("degenerate hatch must be skipped, got {other:?}"),
+        }
+
+        let mut mixed = Hatch::new();
+        let mut degenerate = BoundaryPath::new();
+        degenerate.add_edge(BoundaryEdge::Line(LineEdge {
+            start: Vector2::new(0.0, 0.0),
+            end: Vector2::new(1.0, 0.0),
+        }));
+        mixed.paths.push(square_path((0.0, 0.0), (10.0, 10.0)));
+        mixed.paths.push(degenerate);
+        match convert_entity(&EntityType::Hatch(mixed), &opts(false)) {
+            EntityOutcome::Converted {
+                extra_properties,
+                warnings,
+                ..
+            } => {
+                assert!(
+                    extra_properties
+                        .iter()
+                        .any(|(k, v)| *k == "hatch_loops_dropped" && *v == serde_json::json!(1)),
+                    "dropped loop must be counted: {extra_properties:?}"
+                );
+                assert!(warnings.iter().any(|w| w.contains("dropped")));
+            }
+            other => panic!("mixed hatch must convert, got {other:?}"),
+        }
     }
 }
