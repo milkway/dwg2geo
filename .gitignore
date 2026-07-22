@@ -20,3 +20,10 @@
 
 # Local-only validation notes (proprietary data derived)
 *.local.md
+
+# AI-development scaffolding and internal roadmap — kept local, not published
+/CLAUDE.md
+/AGENTS.md
+/PROMPT.md
+/docs/PLAN.md
+/prompts/

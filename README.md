@@ -120,33 +120,17 @@ With the feature enabled:
 
 The separate `native-reproject` feature adds the `proj` crate for native reprojection; it needs system PROJ >= 9.6 or a build toolchain with cmake and sqlite3 (see `docs/DECISIONS.md`, ADR-009).
 
-## Continue with an AI coding agent
-
-Read one of these prompts into the terminal agent:
-
-```bash
-codex "$(cat prompts/START_CODEX.md)"
-```
-
-or:
-
-```bash
-claude "$(cat prompts/START_CLAUDE.md)"
-```
-
-The canonical engineering instructions are in `AGENTS.md`. Claude-specific guidance is in `CLAUDE.md`.
-
 ## Repository map
 
 ```text
-src/                    Rust CLI starter
+src/                    Rust CLI source
 samples/                local-only drawings and reference metadata
-docs/PLAN.md            phased implementation plan
 docs/ARCHITECTURE.md    target architecture and boundaries
 docs/ENTITY_MAPPING.md  CAD-to-GeoJSON mapping rules
-docs/DECISIONS.md       initial architectural decisions
+docs/DECISIONS.md       architectural decisions (ADRs)
+docs/LICENSING.md       LibreDWG/GDAL licensing and distribution boundaries
+docs/DISTRIBUTION.md    container, SBOM, and license-report guidance
 docs/RISKS.md           engineering and delivery risks
-prompts/                 ready-to-paste agent prompts
 ```
 
 ## Important constraints

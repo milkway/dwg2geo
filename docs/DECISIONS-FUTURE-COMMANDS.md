@@ -4,7 +4,7 @@
 
 **Status:** accepted.
 
-`AGENTS.md` says future commands "may include" the commands below; it does not require each candidate to become a standalone command. The current disposition therefore does not breach the implementation contract, but is recorded here so later work does not have to infer intent from the roadmap.
+The project charter lists future commands that "may include" those below; it does not require each candidate to become a standalone command. The current disposition therefore does not breach the implementation contract, but is recorded here so later work does not have to infer intent from the roadmap.
 
 | Candidate | Disposition |
 |---|---|
