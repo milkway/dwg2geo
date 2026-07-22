@@ -47,16 +47,28 @@ jobs:
           bin=target/${{ matrix.target }}/release/dwg2geo
           strip "$bin" || true
           name=dwg2geo-${{ github.ref_name }}-${{ matrix.target }}
-          mkdir -p dist
-          tar -C "target/${{ matrix.target }}/release" -czf "dist/$name.tar.gz" dwg2geo
+          # Stage the binary alongside the build.rs-generated shell
+          # completions and man pages so packagers get everything in one
+          # archive.
+          stage="pkg/$name"
+          mkdir -p "$stage" dist
+          cp "$bin" "$stage/"
+          assets=$(find "target/${{ matrix.target }}/release/build" -type d -name assets -path '*dwg2geo-*' | head -n1)
+          if [ -n "$assets" ]; then cp -r "$assets" "$stage/assets"; fi
+          tar -C pkg -czf "dist/$name.tar.gz" "$name"
           ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $name = "dwg2geo-${{ github.ref_name }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path "target/${{ matrix.target }}/release/dwg2geo.exe" -DestinationPath "dist/$name.zip"
+          $stage = "pkg/$name"
+          New-Item -ItemType Directory -Force $stage, dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/dwg2geo.exe" $stage
+          $assets = Get-ChildItem -Recurse -Directory "target/${{ matrix.target }}/release/build" |
+            Where-Object { $_.Name -eq 'assets' -and $_.FullName -like '*dwg2geo-*' } | Select-Object -First 1
+          if ($assets) { Copy-Item -Recurse $assets.FullName "$stage/assets" }
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
       - uses: actions/upload-artifact@v4

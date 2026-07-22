@@ -11,7 +11,10 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Build the authoritative clap command tree used by help and packaging assets.
+/// Build the authoritative clap command tree used by help and packaging
+/// assets. Consumed by `build.rs` (completions and man pages) and the
+/// `cli_gen` tests, which are separate compilation units from the binary.
+#[allow(dead_code)]
 pub fn command() -> clap::Command {
     <Cli as clap::CommandFactory>::command()
 }
