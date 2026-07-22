@@ -53,10 +53,21 @@ LibreDWG distribution, exactly as with any other GPL tool on their machine.
 
 The pure-Rust native backend (`--features native-backend`) reads DWG with the
 `acadrust` crate and converts entirely in-process. It uses **no LibreDWG and no
-GDAL**. Its dependency tree is permissively licensed (see
-`THIRD-PARTY-LICENSES.md` / the CycloneDX SBOM for the exact per-crate terms).
-The optional `native-reproject` feature adds the `proj`/`proj-sys` crates, which
-link the permissively licensed PROJ library — still no copyleft.
+GDAL**. Its dependency tree carries no strong copyleft: a scan of the native
+runtime graph (see `THIRD-PARTY-LICENSES.md` and `sbom.cdx.json`) finds MIT,
+Apache-2.0, BSD-3-Clause, and Unicode-3.0 — plus exactly one weak-copyleft
+crate, **`acadrust` (MPL-2.0)**. MPL-2.0 is file-level copyleft: distributing a
+compiled binary that includes `acadrust` is unrestricted, and it imposes no
+terms on `dwg2geo`'s own MIT source; the only obligation is that if you modify
+`acadrust`'s own files you must make those file changes available under MPL-2.0.
+No GPL, LGPL, or AGPL crate is present.
+
+The optional `native-reproject` feature adds the `proj`/`proj-sys` crates
+(MIT/Apache-2.0), which link the permissively licensed PROJ library — still no
+additional copyleft.
+
+Regenerate the SBOM and license report after any dependency change with
+`scripts/gen-sbom.sh` and `scripts/gen-licenses.sh`.
 
 ## Summary
 

@@ -56,3 +56,18 @@ jobs:
         run: cargo clippy --all-targets --features native-reproject -- -D warnings
       - name: Test (native-reproject)
         run: cargo test --features native-reproject
+
+  # License gate: cargo-about fails if any native-backend dependency carries a
+  # license outside the allowlist in about.toml, catching a newly introduced
+  # copyleft dependency before it ships. See docs/LICENSING.md.
+  licenses:
+    name: license allowlist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+      - name: Check license allowlist
+        run: cargo about generate --features native-backend --fail scripts/about-check.hbs
