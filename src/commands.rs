@@ -100,6 +100,8 @@ pub fn execute(command: Command) -> Result<()> {
             exclude_layers,
             polygonize_closed,
             curve_tolerance,
+            explode_blocks,
+            preserve_inserts,
         } => {
             if source_crs.is_none() && !allow_local_coordinates {
                 bail!(
@@ -131,6 +133,12 @@ pub fn execute(command: Command) -> Result<()> {
                 }
             }
 
+            if (explode_blocks || preserve_inserts) && backend != BackendChoice::Native {
+                bail!(
+                    "block handling modes are only supported by the native backend; pass --backend native"
+                );
+            }
+
             if allow_local_coordinates {
                 eprintln!(
                     "warning: exporting local CAD coordinates without establishing a geographic CRS"
@@ -149,6 +157,7 @@ pub fn execute(command: Command) -> Result<()> {
                 exclude_layers: &exclude_layers,
                 polygonize_closed,
                 curve_tolerance,
+                preserve_inserts,
             };
 
             match backend {

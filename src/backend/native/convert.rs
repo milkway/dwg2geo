@@ -43,10 +43,148 @@ const MAX_ANGLE_STEP: f64 = std::f64::consts::PI / 12.0;
 /// Hard cap on segments per arc; reaching it emits a warning.
 const MAX_ARC_SEGMENTS: usize = 256;
 
+/// Hard cap on nested INSERT expansion depth.
+const MAX_BLOCK_DEPTH: usize = 16;
+
 /// Geometry-mapping options resolved from the CLI.
 struct GeometryOptions {
     polygonize_closed: bool,
     curve_tolerance: f64,
+    preserve_inserts: bool,
+}
+
+/// Row-major affine transform: `linear * v + translation`.
+#[derive(Clone, Copy, Debug)]
+struct Affine {
+    linear: [[f64; 3]; 3],
+    translation: [f64; 3],
+}
+
+impl Affine {
+    const IDENTITY: Affine = Affine {
+        linear: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        translation: [0.0, 0.0, 0.0],
+    };
+
+    fn from_linear(linear: [[f64; 3]; 3]) -> Affine {
+        Affine {
+            linear,
+            translation: [0.0, 0.0, 0.0],
+        }
+    }
+
+    fn from_translation(v: Vector3) -> Affine {
+        Affine {
+            linear: Affine::IDENTITY.linear,
+            translation: [v.x, v.y, v.z],
+        }
+    }
+
+    fn rotation_z(angle: f64) -> Affine {
+        let (sin, cos) = angle.sin_cos();
+        Affine::from_linear([[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]])
+    }
+
+    fn scale(x: f64, y: f64, z: f64) -> Affine {
+        Affine::from_linear([[x, 0.0, 0.0], [0.0, y, 0.0], [0.0, 0.0, z]])
+    }
+
+    fn apply(&self, v: Vector3) -> Vector3 {
+        let m = &self.linear;
+        Vector3::new(
+            m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z + self.translation[0],
+            m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z + self.translation[1],
+            m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z + self.translation[2],
+        )
+    }
+
+    /// `self` after `inner` (apply `inner` first).
+    fn compose(&self, inner: &Affine) -> Affine {
+        let mut linear = [[0.0; 3]; 3];
+        for (row, out) in linear.iter_mut().enumerate() {
+            for (col, cell) in out.iter_mut().enumerate() {
+                *cell = (0..3)
+                    .map(|k| self.linear[row][k] * inner.linear[k][col])
+                    .sum();
+            }
+        }
+        let t = self.apply(Vector3::new(
+            inner.translation[0],
+            inner.translation[1],
+            inner.translation[2],
+        ));
+        Affine {
+            linear,
+            translation: [t.x, t.y, t.z],
+        }
+    }
+}
+
+/// Where an entity is being placed: identity for direct model-space
+/// entities, or the composed INSERT transform chain for block content.
+struct Placement {
+    matrix: Affine,
+    /// Block-name chain, outermost first; used for provenance and to detect
+    /// recursive references.
+    block_path: Vec<String>,
+    /// Insert-handle chain prefix so feature ids stay unique per instance.
+    id_prefix: String,
+    /// Layer substituted for block entities on layer "0" (the conventional
+    /// BYBLOCK-style inheritance); None outside block content.
+    inherited_layer: Option<String>,
+    /// Largest accumulated |scale| factor, for tessellation-error warnings.
+    max_scale: f64,
+}
+
+impl Placement {
+    fn model_space() -> Placement {
+        Placement {
+            matrix: Affine::IDENTITY,
+            block_path: Vec::new(),
+            id_prefix: String::new(),
+            inherited_layer: None,
+            max_scale: 1.0,
+        }
+    }
+}
+
+/// Apply the placement and project to 2D, tracking dropped |z|. None on
+/// non-finite results.
+fn project(placement: &Placement, point: Vector3, max_abs_z: &mut f64) -> Option<(f64, f64)> {
+    let placed = placement.matrix.apply(point);
+    if !is_finite(&placed) {
+        return None;
+    }
+    *max_abs_z = max_abs_z.max(placed.z.abs());
+    Some((placed.x, placed.y))
+}
+
+/// Block-reference transform: translate to the insertion point, orient by
+/// the insert normal, rotate, offset the MINSERT cell (rotated, unscaled),
+/// scale, and shift by the block base point.
+fn insert_matrix(
+    insert: &acadrust::entities::Insert,
+    base_point: Vector3,
+    column: u16,
+    row: u16,
+) -> Affine {
+    let to_insertion = Affine::from_translation(insert.insert_point);
+    let orient = Affine::from_linear(Matrix3::arbitrary_axis(insert.normal).m);
+    let rotate = Affine::rotation_z(insert.rotation);
+    let cell = Affine::from_translation(Vector3::new(
+        f64::from(column) * insert.column_spacing,
+        f64::from(row) * insert.row_spacing,
+        0.0,
+    ));
+    let scale = Affine::scale(insert.x_scale(), insert.y_scale(), insert.z_scale());
+    let from_base = Affine::from_translation(base_point * -1.0);
+
+    to_insertion
+        .compose(&orient)
+        .compose(&rotate)
+        .compose(&cell)
+        .compose(&scale)
+        .compose(&from_base)
 }
 
 pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
@@ -97,6 +235,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let geometry_options = GeometryOptions {
         polygonize_closed: request.polygonize_closed,
         curve_tolerance: request.curve_tolerance.unwrap_or(DEFAULT_CURVE_TOLERANCE),
+        preserve_inserts: request.preserve_inserts,
     };
 
     let extract_started = Instant::now();
@@ -158,6 +297,14 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             exclude_layers: request.exclude_layers.to_vec(),
             polygonize_closed: request.polygonize_closed,
             curve_tolerance: Some(geometry_options.curve_tolerance),
+            block_mode: Some(
+                if request.preserve_inserts {
+                    "preserve-inserts"
+                } else {
+                    "explode"
+                }
+                .to_string(),
+            ),
         },
         external_tools: Vec::new(),
         steps,
@@ -170,6 +317,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             read_errors,
             features_written,
             approximated_features: extraction.approximated_features,
+            inserts_expanded: extraction.inserts_expanded,
             converted: extraction
                 .converted
                 .into_iter()
@@ -232,6 +380,7 @@ struct Extraction {
     excluded_unowned: usize,
     feature_warnings: usize,
     approximated_features: usize,
+    inserts_expanded: usize,
 }
 
 fn outcome_counts(map: BTreeMap<(String, String), HandleSamples>) -> Vec<OutcomeCount> {
@@ -263,6 +412,7 @@ fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extracti
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut model_index: usize = 0;
     let mut found_model_space = false;
+    let model_placement = Placement::model_space();
 
     for record in document.block_records.iter() {
         let is_model = record.is_model_space();
@@ -295,7 +445,15 @@ fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extracti
                 continue;
             }
 
-            process_entity(entity, model_index, options, &mut extraction);
+            process_entity(
+                document,
+                entity,
+                model_index,
+                options,
+                &mut extraction,
+                &model_placement,
+                0,
+            );
             model_index += 1;
         }
     }
@@ -313,16 +471,27 @@ fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extracti
     Ok(extraction)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_entity(
+    document: &CadDocument,
     entity: &EntityType,
     index: usize,
     options: &GeometryOptions,
     extraction: &mut Extraction,
+    placement: &Placement,
+    depth: usize,
 ) {
-    let entity_type = entity.as_entity().entity_type().to_string();
-    let handle_text = format!("{}", entity.common().handle);
+    if let EntityType::Insert(insert) = entity {
+        process_insert(
+            document, entity, insert, options, extraction, placement, depth,
+        );
+        return;
+    }
 
-    match convert_entity(entity, options) {
+    let entity_type = entity.as_entity().entity_type().to_string();
+    let feature_id = feature_id(entity, index, placement);
+
+    match convert_entity(entity, options, placement) {
         EntityOutcome::Converted {
             geometry,
             extra_properties,
@@ -338,20 +507,232 @@ fn process_entity(
             *extraction.converted.entry(entity_type.clone()).or_default() += 1;
             extraction.features.push(build_feature(
                 entity,
-                index,
+                feature_id,
                 &entity_type,
                 geometry,
                 extra_properties,
                 warnings,
+                placement,
             ));
         }
         EntityOutcome::Skipped(reason) => {
-            record_outcome(&mut extraction.skipped, entity_type, reason, &handle_text);
+            record_outcome(&mut extraction.skipped, entity_type, reason, &feature_id);
         }
         EntityOutcome::Failed(reason) => {
-            record_outcome(&mut extraction.failed, entity_type, reason, &handle_text);
+            record_outcome(&mut extraction.failed, entity_type, reason, &feature_id);
         }
     }
+}
+
+/// Unique, stable feature id: the insert-handle chain plus the entity's own
+/// handle (or its model-space position when the handle is null).
+fn feature_id(entity: &EntityType, index: usize, placement: &Placement) -> String {
+    let handle = entity.common().handle;
+    if handle.is_null() {
+        format!("{}model-{index}", placement.id_prefix)
+    } else {
+        format!("{}{}", placement.id_prefix, handle)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_insert(
+    document: &CadDocument,
+    entity: &EntityType,
+    insert: &acadrust::entities::Insert,
+    options: &GeometryOptions,
+    extraction: &mut Extraction,
+    placement: &Placement,
+    depth: usize,
+) {
+    let id = feature_id(entity, 0, placement);
+
+    // Entities on layer "0" inside a block conventionally take the insert's
+    // layer; resolve the insert's own effective layer first so the rule
+    // composes through nesting.
+    let insert_layer = &entity.common().layer;
+    let effective_layer = if insert_layer == "0" {
+        placement
+            .inherited_layer
+            .clone()
+            .unwrap_or_else(|| insert_layer.clone())
+    } else {
+        insert_layer.clone()
+    };
+
+    let attributes: BTreeMap<String, String> = insert
+        .attributes
+        .iter()
+        .map(|attribute| (attribute.tag.clone(), attribute.value.clone()))
+        .collect();
+
+    if options.preserve_inserts {
+        emit_insert_anchor(entity, insert, &attributes, extraction, placement);
+        return;
+    }
+
+    let Some(record) = document.block_records.get(&insert.block_name) else {
+        record_outcome(
+            &mut extraction.failed,
+            "INSERT".to_string(),
+            format!(
+                "references missing block definition {:?}",
+                insert.block_name
+            ),
+            &id,
+        );
+        return;
+    };
+    if placement
+        .block_path
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&insert.block_name))
+    {
+        record_outcome(
+            &mut extraction.failed,
+            "INSERT".to_string(),
+            format!("recursive reference to block {:?}", insert.block_name),
+            &id,
+        );
+        return;
+    }
+    if depth >= MAX_BLOCK_DEPTH {
+        record_outcome(
+            &mut extraction.failed,
+            "INSERT".to_string(),
+            format!("block nesting deeper than {MAX_BLOCK_DEPTH} levels"),
+            &id,
+        );
+        return;
+    }
+
+    let columns = insert.column_count.max(1);
+    let rows = insert.row_count.max(1);
+    let multi = columns > 1 || rows > 1;
+    let instance_scale = insert
+        .x_scale()
+        .abs()
+        .max(insert.y_scale().abs())
+        .max(insert.z_scale().abs());
+
+    let mut block_path = placement.block_path.clone();
+    block_path.push(insert.block_name.clone());
+
+    for row in 0..rows {
+        for column in 0..columns {
+            let cell_suffix = if multi {
+                format!("[{row},{column}]")
+            } else {
+                String::new()
+            };
+            let child_placement = Placement {
+                matrix: placement.matrix.compose(&insert_matrix(
+                    insert,
+                    record.base_point,
+                    column,
+                    row,
+                )),
+                block_path: block_path.clone(),
+                id_prefix: format!("{id}{cell_suffix}/"),
+                inherited_layer: Some(effective_layer.clone()),
+                max_scale: placement.max_scale * instance_scale,
+            };
+
+            for handle in &record.entity_handles {
+                let Some(child) = document.get_entity(*handle) else {
+                    record_outcome(
+                        &mut extraction.failed,
+                        "UNRESOLVED".to_string(),
+                        "entity handle does not resolve to an entity".to_string(),
+                        &format!("{}{}", child_placement.id_prefix, handle),
+                    );
+                    continue;
+                };
+                if matches!(child, EntityType::Block(_) | EntityType::BlockEnd(_)) {
+                    continue;
+                }
+                if matches!(child, EntityType::AttributeDefinition(_)) {
+                    record_outcome(
+                        &mut extraction.skipped,
+                        "ATTDEF".to_string(),
+                        "attribute definition template; values are read from the INSERT"
+                            .to_string(),
+                        &format!("{}{}", child_placement.id_prefix, child.common().handle),
+                    );
+                    continue;
+                }
+                process_entity(
+                    document,
+                    child,
+                    0,
+                    options,
+                    extraction,
+                    &child_placement,
+                    depth + 1,
+                );
+            }
+        }
+    }
+
+    extraction.inserts_expanded += 1;
+    if !attributes.is_empty() {
+        emit_insert_anchor(entity, insert, &attributes, extraction, placement);
+    }
+}
+
+/// Point feature at the (transformed) insertion point carrying the block
+/// name and attribute values.
+fn emit_insert_anchor(
+    entity: &EntityType,
+    insert: &acadrust::entities::Insert,
+    attributes: &BTreeMap<String, String>,
+    extraction: &mut Extraction,
+    placement: &Placement,
+) {
+    let id = feature_id(entity, 0, placement);
+    let mut max_abs_z: f64 = 0.0;
+    let Some(position) = project(placement, insert.insert_point, &mut max_abs_z) else {
+        record_outcome(
+            &mut extraction.failed,
+            "INSERT".to_string(),
+            "non-finite coordinates".to_string(),
+            &id,
+        );
+        return;
+    };
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+
+    let mut extra_properties = vec![
+        ("block_name", JsonValue::from(insert.block_name.clone())),
+        (
+            "rotation_deg",
+            JsonValue::from(insert.rotation.to_degrees()),
+        ),
+    ];
+    if !attributes.is_empty() {
+        let map: JsonObject = attributes
+            .iter()
+            .map(|(tag, value)| (tag.clone(), JsonValue::from(value.clone())))
+            .collect();
+        extra_properties.push(("attributes", JsonValue::Object(map)));
+    }
+
+    extraction.feature_warnings += warnings.len();
+    *extraction
+        .converted
+        .entry("INSERT".to_string())
+        .or_default() += 1;
+    extraction.features.push(build_feature(
+        entity,
+        id,
+        "INSERT",
+        GeometryValue::new_point(position),
+        extra_properties,
+        warnings,
+        placement,
+    ));
 }
 
 fn record_outcome(
@@ -369,28 +750,46 @@ fn record_outcome(
 
 fn build_feature(
     entity: &EntityType,
-    index: usize,
+    feature_id: String,
     entity_type: &str,
     geometry: GeometryValue,
     extra_properties: Vec<(&'static str, JsonValue)>,
     warnings: Vec<String>,
+    placement: &Placement,
 ) -> Feature {
     let common = entity.common();
 
-    let id = if common.handle.is_null() {
-        format!("model-{index}")
+    // Layer "0" content inside a block takes the insert's layer.
+    let source_layer = common.layer.clone();
+    let layer = if source_layer == "0" {
+        placement
+            .inherited_layer
+            .clone()
+            .unwrap_or_else(|| source_layer.clone())
     } else {
-        format!("{}", common.handle)
+        source_layer.clone()
     };
 
     let mut properties = JsonObject::new();
-    properties.insert("layer".to_string(), JsonValue::from(common.layer.clone()));
+    properties.insert("layer".to_string(), JsonValue::from(layer.clone()));
+    if layer != source_layer {
+        properties.insert("source_layer".to_string(), JsonValue::from(source_layer));
+    }
     properties.insert(
         "entity_type".to_string(),
         JsonValue::from(entity_type.to_string()),
     );
     properties.insert("space".to_string(), JsonValue::from("model"));
-    properties.insert("handle".to_string(), JsonValue::from(id.clone()));
+    properties.insert(
+        "handle".to_string(),
+        JsonValue::from(format!("{}", common.handle)),
+    );
+    if !placement.block_path.is_empty() {
+        properties.insert(
+            "block_path".to_string(),
+            JsonValue::from(placement.block_path.join("/")),
+        );
+    }
     for (key, value) in extra_properties {
         properties.insert(key.to_string(), value);
     }
@@ -401,64 +800,75 @@ fn build_feature(
     Feature {
         bbox: None,
         geometry: Some(Geometry::new(geometry)),
-        id: Some(Id::String(id)),
+        id: Some(Id::String(feature_id)),
         properties: Some(properties),
         foreign_members: None,
     }
 }
 
-fn convert_entity(entity: &EntityType, options: &GeometryOptions) -> EntityOutcome {
+fn convert_entity(
+    entity: &EntityType,
+    options: &GeometryOptions,
+    placement: &Placement,
+) -> EntityOutcome {
     match entity {
-        EntityType::Point(point) => convert_point(point),
-        EntityType::Line(line) => convert_line(line),
-        EntityType::LwPolyline(polyline) => convert_lwpolyline(polyline, options),
-        EntityType::Polyline2D(polyline) => convert_polyline2d(polyline, options),
-        EntityType::Polyline3D(polyline) => convert_polyline3d(polyline, options),
-        EntityType::Polyline(polyline) => convert_polyline_generic(polyline, options),
-        EntityType::Circle(circle) => convert_circle(circle, options),
-        EntityType::Arc(arc) => convert_arc(arc, options),
-        EntityType::Ellipse(ellipse) => convert_ellipse(ellipse, options),
-        EntityType::Spline(spline) => convert_spline(spline, options),
-        EntityType::Text(text) => convert_text(text),
-        EntityType::MText(mtext) => convert_mtext(mtext),
+        EntityType::Point(point) => convert_point(point, placement),
+        EntityType::Line(line) => convert_line(line, placement),
+        EntityType::LwPolyline(polyline) => convert_lwpolyline(polyline, options, placement),
+        EntityType::Polyline2D(polyline) => convert_polyline2d(polyline, options, placement),
+        EntityType::Polyline3D(polyline) => convert_polyline3d(polyline, options, placement),
+        EntityType::Polyline(polyline) => convert_polyline_generic(polyline, options, placement),
+        EntityType::Circle(circle) => convert_circle(circle, options, placement),
+        EntityType::Arc(arc) => convert_arc(arc, options, placement),
+        EntityType::Ellipse(ellipse) => convert_ellipse(ellipse, options, placement),
+        EntityType::Spline(spline) => convert_spline(spline, options, placement),
+        EntityType::Text(text) => convert_text(text, placement),
+        EntityType::MText(mtext) => convert_mtext(mtext, placement),
         _ => EntityOutcome::Skipped(
             "entity type is not converted by the native backend yet".to_string(),
         ),
     }
 }
 
-fn convert_point(point: &acadrust::entities::Point) -> EntityOutcome {
-    let location = point.location;
-    if !is_finite(&location) {
+fn convert_point(point: &acadrust::entities::Point, placement: &Placement) -> EntityOutcome {
+    if !is_finite(&point.location) {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
     }
+    let mut max_abs_z: f64 = 0.0;
+    let Some(position) = project(placement, point.location, &mut max_abs_z) else {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    };
 
     let mut warnings = Vec::new();
-    push_z_warning(&mut warnings, location.z.abs());
+    push_z_warning(&mut warnings, max_abs_z);
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_point((location.x, location.y)),
+        geometry: GeometryValue::new_point(position),
         extra_properties: Vec::new(),
         warnings,
     }
 }
 
-fn convert_line(line: &acadrust::entities::Line) -> EntityOutcome {
+fn convert_line(line: &acadrust::entities::Line, placement: &Placement) -> EntityOutcome {
     if !is_finite(&line.start) || !is_finite(&line.end) {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
     }
-    if line.start.x == line.end.x && line.start.y == line.end.y {
+    let mut max_abs_z: f64 = 0.0;
+    let (Some(start), Some(end)) = (
+        project(placement, line.start, &mut max_abs_z),
+        project(placement, line.end, &mut max_abs_z),
+    ) else {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    };
+    if start == end {
         return EntityOutcome::Skipped("degenerate line: identical XY endpoints".to_string());
     }
 
     let mut warnings = Vec::new();
-    push_z_warning(&mut warnings, line.start.z.abs().max(line.end.z.abs()));
+    push_z_warning(&mut warnings, max_abs_z);
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_line_string(vec![
-            (line.start.x, line.start.y),
-            (line.end.x, line.end.y),
-        ]),
+        geometry: GeometryValue::new_line_string(vec![start, end]),
         extra_properties: Vec::new(),
         warnings,
     }
@@ -475,6 +885,7 @@ struct OcsVertex {
 fn convert_lwpolyline(
     polyline: &acadrust::entities::LwPolyline,
     options: &GeometryOptions,
+    placement: &Placement,
 ) -> EntityOutcome {
     let vertices: Vec<OcsVertex> = polyline
         .vertices
@@ -491,12 +902,14 @@ fn convert_lwpolyline(
         polyline.elevation,
         polyline.normal,
         options,
+        placement,
     )
 }
 
 fn convert_polyline2d(
     polyline: &acadrust::entities::Polyline2D,
     options: &GeometryOptions,
+    placement: &Placement,
 ) -> EntityOutcome {
     use acadrust::entities::PolylineFlags;
 
@@ -533,12 +946,14 @@ fn convert_polyline2d(
         elevation,
         polyline.normal,
         options,
+        placement,
     )
 }
 
 fn convert_polyline3d(
     polyline: &acadrust::entities::Polyline3D,
     options: &GeometryOptions,
+    placement: &Placement,
 ) -> EntityOutcome {
     if polyline.flags.spline_fit {
         return EntityOutcome::Skipped(
@@ -556,12 +971,13 @@ fn convert_polyline3d(
         .iter()
         .map(|vertex| vertex.position)
         .collect();
-    finish_wcs_path(&points, polyline.flags.closed, options)
+    finish_wcs_path(&points, polyline.flags.closed, options, placement)
 }
 
 fn convert_polyline_generic(
     polyline: &acadrust::entities::Polyline,
     options: &GeometryOptions,
+    placement: &Placement,
 ) -> EntityOutcome {
     use acadrust::entities::PolylineFlags;
 
@@ -582,7 +998,7 @@ fn convert_polyline_generic(
         .iter()
         .map(|vertex| vertex.location)
         .collect();
-    finish_wcs_path(&points, polyline.is_closed(), options)
+    finish_wcs_path(&points, polyline.is_closed(), options, placement)
 }
 
 /// Expand bulge arcs in the OCS plane, lift to WCS via the arbitrary axis
@@ -593,6 +1009,7 @@ fn finish_ocs_path(
     elevation: f64,
     normal: Vector3,
     options: &GeometryOptions,
+    placement: &Placement,
 ) -> EntityOutcome {
     if vertices.len() < 2 {
         return EntityOutcome::Skipped("polyline has fewer than two vertices".to_string());
@@ -645,11 +1062,10 @@ fn finish_ocs_path(
     let mut max_abs_z: f64 = 0.0;
     for (x, y) in ocs_points {
         let wcs = ocs_to_wcs.transform_point(Vector3::new(x, y, elevation));
-        if !is_finite(&wcs) {
+        let Some(position) = project(placement, wcs, &mut max_abs_z) else {
             return EntityOutcome::Failed("non-finite coordinates".to_string());
-        }
-        max_abs_z = max_abs_z.max(wcs.z.abs());
-        coordinates.push((wcs.x, wcs.y));
+        };
+        coordinates.push(position);
     }
 
     push_z_warning(&mut warnings, max_abs_z);
@@ -659,11 +1075,23 @@ fn finish_ocs_path(
             options.curve_tolerance
         ));
     }
-    finish_coordinates(coordinates, closed, approximated, options, warnings)
+    finish_coordinates(
+        coordinates,
+        closed,
+        approximated,
+        options,
+        placement,
+        warnings,
+    )
 }
 
 /// 3D polylines carry WCS positions and no bulges; drop z with a warning.
-fn finish_wcs_path(points: &[Vector3], closed: bool, options: &GeometryOptions) -> EntityOutcome {
+fn finish_wcs_path(
+    points: &[Vector3],
+    closed: bool,
+    options: &GeometryOptions,
+    placement: &Placement,
+) -> EntityOutcome {
     if points.len() < 2 {
         return EntityOutcome::Skipped("polyline has fewer than two vertices".to_string());
     }
@@ -673,13 +1101,15 @@ fn finish_wcs_path(points: &[Vector3], closed: bool, options: &GeometryOptions) 
         if !is_finite(point) {
             return EntityOutcome::Failed("non-finite coordinates".to_string());
         }
-        max_abs_z = max_abs_z.max(point.z.abs());
-        coordinates.push((point.x, point.y));
+        let Some(position) = project(placement, *point, &mut max_abs_z) else {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        };
+        coordinates.push(position);
     }
 
     let mut warnings = Vec::new();
     push_z_warning(&mut warnings, max_abs_z);
-    finish_coordinates(coordinates, closed, false, options, warnings)
+    finish_coordinates(coordinates, closed, false, options, placement, warnings)
 }
 
 fn finish_coordinates(
@@ -687,8 +1117,15 @@ fn finish_coordinates(
     closed: bool,
     approximated: bool,
     options: &GeometryOptions,
-    warnings: Vec<String>,
+    placement: &Placement,
+    mut warnings: Vec<String>,
 ) -> EntityOutcome {
+    if approximated && placement.max_scale > 1.0 + 1e-9 {
+        warnings.push(format!(
+            "placed by an insert with scale {}; the effective chord error scales accordingly",
+            placement.max_scale
+        ));
+    }
     let mut extra_properties = vec![("is_closed", JsonValue::from(closed))];
     if approximated {
         extra_properties.push(("approximated", JsonValue::from(true)));
@@ -819,7 +1256,11 @@ fn arc_points(
 
 /// DXF circles live in the OCS plane of their normal; tessellate CCW and
 /// close the ring.
-fn convert_circle(circle: &acadrust::entities::Circle, options: &GeometryOptions) -> EntityOutcome {
+fn convert_circle(
+    circle: &acadrust::entities::Circle,
+    options: &GeometryOptions,
+    placement: &Placement,
+) -> EntityOutcome {
     if !is_finite(&circle.center) || !circle.radius.is_finite() {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
     }
@@ -845,12 +1286,17 @@ fn convert_circle(circle: &acadrust::entities::Circle, options: &GeometryOptions
         circle.normal,
         true,
         options,
+        placement,
         warnings,
     )
 }
 
 /// DXF arcs sweep counter-clockwise from start to end angle in the OCS plane.
-fn convert_arc(arc: &acadrust::entities::Arc, options: &GeometryOptions) -> EntityOutcome {
+fn convert_arc(
+    arc: &acadrust::entities::Arc,
+    options: &GeometryOptions,
+    placement: &Placement,
+) -> EntityOutcome {
     if !is_finite(&arc.center)
         || !arc.radius.is_finite()
         || !arc.start_angle.is_finite()
@@ -883,6 +1329,7 @@ fn convert_arc(arc: &acadrust::entities::Arc, options: &GeometryOptions) -> Enti
         arc.normal,
         false,
         options,
+        placement,
         warnings,
     )
 }
@@ -892,6 +1339,7 @@ fn convert_arc(arc: &acadrust::entities::Arc, options: &GeometryOptions) -> Enti
 fn convert_ellipse(
     ellipse: &acadrust::entities::Ellipse,
     options: &GeometryOptions,
+    placement: &Placement,
 ) -> EntityOutcome {
     if !is_finite(&ellipse.center)
         || !is_finite(&ellipse.major_axis)
@@ -940,11 +1388,10 @@ fn convert_ellipse(
     let mut max_abs_z: f64 = 0.0;
     for (cos_t, sin_t) in parameters {
         let point = ellipse.center + ellipse.major_axis * cos_t + minor_axis * sin_t;
-        if !is_finite(&point) {
+        let Some(position) = project(placement, point, &mut max_abs_z) else {
             return EntityOutcome::Failed("non-finite coordinates".to_string());
-        }
-        max_abs_z = max_abs_z.max(point.z.abs());
-        coordinates.push((point.x, point.y));
+        };
+        coordinates.push(position);
     }
     if closed {
         coordinates.pop();
@@ -955,7 +1402,7 @@ fn convert_ellipse(
         "arc segments tessellated with chord tolerance {} drawing units",
         options.curve_tolerance
     ));
-    finish_coordinates(coordinates, closed, true, options, warnings)
+    finish_coordinates(coordinates, closed, true, options, placement, warnings)
 }
 
 /// Fixed sampling density for spline evaluation, per knot span.
@@ -965,7 +1412,11 @@ const SPLINE_MIN_SEGMENTS: usize = 16;
 /// Evaluate the NURBS control net with de Boor's algorithm; when the NURBS
 /// data is invalid, fall back to a polyline through the fit points rather
 /// than dropping the entity silently.
-fn convert_spline(spline: &acadrust::entities::Spline, options: &GeometryOptions) -> EntityOutcome {
+fn convert_spline(
+    spline: &acadrust::entities::Spline,
+    options: &GeometryOptions,
+    placement: &Placement,
+) -> EntityOutcome {
     let degree = spline.degree;
     let control_count = spline.control_points.len();
     let nurbs_valid = degree >= 1
@@ -977,7 +1428,8 @@ fn convert_spline(spline: &acadrust::entities::Spline, options: &GeometryOptions
 
     if !nurbs_valid {
         if spline.fit_points.len() >= 2 && spline.fit_points.iter().all(is_finite) {
-            let mut outcome = finish_wcs_path(&spline.fit_points, spline.flags.closed, options);
+            let mut outcome =
+                finish_wcs_path(&spline.fit_points, spline.flags.closed, options, placement);
             if let EntityOutcome::Converted {
                 extra_properties,
                 warnings,
@@ -1016,7 +1468,7 @@ fn convert_spline(spline: &acadrust::entities::Spline, options: &GeometryOptions
 
     let domain_start = spline.knots[degree];
     let domain_end = spline.knots[control_count];
-    if !(domain_end > domain_start) {
+    if domain_end <= domain_start {
         return EntityOutcome::Skipped("spline has an empty parameter domain".to_string());
     }
 
@@ -1032,8 +1484,14 @@ fn convert_spline(spline: &acadrust::entities::Spline, options: &GeometryOptions
                 "spline evaluation produced a non-finite or zero-weight point".to_string(),
             );
         };
-        max_abs_z = max_abs_z.max(point.2.abs());
-        coordinates.push((point.0, point.1));
+        let Some(position) = project(
+            placement,
+            Vector3::new(point.0, point.1, point.2),
+            &mut max_abs_z,
+        ) else {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        };
+        coordinates.push(position);
     }
 
     let mut warnings = Vec::new();
@@ -1042,7 +1500,14 @@ fn convert_spline(spline: &acadrust::entities::Spline, options: &GeometryOptions
         "spline sampled at {} points with uniform parameter spacing; chord tolerance is not applied to splines yet",
         segments + 1
     ));
-    finish_coordinates(coordinates, spline.flags.closed, true, options, warnings)
+    finish_coordinates(
+        coordinates,
+        spline.flags.closed,
+        true,
+        options,
+        placement,
+        warnings,
+    )
 }
 
 /// De Boor evaluation on homogeneous coordinates. Returns the Cartesian
@@ -1072,8 +1537,9 @@ fn evaluate_nurbs(
             } else {
                 (t - knots[i]) / denominator
             };
-            for c in 0..4 {
-                d[j][c] = (1.0 - alpha) * d[j - 1][c] + alpha * d[j][c];
+            let previous = d[j - 1];
+            for (c, cell) in d[j].iter_mut().enumerate() {
+                *cell = (1.0 - alpha) * previous[c] + alpha * *cell;
             }
         }
     }
@@ -1087,21 +1553,22 @@ fn evaluate_nurbs(
 
 /// TEXT anchors live in OCS; the second alignment point, when present, is
 /// the effective anchor for aligned text.
-fn convert_text(text: &acadrust::entities::Text) -> EntityOutcome {
+fn convert_text(text: &acadrust::entities::Text, placement: &Placement) -> EntityOutcome {
     let anchor = text.alignment_point.unwrap_or(text.insertion_point);
     if !is_finite(&anchor) {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
     }
     let wcs = Matrix3::arbitrary_axis(text.normal).transform_point(anchor);
-    if !is_finite(&wcs) {
+    let mut max_abs_z: f64 = 0.0;
+    let Some(position) = project(placement, wcs, &mut max_abs_z) else {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
-    }
+    };
 
     let mut warnings = Vec::new();
-    push_z_warning(&mut warnings, wcs.z.abs());
+    push_z_warning(&mut warnings, max_abs_z);
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_point((wcs.x, wcs.y)),
+        geometry: GeometryValue::new_point(position),
         extra_properties: vec![
             ("text", JsonValue::from(text.value.clone())),
             ("text_height", JsonValue::from(text.height)),
@@ -1117,14 +1584,18 @@ fn convert_text(text: &acadrust::entities::Text) -> EntityOutcome {
 
 /// MTEXT insertion points are WCS; the value may carry inline format codes,
 /// which are stripped into a plain-text property (raw kept when different).
-fn convert_mtext(mtext: &acadrust::entities::MText) -> EntityOutcome {
+fn convert_mtext(mtext: &acadrust::entities::MText, placement: &Placement) -> EntityOutcome {
     let anchor = mtext.insertion_point;
     if !is_finite(&anchor) {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
     }
+    let mut max_abs_z: f64 = 0.0;
+    let Some(position) = project(placement, anchor, &mut max_abs_z) else {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    };
 
     let mut warnings = Vec::new();
-    push_z_warning(&mut warnings, anchor.z.abs());
+    push_z_warning(&mut warnings, max_abs_z);
 
     let plain = strip_mtext_codes(&mtext.value);
     let mut extra_properties = vec![
@@ -1141,7 +1612,7 @@ fn convert_mtext(mtext: &acadrust::entities::MText) -> EntityOutcome {
     }
 
     EntityOutcome::Converted {
-        geometry: GeometryValue::new_point((anchor.x, anchor.y)),
+        geometry: GeometryValue::new_point(position),
         extra_properties,
         warnings,
     }
@@ -1200,6 +1671,7 @@ fn finish_curve(
     normal: Vector3,
     closed: bool,
     options: &GeometryOptions,
+    placement: &Placement,
     mut warnings: Vec<String>,
 ) -> EntityOutcome {
     let ocs_to_wcs = Matrix3::arbitrary_axis(normal);
@@ -1207,11 +1679,10 @@ fn finish_curve(
     let mut max_abs_z: f64 = 0.0;
     for (x, y) in ocs_points {
         let wcs = ocs_to_wcs.transform_point(Vector3::new(x, y, ocs_z));
-        if !is_finite(&wcs) {
+        let Some(position) = project(placement, wcs, &mut max_abs_z) else {
             return EntityOutcome::Failed("non-finite coordinates".to_string());
-        }
-        max_abs_z = max_abs_z.max(wcs.z.abs());
-        coordinates.push((wcs.x, wcs.y));
+        };
+        coordinates.push(position);
     }
 
     push_z_warning(&mut warnings, max_abs_z);
@@ -1219,7 +1690,7 @@ fn finish_curve(
         "arc segments tessellated with chord tolerance {} drawing units",
         options.curve_tolerance
     ));
-    finish_coordinates(coordinates, closed, true, options, warnings)
+    finish_coordinates(coordinates, closed, true, options, placement, warnings)
 }
 
 fn push_z_warning(warnings: &mut Vec<String>, max_abs_z: f64) {
@@ -1261,15 +1732,21 @@ mod tests {
     use geojson::GeometryValue;
 
     use super::{
-        DEFAULT_CURVE_TOLERANCE, EntityOutcome, GeometryOptions, convert_entity, extract,
-        signed_area, tessellate_bulge,
+        DEFAULT_CURVE_TOLERANCE, EntityOutcome, GeometryOptions, Placement, extract, signed_area,
+        tessellate_bulge,
     };
 
     fn opts(polygonize_closed: bool) -> GeometryOptions {
         GeometryOptions {
             polygonize_closed,
             curve_tolerance: DEFAULT_CURVE_TOLERANCE,
+            preserve_inserts: false,
         }
+    }
+
+    /// Test shorthand: convert with the identity model-space placement.
+    fn convert_entity(entity: &EntityType, options: &GeometryOptions) -> EntityOutcome {
+        super::convert_entity(entity, options, &Placement::model_space())
     }
 
     fn lwpolyline(points: &[(f64, f64)], closed: bool) -> LwPolyline {
@@ -1841,5 +2318,282 @@ mod tests {
         };
         assert_eq!(ids(&first), ids(&second));
         assert_eq!(first.features.len(), 3);
+    }
+
+    /// Register a block definition and route its entities to the new record.
+    fn add_block(
+        document: &mut CadDocument,
+        name: &str,
+        base_point: acadrust::types::Vector3,
+        entities: Vec<EntityType>,
+    ) {
+        let mut record = acadrust::BlockRecord::new(name);
+        record.handle = document.allocate_handle();
+        record.base_point = base_point;
+        let owner = record.handle;
+        document
+            .block_records
+            .add(record)
+            .expect("add block record");
+        for mut entity in entities {
+            entity.common_mut().owner_handle = owner;
+            document.add_entity(entity).expect("add block entity");
+        }
+    }
+
+    fn string_id(feature: &geojson::Feature) -> String {
+        match &feature.id {
+            Some(geojson::feature::Id::String(id)) => id.clone(),
+            other => panic!("expected string feature id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_expands_block_geometry_with_scale_rotation_translation() {
+        use acadrust::entities::Insert;
+        use acadrust::types::Vector3;
+        use geojson::JsonValue;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "PART",
+            Vector3::ZERO,
+            vec![EntityType::Line(Line::from_coords(
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            ))],
+        );
+
+        let mut insert = Insert::new("PART", Vector3::new(10.0, 0.0, 0.0));
+        insert.set_x_scale(2.0);
+        insert.set_y_scale(2.0);
+        insert.set_z_scale(2.0);
+        insert.rotation = std::f64::consts::FRAC_PI_2;
+        document
+            .add_entity(EntityType::Insert(insert))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.inserts_expanded, 1);
+        assert_eq!(extraction.features.len(), 1);
+        assert_eq!(extraction.converted.get("LINE"), Some(&1));
+        let feature = &extraction.features[0];
+        let geometry = feature.geometry.as_ref().expect("geometry");
+        let GeometryValue::LineString { coordinates } = &geometry.value else {
+            panic!("expected LineString, got {:?}", geometry.value);
+        };
+        // (0,0) maps to the insertion point; (1,0) scales to (2,0), rotates
+        // 90 degrees to (0,2), and shifts to (10,2).
+        assert!((coordinates[0][0] - 10.0).abs() < 1e-9 && coordinates[0][1].abs() < 1e-9);
+        assert!((coordinates[1][0] - 10.0).abs() < 1e-9 && (coordinates[1][1] - 2.0).abs() < 1e-9);
+        let properties = feature.properties.as_ref().expect("properties");
+        assert_eq!(properties.get("block_path"), Some(&JsonValue::from("PART")));
+        let id = string_id(feature);
+        assert!(
+            id.contains('/'),
+            "id must be prefixed by the insert chain: {id}"
+        );
+    }
+
+    #[test]
+    fn nested_inserts_compose_transforms_and_block_paths() {
+        use acadrust::entities::Insert;
+        use acadrust::types::Vector3;
+        use geojson::JsonValue;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "INNER",
+            Vector3::ZERO,
+            vec![EntityType::Point(Point::from_coords(1.0, 0.0, 0.0))],
+        );
+        add_block(
+            &mut document,
+            "OUTER",
+            Vector3::ZERO,
+            vec![EntityType::Insert(Insert::new(
+                "INNER",
+                Vector3::new(2.0, 0.0, 0.0),
+            ))],
+        );
+        document
+            .add_entity(EntityType::Insert(Insert::new(
+                "OUTER",
+                Vector3::new(10.0, 0.0, 0.0),
+            )))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.inserts_expanded, 2);
+        assert_eq!(extraction.features.len(), 1);
+        let feature = &extraction.features[0];
+        let geometry = feature.geometry.as_ref().expect("geometry");
+        assert_eq!(geometry.value, GeometryValue::new_point((13.0, 0.0)));
+        let properties = feature.properties.as_ref().expect("properties");
+        assert_eq!(
+            properties.get("block_path"),
+            Some(&JsonValue::from("OUTER/INNER"))
+        );
+    }
+
+    #[test]
+    fn layer_zero_block_content_inherits_the_insert_layer() {
+        use acadrust::entities::Insert;
+        use acadrust::types::Vector3;
+        use geojson::JsonValue;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "SYM",
+            Vector3::ZERO,
+            vec![EntityType::Point(Point::from_coords(1.0, 1.0, 0.0))],
+        );
+
+        let mut insert = EntityType::Insert(Insert::new("SYM", Vector3::ZERO));
+        insert.common_mut().layer = "PIPES".to_string();
+        document.add_entity(insert).expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.features.len(), 1);
+        let properties = extraction.features[0]
+            .properties
+            .as_ref()
+            .expect("properties");
+        assert_eq!(properties.get("layer"), Some(&JsonValue::from("PIPES")));
+        assert_eq!(properties.get("source_layer"), Some(&JsonValue::from("0")));
+    }
+
+    #[test]
+    fn preserve_inserts_emits_anchor_points_with_attributes() {
+        use acadrust::entities::{AttributeEntity, Insert};
+        use acadrust::types::Vector3;
+        use geojson::JsonValue;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "SYM",
+            Vector3::ZERO,
+            vec![EntityType::Point(Point::from_coords(1.0, 1.0, 0.0))],
+        );
+
+        let mut insert = Insert::new("SYM", Vector3::new(5.0, 6.0, 0.0));
+        insert
+            .attributes
+            .push(AttributeEntity::new("TAG".to_string(), "V1".to_string()));
+        document
+            .add_entity(EntityType::Insert(insert))
+            .expect("add insert");
+
+        let mut options = opts(false);
+        options.preserve_inserts = true;
+        let extraction = extract(&document, &options).expect("extract");
+
+        assert_eq!(extraction.inserts_expanded, 0);
+        assert_eq!(extraction.features.len(), 1);
+        assert_eq!(extraction.converted.get("INSERT"), Some(&1));
+        let feature = &extraction.features[0];
+        let geometry = feature.geometry.as_ref().expect("geometry");
+        assert_eq!(geometry.value, GeometryValue::new_point((5.0, 6.0)));
+        let properties = feature.properties.as_ref().expect("properties");
+        assert_eq!(properties.get("block_name"), Some(&JsonValue::from("SYM")));
+        let attributes = properties.get("attributes").expect("attributes");
+        assert_eq!(attributes.get("TAG"), Some(&JsonValue::from("V1")));
+    }
+
+    #[test]
+    fn recursive_block_references_are_failed_not_looped() {
+        use acadrust::entities::Insert;
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "LOOP",
+            Vector3::ZERO,
+            vec![EntityType::Insert(Insert::new("LOOP", Vector3::ZERO))],
+        );
+        document
+            .add_entity(EntityType::Insert(Insert::new("LOOP", Vector3::ZERO)))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert!(extraction.features.is_empty());
+        assert!(
+            extraction.failed.keys().any(
+                |(entity_type, reason)| entity_type == "INSERT" && reason.contains("recursive")
+            ),
+            "failed outcomes: {:?}",
+            extraction.failed.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn missing_block_definition_is_a_failed_insert() {
+        use acadrust::entities::Insert;
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        document
+            .add_entity(EntityType::Insert(Insert::new("GHOST", Vector3::ZERO)))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert!(extraction.features.is_empty());
+        assert!(
+            extraction
+                .failed
+                .keys()
+                .any(|(entity_type, reason)| entity_type == "INSERT"
+                    && reason.contains("missing block definition")),
+            "failed outcomes: {:?}",
+            extraction.failed.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn minsert_grids_emit_one_feature_per_cell() {
+        use acadrust::entities::Insert;
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "CELL",
+            Vector3::ZERO,
+            vec![EntityType::Point(Point::from_coords(0.0, 0.0, 0.0))],
+        );
+
+        let mut insert = Insert::new("CELL", Vector3::ZERO);
+        insert.column_count = 2;
+        insert.row_count = 1;
+        insert.column_spacing = 5.0;
+        document
+            .add_entity(EntityType::Insert(insert))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.features.len(), 2);
+        let points: Vec<_> = extraction
+            .features
+            .iter()
+            .map(|feature| feature.geometry.as_ref().expect("geometry").value.clone())
+            .collect();
+        assert_eq!(points[0], GeometryValue::new_point((0.0, 0.0)));
+        assert_eq!(points[1], GeometryValue::new_point((5.0, 0.0)));
+        let ids: Vec<String> = extraction.features.iter().map(string_id).collect();
+        assert!(
+            ids[0].contains("[0,0]") && ids[1].contains("[0,1]"),
+            "{ids:?}"
+        );
+        assert_ne!(ids[0], ids[1]);
     }
 }

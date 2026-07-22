@@ -93,6 +93,16 @@ pub enum Command {
         /// (native backend only; default 0.05).
         #[arg(long, value_name = "UNITS")]
         curve_tolerance: Option<f64>,
+
+        /// Expand INSERT references into their block geometry. This is the
+        /// default; the flag exists to make the choice explicit.
+        #[arg(long, conflicts_with = "preserve_inserts")]
+        explode_blocks: bool,
+
+        /// Emit INSERT references as point features with block name and
+        /// attributes instead of expanding them (native backend only).
+        #[arg(long)]
+        preserve_inserts: bool,
     },
 }
 

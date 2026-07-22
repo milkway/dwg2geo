@@ -22,6 +22,7 @@ pub struct ConvertRequest<'a> {
     pub exclude_layers: &'a [String],
     pub polygonize_closed: bool,
     pub curve_tolerance: Option<f64>,
+    pub preserve_inserts: bool,
 }
 
 pub fn doctor(json: bool) -> Result<()> {

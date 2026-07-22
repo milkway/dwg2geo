@@ -78,12 +78,12 @@ Exit condition: common civil/utility plan geometry converts natively with quanti
 
 ## Milestone 4 — blocks and references
 
-- [ ] Read block definitions and `INSERT` references.
-- [ ] Compose translation, rotation, non-uniform scale, extrusion, and nested transforms.
-- [ ] Detect recursive block references.
-- [ ] Add `--explode-blocks` and `--preserve-inserts` modes.
-- [ ] Preserve block path and attributes in feature properties.
-- [ ] Resolve BYLAYER/BYBLOCK metadata where relevant.
+- [x] Read block definitions and `INSERT` references. (Native backend; missing definitions and unresolved child handles are failed outcomes, never silent drops.)
+- [x] Compose translation, rotation, non-uniform scale, extrusion, and nested transforms. (Affine chain per instance: insertion point, arbitrary-axis orientation of the insert normal, rotation, MINSERT cell offset, scale, block base point. Nesting capped at 16 levels; MINSERT grids emit one feature set per cell with `[row,col]` id suffixes; accumulated scale > 1 adds a chord-error warning to approximated geometry.)
+- [x] Detect recursive block references. (Case-insensitive block-name chain check; recursion is a failed INSERT with the block name in the reason.)
+- [x] Add `--explode-blocks` and `--preserve-inserts` modes. (Explode is the default and the flag documents the choice; the two flags conflict; both are native-backend-only and rejected elsewhere. The report records `block_mode`.)
+- [x] Preserve block path and attributes in feature properties. (`block_path` joined with `/`; feature ids are prefixed by the insert-handle chain so repeated inserts stay unique; attribute values are emitted on an INSERT anchor point in both modes; ATTDEF templates are counted as skipped.)
+- [ ] Resolve BYLAYER/BYBLOCK metadata where relevant. (Done for layers: block content on layer "0" takes the insert's effective layer, keeping `source_layer`. Color/linetype resolution is not converted yet — style properties are not emitted at all.)
 
 Exit condition: nested engineering symbols and repeated structures are spatially correct and traceable.
 

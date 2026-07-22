@@ -461,6 +461,40 @@ fn polygonize_closed_requires_native_backend() {
     assert!(stderr.contains("--backend native"), "stderr: {stderr}");
 }
 
+#[test]
+fn block_modes_require_native_backend_and_are_mutually_exclusive() {
+    let dir = TempDir::new().expect("temporary directory");
+    let fixture = write_fixture(dir.path(), "fixture.dwg");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojson"))
+        .args(["--allow-local-coordinates", "--preserve-inserts"])
+        .output()
+        .expect("run binary");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--backend native"), "stderr: {stderr}");
+
+    let output = binary()
+        .arg("convert")
+        .arg(&fixture)
+        .arg("--output")
+        .arg(dir.path().join("out.geojson"))
+        .args([
+            "--allow-local-coordinates",
+            "--explode-blocks",
+            "--preserve-inserts",
+        ])
+        .output()
+        .expect("run binary");
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot be used with"), "stderr: {stderr}");
+}
+
 /// Fixture for conversion tests: three convertible model-space entities, a
 /// bulged polyline and a circle that must be skipped with reasons, and one
 /// paper-space entity that must be excluded.

@@ -40,6 +40,8 @@ pub struct NativeConversionSummary {
     pub features_written: usize,
     /// Features whose geometry required curve approximation.
     pub approximated_features: usize,
+    /// INSERT references expanded into block geometry.
+    pub inserts_expanded: usize,
     pub converted: Vec<ConvertedCount>,
     pub skipped: Vec<OutcomeCount>,
     pub failed: Vec<OutcomeCount>,
@@ -98,6 +100,9 @@ pub struct ConversionOptions {
     /// Effective chord-error tolerance for arc tessellation, in drawing
     /// units. `None` on routes that do not tessellate.
     pub curve_tolerance: Option<f64>,
+    /// How INSERT references were handled: "explode" or "preserve-inserts".
+    /// `None` on routes that do not resolve blocks themselves.
+    pub block_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +165,7 @@ mod tests {
                 exclude_layers: Vec::new(),
                 polygonize_closed: false,
                 curve_tolerance: None,
+                block_mode: None,
             },
             external_tools: Vec::new(),
             steps: vec![Step {

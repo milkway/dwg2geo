@@ -16,7 +16,7 @@
 | HATCH | Polygon / MultiPolygon | Extract loops, classify holes, validate rings. |
 | 3DFACE | Polygon | Apply configured projection/dimension policy. |
 | TEXT / MTEXT | Point | Store text, rotation, height, style, alignment, and layer. |
-| INSERT | Expanded child features or Point/reference | Compose nested transforms and preserve block path. |
+| INSERT | Expanded child features or Point/reference | Compose nested transforms and preserve block path. Native backend: expanded by default (translation, normal orientation, rotation, non-uniform scale, MINSERT grids, nesting up to 16 levels; recursion and missing definitions fail with reasons); `--preserve-inserts` emits anchor Points with `block_name` and `attributes`; block content on layer "0" inherits the insert's effective layer (`source_layer` keeps the original). |
 | DIMENSION | Expanded graphics and/or semantic properties | Initially report unsupported rather than silently flattening incorrectly. |
 | SOLID / TRACE | Polygon | Validate vertex ordering. |
 | RAY / XLINE | Unsupported by default | Infinite geometry needs clipping bounds. |

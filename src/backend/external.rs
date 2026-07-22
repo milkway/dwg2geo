@@ -64,6 +64,9 @@ pub fn doctor(json: bool) -> Result<()> {
 pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let started = Instant::now();
 
+    // The CLI rejects the native-only block-mode flags before reaching here.
+    debug_assert!(!request.preserve_inserts);
+
     validate_input(request.input)?;
     check_output_collision(request.output, request.force)?;
     ensure_parent_directory(request.output)?;
@@ -137,9 +140,10 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             include_layers: request.include_layers.to_vec(),
             exclude_layers: request.exclude_layers.to_vec(),
             polygonize_closed: request.polygonize_closed,
-            // Always None here: the CLI rejects --curve-tolerance for the
-            // external backend, which does not tessellate.
+            // Always None here: the CLI rejects the native-only tessellation
+            // and block-mode flags for the external backend.
             curve_tolerance: request.curve_tolerance,
+            block_mode: None,
         },
         external_tools,
         steps,
