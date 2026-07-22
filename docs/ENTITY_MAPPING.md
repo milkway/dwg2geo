@@ -14,7 +14,7 @@
 | ELLIPSE | LineString or Polygon | Respect start/end parameters. |
 | SPLINE | LineString | Evaluate knots/control points; report unsupported variants. |
 | HATCH | Polygon / MultiPolygon | Extract loops, classify holes, validate rings. |
-| 3DFACE | Polygon | Apply configured projection/dimension policy. |
+| 3DFACE | Polygon | Project WCS corners through INSERT placement to XY and warn when dropping non-zero z; collapse the duplicated fourth corner used for triangles, skip faces with fewer than three distinct projected corners, and always emit a closed CCW Polygon regardless of the closed-polyline polygonization option. |
 | TEXT / MTEXT | Point | Store text, rotation, height, style, alignment, and layer. |
 | INSERT | Expanded child features or Point/reference | Compose nested transforms and preserve block path. Native backend: expanded by default (translation, normal orientation, rotation, non-uniform scale, MINSERT grids, nesting up to 16 levels; recursion and missing definitions fail with reasons); `--preserve-inserts` emits anchor Points with `block_name` and `attributes`; block content on layer "0" inherits the insert's effective layer (`source_layer` keeps the original). |
 | DIMENSION | Expanded graphics and/or semantic properties | Initially report unsupported rather than silently flattening incorrectly. |
