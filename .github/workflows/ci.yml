@@ -37,7 +37,9 @@ jobs:
   # than in the cross-platform matrix.
   reproject:
     name: test (native-reproject)
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (jammy): the ubuntugis PPA that ships PROJ >= 9.6 does
+    # not publish for 24.04 (noble), whose stock PROJ is too old.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
