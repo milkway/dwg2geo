@@ -58,7 +58,7 @@ Implement entities in this order:
 - [x] `LWPOLYLINE` without bulges -> `LineString` / optional `Polygon`. (`--polygonize-closed`; closed polylines stay LineStrings by default per ADR-006. Bulged polylines are skipped with an explicit reason until bulge tessellation lands.)
 - [x] Classic `POLYLINE` / `VERTEX`. (2D and 3D variants; curve-fit/spline-fit smoothing and meshes are skipped with explicit reasons until implemented.)
 - [x] Bulge arc tessellation with deterministic tolerance. (`--curve-tolerance`, default 0.05 drawing units; 15°/segment angular cap and 256-segment arc cap with a warning; applies to LWPOLYLINE and 2D POLYLINE segments including the closing segment.)
-- [ ] `ARC` and `CIRCLE` tessellation.
+- [x] `ARC` and `CIRCLE` tessellation. (Shared arc tessellator with the bulge path: same chord tolerance, angular cap, and segment cap. Circles close their ring and honor `--polygonize-closed`; arcs sweep CCW in the OCS plane; features are marked approximated.)
 - [ ] `ELLIPSE` tessellation.
 - [ ] `SPLINE` evaluation/tessellation.
 - [ ] `TEXT` and `MTEXT` as point features with text properties.

@@ -414,6 +414,8 @@ fn convert_entity(entity: &EntityType, options: &GeometryOptions) -> EntityOutco
         EntityType::Polyline2D(polyline) => convert_polyline2d(polyline, options),
         EntityType::Polyline3D(polyline) => convert_polyline3d(polyline, options),
         EntityType::Polyline(polyline) => convert_polyline_generic(polyline, options),
+        EntityType::Circle(circle) => convert_circle(circle, options),
+        EntityType::Arc(arc) => convert_arc(arc, options),
         _ => EntityOutcome::Skipped(
             "entity type is not converted by the native backend yet".to_string(),
         ),
@@ -754,13 +756,43 @@ fn tessellate_bulge(
     let center_x = (start.0 + end.0) / 2.0 + left_x * apothem * side;
     let center_y = (start.1 + end.1) / 2.0 + left_y * apothem * side;
 
+    let start_angle = (start.1 - center_y).atan2(start.0 - center_x);
+    let mut points = arc_points(
+        (center_x, center_y),
+        radius,
+        start_angle,
+        theta,
+        tolerance,
+        warnings,
+    );
+    // Interior points only: the polyline vertices already provide both
+    // endpoints.
+    points.pop();
+    if !points.is_empty() {
+        points.remove(0);
+    }
+    points
+}
+
+/// Points of a circular arc from `start_angle` sweeping `sweep` radians
+/// (signed CCW), inclusive of both endpoints, tessellated so the chord error
+/// stays within `tolerance` drawing units, capped at [`MAX_ANGLE_STEP`] per
+/// segment and [`MAX_ARC_SEGMENTS`] segments. Deterministic.
+fn arc_points(
+    center: (f64, f64),
+    radius: f64,
+    start_angle: f64,
+    sweep: f64,
+    tolerance: f64,
+    warnings: &mut Vec<String>,
+) -> Vec<(f64, f64)> {
     let chord_limited_step = if tolerance >= radius {
         std::f64::consts::TAU
     } else {
         2.0 * (1.0 - tolerance / radius).acos()
     };
     let step = chord_limited_step.clamp(f64::EPSILON, MAX_ANGLE_STEP);
-    let mut segments = (theta.abs() / step).ceil() as usize;
+    let mut segments = (sweep.abs() / step).ceil() as usize;
     segments = segments.max(1);
     if segments > MAX_ARC_SEGMENTS {
         segments = MAX_ARC_SEGMENTS;
@@ -769,16 +801,115 @@ fn tessellate_bulge(
         ));
     }
 
-    let start_angle = (start.1 - center_y).atan2(start.0 - center_x);
-    (1..segments)
+    (0..=segments)
         .map(|i| {
-            let angle = start_angle + theta * (i as f64) / (segments as f64);
+            let angle = start_angle + sweep * (i as f64) / (segments as f64);
             (
-                center_x + radius * angle.cos(),
-                center_y + radius * angle.sin(),
+                center.0 + radius * angle.cos(),
+                center.1 + radius * angle.sin(),
             )
         })
         .collect()
+}
+
+/// DXF circles live in the OCS plane of their normal; tessellate CCW and
+/// close the ring.
+fn convert_circle(circle: &acadrust::entities::Circle, options: &GeometryOptions) -> EntityOutcome {
+    if !is_finite(&circle.center) || !circle.radius.is_finite() {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    if circle.radius <= 0.0 {
+        return EntityOutcome::Skipped("degenerate circle: non-positive radius".to_string());
+    }
+
+    let mut warnings = Vec::new();
+    let mut ocs_points = arc_points(
+        (circle.center.x, circle.center.y),
+        circle.radius,
+        0.0,
+        std::f64::consts::TAU,
+        options.curve_tolerance,
+        &mut warnings,
+    );
+    // The finisher closes the ring; drop the duplicated end point.
+    ocs_points.pop();
+
+    finish_curve(
+        ocs_points,
+        circle.center.z,
+        circle.normal,
+        true,
+        options,
+        warnings,
+    )
+}
+
+/// DXF arcs sweep counter-clockwise from start to end angle in the OCS plane.
+fn convert_arc(arc: &acadrust::entities::Arc, options: &GeometryOptions) -> EntityOutcome {
+    if !is_finite(&arc.center)
+        || !arc.radius.is_finite()
+        || !arc.start_angle.is_finite()
+        || !arc.end_angle.is_finite()
+    {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    if arc.radius <= 0.0 {
+        return EntityOutcome::Skipped("degenerate arc: non-positive radius".to_string());
+    }
+
+    let mut sweep = (arc.end_angle - arc.start_angle).rem_euclid(std::f64::consts::TAU);
+    if sweep <= f64::EPSILON {
+        sweep = std::f64::consts::TAU;
+    }
+
+    let mut warnings = Vec::new();
+    let ocs_points = arc_points(
+        (arc.center.x, arc.center.y),
+        arc.radius,
+        arc.start_angle,
+        sweep,
+        options.curve_tolerance,
+        &mut warnings,
+    );
+
+    finish_curve(
+        ocs_points,
+        arc.center.z,
+        arc.normal,
+        false,
+        options,
+        warnings,
+    )
+}
+
+/// Lift tessellated OCS curve points to WCS and build the final geometry,
+/// always marked as approximated.
+fn finish_curve(
+    ocs_points: Vec<(f64, f64)>,
+    ocs_z: f64,
+    normal: Vector3,
+    closed: bool,
+    options: &GeometryOptions,
+    mut warnings: Vec<String>,
+) -> EntityOutcome {
+    let ocs_to_wcs = Matrix3::arbitrary_axis(normal);
+    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(ocs_points.len() + 1);
+    let mut max_abs_z: f64 = 0.0;
+    for (x, y) in ocs_points {
+        let wcs = ocs_to_wcs.transform_point(Vector3::new(x, y, ocs_z));
+        if !is_finite(&wcs) {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        }
+        max_abs_z = max_abs_z.max(wcs.z.abs());
+        coordinates.push((wcs.x, wcs.y));
+    }
+
+    push_z_warning(&mut warnings, max_abs_z);
+    warnings.push(format!(
+        "arc segments tessellated with chord tolerance {} drawing units",
+        options.curve_tolerance
+    ));
+    finish_coordinates(coordinates, closed, true, options, warnings)
 }
 
 fn push_z_warning(warnings: &mut Vec<String>, max_abs_z: f64) {
@@ -1006,6 +1137,98 @@ mod tests {
     }
 
     #[test]
+    fn circle_tessellates_to_closed_ring_on_the_circle() {
+        let circle = EntityType::Circle(Circle::from_coords(5.0, -2.0, 0.0, 5.0));
+        match convert_entity(&circle, &opts(false)) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                warnings,
+            } => {
+                match geometry {
+                    GeometryValue::LineString { coordinates } => {
+                        assert_eq!(coordinates.first(), coordinates.last());
+                        assert!(coordinates.len() >= 25, "got {}", coordinates.len());
+                        for position in &coordinates {
+                            let radius =
+                                ((position[0] - 5.0).powi(2) + (position[1] + 2.0).powi(2)).sqrt();
+                            assert!((radius - 5.0).abs() < 1e-9);
+                        }
+                    }
+                    other => panic!("expected LineString, got {other:?}"),
+                }
+                assert!(
+                    extra_properties
+                        .iter()
+                        .any(|(key, value)| *key == "approximated"
+                            && *value == serde_json::Value::Bool(true))
+                );
+                assert!(warnings.iter().any(|w| w.contains("chord tolerance")));
+            }
+            _ => panic!("circle must convert"),
+        }
+    }
+
+    #[test]
+    fn circle_polygonizes_to_ccw_ring() {
+        let circle = EntityType::Circle(Circle::from_coords(0.0, 0.0, 0.0, 2.0));
+        match convert_entity(&circle, &opts(true)) {
+            EntityOutcome::Converted { geometry, .. } => match geometry {
+                GeometryValue::Polygon { coordinates } => {
+                    let ring = &coordinates[0];
+                    assert_eq!(ring.first(), ring.last());
+                    let tuples: Vec<(f64, f64)> = ring.iter().map(|p| (p[0], p[1])).collect();
+                    assert!(signed_area(&tuples) > 0.0, "ring must be CCW");
+                }
+                other => panic!("expected Polygon, got {other:?}"),
+            },
+            _ => panic!("circle must polygonize"),
+        }
+    }
+
+    #[test]
+    fn arc_preserves_endpoints_and_crosses_zero_angle() {
+        use acadrust::entities::Arc;
+
+        // From 270 degrees to 90 degrees: sweeps CCW through 0 degrees.
+        let arc = EntityType::Arc(Arc::from_coords(
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.5 * std::f64::consts::PI,
+            0.5 * std::f64::consts::PI,
+        ));
+        match convert_entity(&arc, &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => match geometry {
+                GeometryValue::LineString { coordinates } => {
+                    let first = coordinates.first().expect("start");
+                    let last = coordinates.last().expect("end");
+                    assert!((first[0] - 0.0).abs() < 1e-9 && (first[1] + 1.0).abs() < 1e-9);
+                    assert!((last[0] - 0.0).abs() < 1e-9 && (last[1] - 1.0).abs() < 1e-9);
+                    // Passes through (1, 0), never through (-1, 0).
+                    assert!(coordinates.iter().all(|p| p[0] > -1e-9));
+                    for position in &coordinates {
+                        let radius = (position[0].powi(2) + position[1].powi(2)).sqrt();
+                        assert!((radius - 1.0).abs() < 1e-9);
+                    }
+                }
+                other => panic!("expected LineString, got {other:?}"),
+            },
+            _ => panic!("arc must convert"),
+        }
+    }
+
+    #[test]
+    fn degenerate_circle_is_skipped() {
+        let circle = EntityType::Circle(Circle::from_coords(0.0, 0.0, 0.0, 0.0));
+        match convert_entity(&circle, &opts(false)) {
+            EntityOutcome::Skipped(reason) => assert!(reason.contains("radius")),
+            _ => panic!("zero-radius circle must be skipped"),
+        }
+    }
+
+    #[test]
     fn arc_segment_cap_is_reported() {
         let mut warnings = Vec::new();
         let interior = tessellate_bulge((0.0, 0.0), (10.0, 0.0), 1.0, 1e-7, &mut warnings);
@@ -1085,8 +1308,8 @@ mod tests {
     fn unsupported_types_are_counted_and_paper_space_is_excluded() {
         let mut document = CadDocument::with_version(DxfVersion::AC1027);
         document
-            .add_entity(EntityType::Circle(Circle::from_coords(0.0, 0.0, 0.0, 5.0)))
-            .expect("add circle");
+            .add_entity(EntityType::Text(acadrust::entities::Text::new()))
+            .expect("add text");
         document
             .add_entity(EntityType::Point(Point::from_coords(1.0, 1.0, 0.0)))
             .expect("add point");
@@ -1101,7 +1324,7 @@ mod tests {
         assert_eq!(extraction.excluded_paper_space, 1);
         let skipped: Vec<_> = extraction.skipped.keys().collect();
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].0, "CIRCLE");
+        assert_eq!(skipped[0].0, "TEXT");
         let samples = extraction.skipped.values().next().expect("skip entry");
         assert_eq!(samples.count, 1);
         assert_eq!(samples.samples.len(), 1);

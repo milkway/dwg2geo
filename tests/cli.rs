@@ -558,7 +558,7 @@ fn native_convert_writes_geojson_and_accounted_report() {
     );
 
     let features = geojson["features"].as_array().expect("features");
-    assert_eq!(features.len(), 4);
+    assert_eq!(features.len(), 5);
     let kinds: Vec<(&str, &str)> = features
         .iter()
         .map(|feature| {
@@ -575,6 +575,7 @@ fn native_convert_writes_geojson_and_accounted_report() {
             ("POINT", "Point"),
             ("LWPOLYLINE", "Polygon"),
             ("LWPOLYLINE", "LineString"),
+            ("CIRCLE", "Polygon"),
         ]
     );
     for feature in features {
@@ -602,13 +603,10 @@ fn native_convert_writes_geojson_and_accounted_report() {
 
     let native = &report["native"];
     assert_eq!(native["read_mode"], "strict");
-    assert_eq!(native["features_written"], 4);
-    assert_eq!(native["approximated_features"], 1);
+    assert_eq!(native["features_written"], 5);
+    assert_eq!(native["approximated_features"], 2);
     assert_eq!(native["excluded"]["paper_space"], 1);
-
-    let skipped = native["skipped"].as_array().expect("skipped");
-    assert_eq!(skipped.len(), 1);
-    assert_eq!(skipped[0]["entity_type"], "CIRCLE");
+    assert_eq!(native["skipped"].as_array().expect("skipped").len(), 0);
 }
 
 #[cfg(feature = "native-backend")]
