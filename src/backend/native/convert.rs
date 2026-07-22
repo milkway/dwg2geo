@@ -4757,4 +4757,167 @@ mod tests {
             "every top-level entity must reach exactly one outcome"
         );
     }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        use super::super::{Affine, arc_points, tessellate_bulge};
+        use crate::backend::native::calibrate::{Calibration, ControlPoint, solve};
+
+        proptest! {
+            /// Every tessellated arc point lies on the circle, the endpoints
+            /// are analytically exact, and (when no segment cap fired) each
+            /// chord's sagitta respects the requested tolerance.
+            #[test]
+            fn arc_points_stay_on_the_circle_within_tolerance(
+                cx in -1.0e6f64..1.0e6,
+                cy in -1.0e6f64..1.0e6,
+                radius in 1.0e-3f64..1.0e5,
+                start in -std::f64::consts::TAU..std::f64::consts::TAU,
+                sweep in 0.01f64..std::f64::consts::TAU,
+                negate in proptest::bool::ANY,
+                tolerance in 1.0e-4f64..10.0,
+            ) {
+                let sweep = if negate { -sweep } else { sweep };
+                let mut warnings = Vec::new();
+                let points = arc_points((cx, cy), radius, start, sweep, tolerance, &mut warnings);
+
+                prop_assert!(points.len() >= 2);
+                // Scale-aware equality: coordinates are center +- radius.
+                let scale = cx.abs().max(cy.abs()).max(radius).max(1.0);
+                let epsilon = 1e-9 * scale;
+
+                let expected_first = (cx + radius * start.cos(), cy + radius * start.sin());
+                let end_angle = start + sweep;
+                let expected_last = (cx + radius * end_angle.cos(), cy + radius * end_angle.sin());
+                prop_assert!((points[0].0 - expected_first.0).abs() <= epsilon);
+                prop_assert!((points[0].1 - expected_first.1).abs() <= epsilon);
+                let last = points[points.len() - 1];
+                prop_assert!((last.0 - expected_last.0).abs() <= epsilon);
+                prop_assert!((last.1 - expected_last.1).abs() <= epsilon);
+
+                for (x, y) in &points {
+                    let distance = (x - cx).hypot(y - cy);
+                    prop_assert!(
+                        (distance - radius).abs() <= epsilon,
+                        "point off circle by {}",
+                        (distance - radius).abs()
+                    );
+                }
+
+                if warnings.is_empty() {
+                    let step = sweep.abs() / (points.len() - 1) as f64;
+                    let sagitta = radius * (1.0 - (step / 2.0).cos());
+                    prop_assert!(
+                        sagitta <= tolerance * (1.0 + 1e-9) + epsilon,
+                        "sagitta {sagitta} exceeds tolerance {tolerance}"
+                    );
+                }
+            }
+
+            /// Bulge tessellation returns interior points on the arc through
+            /// the two endpoints with the given bulge.
+            #[test]
+            fn bulge_points_lie_on_the_defined_arc(
+                sx in -1.0e4f64..1.0e4,
+                sy in -1.0e4f64..1.0e4,
+                dx in 0.1f64..1.0e3,
+                dy in -1.0e3f64..1.0e3,
+                bulge in 0.05f64..1.5,
+                negate in proptest::bool::ANY,
+                tolerance in 1.0e-3f64..1.0,
+            ) {
+                let bulge = if negate { -bulge } else { bulge };
+                let start = (sx, sy);
+                let end = (sx + dx, sy + dy);
+                let mut warnings = Vec::new();
+                let points = tessellate_bulge(start, end, bulge, tolerance, &mut warnings);
+
+                // Reconstruct the arc's circle analytically.
+                let chord = dx.hypot(dy);
+                let sagitta = bulge.abs() * chord / 2.0;
+                let radius = (chord * chord / 4.0 + sagitta * sagitta) / (2.0 * sagitta);
+                let side = if bulge > 0.0 { 1.0 } else { -1.0 };
+                let apothem = radius - sagitta;
+                let center = (
+                    (start.0 + end.0) / 2.0 + (-dy / chord) * apothem * side,
+                    (start.1 + end.1) / 2.0 + (dx / chord) * apothem * side,
+                );
+
+                let scale = sx.abs().max(sy.abs()).max(radius).max(1.0);
+                let epsilon = 1e-9 * scale;
+                for (x, y) in &points {
+                    let distance = (x - center.0).hypot(y - center.1);
+                    prop_assert!(
+                        (distance - radius).abs() <= epsilon,
+                        "interior point off the bulge circle by {}",
+                        (distance - radius).abs()
+                    );
+                }
+            }
+
+            /// Affine composition is exactly application order:
+            /// (a . b)(p) == a(b(p)).
+            #[test]
+            fn affine_composition_matches_sequential_application(
+                translate_x in -1.0e5f64..1.0e5,
+                translate_y in -1.0e5f64..1.0e5,
+                angle in -std::f64::consts::TAU..std::f64::consts::TAU,
+                scale_x in 0.01f64..100.0,
+                scale_y in 0.01f64..100.0,
+                px in -1.0e4f64..1.0e4,
+                py in -1.0e4f64..1.0e4,
+            ) {
+                use acadrust::types::Vector3;
+
+                let a = Affine::from_translation(Vector3::new(translate_x, translate_y, 0.0))
+                    .compose(&Affine::rotation_z(angle));
+                let b = Affine::scale(scale_x, scale_y, 1.0)
+                    .compose(&Affine::from_translation(Vector3::new(-translate_y, px, 0.0)));
+                let point = Vector3::new(px, py, 0.0);
+
+                let composed = a.compose(&b).apply(point);
+                let sequential = a.apply(b.apply(point));
+                let magnitude = sequential.x.abs().max(sequential.y.abs()).max(1.0);
+                prop_assert!((composed.x - sequential.x).abs() <= 1e-9 * magnitude);
+                prop_assert!((composed.y - sequential.y).abs() <= 1e-9 * magnitude);
+            }
+
+            /// Calibration recovers a known similarity transform from any
+            /// non-degenerate control-point set.
+            #[test]
+            fn calibration_recovers_known_similarity(
+                a in -5.0f64..5.0,
+                b in -5.0f64..5.0,
+                tx in -1.0e5f64..1.0e5,
+                ty in -1.0e5f64..1.0e5,
+                base_x in -1.0e4f64..1.0e4,
+                base_y in -1.0e4f64..1.0e4,
+                spread in 1.0f64..1.0e3,
+            ) {
+                prop_assume!(a.hypot(b) > 1e-3);
+                let truth = Calibration { a, b, tx, ty };
+                let sources = [
+                    (base_x, base_y),
+                    (base_x + spread, base_y),
+                    (base_x, base_y + spread),
+                ];
+                let points: Vec<ControlPoint> = sources
+                    .iter()
+                    .map(|&source| ControlPoint {
+                        source,
+                        target: truth.apply(source),
+                    })
+                    .collect();
+
+                let (fitted, quality) = solve(&points).expect("solvable");
+                let magnitude = tx.abs().max(ty.abs()).max(1.0);
+                prop_assert!((fitted.a - a).abs() <= 1e-6);
+                prop_assert!((fitted.b - b).abs() <= 1e-6);
+                prop_assert!((fitted.tx - tx).abs() <= 1e-6 * magnitude);
+                prop_assert!((fitted.ty - ty).abs() <= 1e-6 * magnitude);
+                prop_assert!(quality.rms_error <= 1e-6 * magnitude.max(spread));
+            }
+        }
+    }
 }
