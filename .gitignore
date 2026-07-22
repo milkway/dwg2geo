@@ -7,9 +7,9 @@
 *.dwg
 *.report.json
 
-# Keep sample instructions and metadata, but never commit client drawings.
+# Sample data is client-derived; keep only the instructions in git.
+/samples/*
 !/samples/README.md
-!/samples/*.metadata.json
 
 .DS_Store
 .idea/

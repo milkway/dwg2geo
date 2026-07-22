@@ -31,7 +31,7 @@ Convert options for traceability and control:
 - `--include-layers` / `--exclude-layers` restrict the GDAL route to a comma-separated layer subset via an attribute filter; they require `--source-crs`.
 - Overwrites are explicit: an existing output fails without `--force`, and even with `--force` the previous file is replaced only after the new output is complete. Failed runs remove their partial output; nothing is silently truncated.
 
-The uploaded reference drawing is **not included** in this repository. Its observed metadata is stored in `samples/corredor-sul.metadata.json`.
+The uploaded reference drawing and all data derived from it (metadata, entity histogram, validation notes) are **kept out of this repository** — the `samples/` directory is git-ignored except for `samples/README.md`. Regenerate the metadata and histogram locally with `dwg2geo inspect <file> --json`.
 
 ## Why fail closed on CRS?
 
