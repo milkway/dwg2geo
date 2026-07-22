@@ -1,100 +1,82 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 430" role="img" aria-label="dwg2geo architecture: DWG input flows to a header inspector, an external LibreDWG/GDAL backend, or the pure-Rust native backend that builds a CAD-neutral model and writes GeoJSON with a report.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 440" role="img" aria-label="dwg2geo architecture: a DWG file flows to a header inspector, an external LibreDWG/GDAL backend, or the pure-Rust native backend that builds a CAD-neutral model and writes GeoJSON with a report.">
   <style>
-    :root { color-scheme: light dark; }
-    .bg { fill: none; }
     .box { fill: #ffffff; stroke: #dbe3f4; }
     .box.native { fill: #f4f1ff; stroke: #c9bcff; }
     .box.io { fill: #eafaf5; stroke: #a9e6d5; }
-    .lane { fill: #f6f8fe; stroke: #e3e9f7; }
-    .title { fill: #10192e; font-weight: 700; }
+    .lane { fill: #f6f8fe; stroke: #e6ecf9; }
     .lbl { fill: #10192e; font-weight: 600; }
     .sub { fill: #56648a; }
-    .edge { stroke: #9aa8cc; }
-    .tag { fill: #56648a; font-weight: 700; letter-spacing: .04em; }
-    .purple { fill: #7c5cff; } .teal { fill: #17b898; }
+    .tag { fill: #56648a; font-weight: 700; letter-spacing: .045em; }
+    .tag.p { fill: #7c5cff; }
+    .edge { fill: none; stroke: #9aa8cc; stroke-width: 1.6; }
     @media (prefers-color-scheme: dark) {
       .box { fill: #16203f; stroke: #2b3a60; }
       .box.native { fill: #1d1b3f; stroke: #4a3f7f; }
       .box.io { fill: #123329; stroke: #1f5a49; }
-      .lane { fill: #10192e; stroke: #24314f; }
-      .title, .lbl { fill: #e8edf7; }
-      .sub, .tag { fill: #9fb0d0; }
+      .lane { fill: #10192e; stroke: #223050; }
+      .lbl { fill: #e8edf7; } .sub, .tag { fill: #9fb0d0; } .tag.p { fill: #a99bff; }
       .edge { stroke: #46577e; }
     }
     text { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-    .box, .lane { rx: 12; }
-    .edge { fill: none; stroke-width: 2; }
   </style>
-
   <defs>
-    <marker id="arch-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#9aa8cc"/>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,1.5 L9,5 L0,8.5 z" fill="#9aa8cc"/>
     </marker>
   </defs>
-  <rect class="bg" width="960" height="430"/>
 
   <!-- Input -->
-  <rect class="box io" x="24" y="176" width="150" height="72" rx="12"/>
-  <text class="lbl" x="99" y="206" text-anchor="middle" font-size="16">DWG file</text>
-  <text class="sub" x="99" y="228" text-anchor="middle" font-size="12.5">AC1027 (2013+)</text>
+  <rect class="box io" x="24" y="182" width="150" height="76" rx="12"/>
+  <text class="lbl" x="99" y="214" text-anchor="middle" font-size="16">DWG file</text>
+  <text class="sub" x="99" y="236" text-anchor="middle" font-size="12.5">AC1027 (2013+)</text>
 
-  <!-- Lanes background -->
-  <rect class="lane" x="210" y="26" width="510" height="86" rx="12"/>
-  <rect class="lane" x="210" y="140" width="510" height="86" rx="12"/>
-  <rect class="lane" x="210" y="254" width="510" height="150" rx="12"/>
-
-  <!-- Lane tags -->
-  <text class="tag" x="228" y="46" font-size="11">ALWAYS AVAILABLE</text>
-  <text class="tag" x="228" y="160" font-size="11">EXTERNAL BACKEND · shells out</text>
-  <text class="tag purple" x="228" y="274" font-size="11">NATIVE BACKEND · pure Rust, in-process</text>
+  <!-- Lanes -->
+  <rect class="lane" x="206" y="28"  width="712" height="88"  rx="12"/>
+  <rect class="lane" x="206" y="140" width="712" height="88"  rx="12"/>
+  <rect class="lane" x="206" y="252" width="712" height="160" rx="12"/>
+  <text class="tag"   x="224" y="48"  font-size="11">ALWAYS AVAILABLE</text>
+  <text class="tag"   x="224" y="160" font-size="11">EXTERNAL BACKEND · shells out to CLI tools</text>
+  <text class="tag p" x="224" y="272" font-size="11">NATIVE BACKEND · pure Rust, in-process</text>
 
   <!-- Edges from input -->
-  <path class="edge" d="M174,196 C196,196 196,80 226,80" marker-end="url(#arch-arrow)"/>
-  <path class="edge" d="M174,212 C196,212 196,190 226,190" marker-end="url(#arch-arrow)"/>
-  <path class="edge" d="M174,228 C196,228 196,326 226,326" marker-end="url(#arch-arrow)"/>
+  <path class="edge" d="M174,204 C194,204 196,84 222,84"   marker-end="url(#a)"/>
+  <path class="edge" d="M174,220 C194,220 196,196 222,196" marker-end="url(#a)"/>
+  <path class="edge" d="M174,236 C194,236 196,318 222,318" marker-end="url(#a)"/>
 
-  <!-- Lane 1: inspector -->
-  <rect class="box" x="236" y="58" width="190" height="42" rx="10"/>
-  <text class="lbl" x="331" y="84" text-anchor="middle" font-size="13.5">Header inspector</text>
-  <path class="edge" d="M426,79 L470,79" marker-end="url(#arch-arrow)"/>
-  <rect class="box" x="474" y="58" width="230" height="42" rx="10"/>
-  <text class="sub" x="589" y="84" text-anchor="middle" font-size="12.5">signature · size · SHA-256</text>
+  <!-- Lane 1 -->
+  <rect class="box" x="230" y="64" width="180" height="44" rx="10"/>
+  <text class="lbl" x="320" y="91" text-anchor="middle" font-size="13.5">Header inspector</text>
+  <path class="edge" d="M410,86 L436,86" marker-end="url(#a)"/>
+  <rect class="box" x="440" y="64" width="250" height="44" rx="10"/>
+  <text class="sub" x="565" y="91" text-anchor="middle" font-size="12.5">signature · size · SHA-256</text>
 
-  <!-- Lane 2: external -->
-  <rect class="box" x="236" y="172" width="130" height="42" rx="10"/>
-  <text class="lbl" x="301" y="198" text-anchor="middle" font-size="13">dwgread → DXF</text>
-  <path class="edge" d="M366,193 L400,193" marker-end="url(#arch-arrow)"/>
-  <rect class="box" x="404" y="172" width="150" height="42" rx="10"/>
-  <text class="lbl" x="479" y="198" text-anchor="middle" font-size="13">ogr2ogr (GDAL)</text>
-  <path class="edge" d="M554,193 L588,193" marker-end="url(#arch-arrow)"/>
-  <rect class="box io" x="592" y="172" width="112" height="42" rx="10"/>
-  <text class="lbl" x="648" y="198" text-anchor="middle" font-size="13">GeoJSON</text>
+  <!-- Lane 2 -->
+  <rect class="box" x="230" y="176" width="150" height="44" rx="10"/>
+  <text class="lbl" x="305" y="203" text-anchor="middle" font-size="13">dwgread → DXF</text>
+  <path class="edge" d="M380,198 L406,198" marker-end="url(#a)"/>
+  <rect class="box" x="410" y="176" width="160" height="44" rx="10"/>
+  <text class="lbl" x="490" y="203" text-anchor="middle" font-size="13">ogr2ogr (GDAL)</text>
+  <path class="edge" d="M570,198 L596,198" marker-end="url(#a)"/>
+  <rect class="box io" x="600" y="176" width="110" height="44" rx="10"/>
+  <text class="lbl" x="655" y="203" text-anchor="middle" font-size="13">GeoJSON</text>
 
-  <!-- Lane 3: native -->
-  <rect class="box native" x="236" y="286" width="120" height="48" rx="10"/>
-  <text class="lbl" x="296" y="308" text-anchor="middle" font-size="13">acadrust</text>
-  <text class="sub" x="296" y="325" text-anchor="middle" font-size="11.5">DWG reader</text>
-  <path class="edge" d="M356,310 L392,310" marker-end="url(#arch-arrow)"/>
-  <rect class="box native" x="396" y="286" width="150" height="48" rx="10"/>
-  <text class="lbl" x="471" y="308" text-anchor="middle" font-size="13">CAD-neutral model</text>
-  <text class="sub" x="471" y="325" text-anchor="middle" font-size="11.5">CadFeature / CadGeometry</text>
-  <path class="edge" d="M546,310 L582,310" marker-end="url(#arch-arrow)"/>
-  <rect class="box native" x="586" y="286" width="118" height="48" rx="10"/>
-  <text class="lbl" x="645" y="308" text-anchor="middle" font-size="13">Writer</text>
-  <text class="sub" x="645" y="325" text-anchor="middle" font-size="11.5">single GeoJSON exit</text>
+  <!-- Lane 3 -->
+  <rect class="box native" x="230" y="286" width="130" height="52" rx="10"/>
+  <text class="lbl" x="295" y="309" text-anchor="middle" font-size="13">acadrust</text>
+  <text class="sub" x="295" y="326" text-anchor="middle" font-size="11.5">DWG reader</text>
+  <path class="edge" d="M360,312 L388,312" marker-end="url(#a)"/>
+  <rect class="box native" x="392" y="286" width="176" height="52" rx="10"/>
+  <text class="lbl" x="480" y="309" text-anchor="middle" font-size="13">CAD-neutral model</text>
+  <text class="sub" x="480" y="326" text-anchor="middle" font-size="11.5">CadFeature / CadGeometry</text>
+  <path class="edge" d="M568,312 L596,312" marker-end="url(#a)"/>
+  <rect class="box native" x="600" y="286" width="130" height="52" rx="10"/>
+  <text class="lbl" x="665" y="309" text-anchor="middle" font-size="13">Writer</text>
+  <text class="sub" x="665" y="326" text-anchor="middle" font-size="11.5">single GeoJSON exit</text>
+  <path class="edge" d="M730,312 L758,312" marker-end="url(#a)"/>
+  <rect class="box io" x="762" y="286" width="140" height="52" rx="10"/>
+  <text class="lbl" x="832" y="309" text-anchor="middle" font-size="13">GeoJSON</text>
+  <text class="sub" x="832" y="326" text-anchor="middle" font-size="11.5">+ report.json</text>
 
-  <!-- Native pipeline chips -->
-  <text class="sub" x="396" y="360" font-size="11.5">pipeline · one sink per feature:</text>
-  <g font-size="11" font-weight="600">
-    <rect class="box" x="396" y="368" width="120" height="24" rx="12"/><text class="lbl" x="456" y="384" text-anchor="middle">block / OCS→WCS</text>
-    <rect class="box" x="524" y="368" width="96" height="24" rx="12"/><text class="lbl" x="572" y="384" text-anchor="middle">tessellate</text>
-    <rect class="box" x="628" y="368" width="112" height="24" rx="12"/><text class="lbl" x="684" y="384" text-anchor="middle">CRS / calibrate</text>
-    <rect class="box" x="748" y="368" width="104" height="24" rx="12"/><text class="lbl" x="800" y="384" text-anchor="middle">validate</text>
-  </g>
-
-  <!-- Native outputs -->
-  <path class="edge" d="M704,310 L742,310" marker-end="url(#arch-arrow)"/>
-  <rect class="box io" x="746" y="286" width="112" height="48" rx="10"/>
-  <text class="lbl" x="802" y="308" text-anchor="middle" font-size="13">GeoJSON</text>
-  <text class="sub" x="802" y="325" text-anchor="middle" font-size="11.5">+ report.json</text>
+  <!-- Native pipeline caption -->
+  <text class="sub" x="230" y="374" font-size="11.5">per feature: block expand · OCS→WCS · tessellate · CRS / calibrate · validate &amp; account</text>
 </svg>

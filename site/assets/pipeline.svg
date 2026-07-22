@@ -1,81 +1,80 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" role="img" aria-label="dwg2geo conversion pipeline: choose a coordinate policy (source CRS, control points, or local), resolve units, tessellate and transform, validate and account, then write GeoJSON or GeoJSONSeq with a deterministic report.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 340" role="img" aria-label="dwg2geo conversion pipeline: choose a coordinate policy (source CRS, control points, or local), resolve units, tessellate and transform, validate and account, then write GeoJSON or GeoJSONSeq with a deterministic report.">
   <style>
-    :root { color-scheme: light dark; }
     .box { fill: #ffffff; stroke: #dbe3f4; }
     .box.pol { fill: #f4f1ff; stroke: #c9bcff; }
     .box.out { fill: #eafaf5; stroke: #a9e6d5; }
     .lbl { fill: #10192e; font-weight: 700; }
-    .sub { fill: #56648a; font-weight: 500; }
+    .sub { fill: #56648a; }
     .flag { fill: #7c5cff; font-weight: 700; }
     .tag { fill: #56648a; font-weight: 700; letter-spacing: .05em; }
-    .edge { fill: none; stroke: #9aa8cc; stroke-width: 2; }
+    .edge { fill: none; stroke: #9aa8cc; stroke-width: 1.6; }
     @media (prefers-color-scheme: dark) {
       .box { fill: #16203f; stroke: #2b3a60; }
       .box.pol { fill: #1d1b3f; stroke: #4a3f7f; }
       .box.out { fill: #123329; stroke: #1f5a49; }
-      .lbl { fill: #e8edf7; } .sub, .tag { fill: #9fb0d0; }
+      .lbl { fill: #e8edf7; } .sub, .tag { fill: #9fb0d0; } .flag { fill: #a99bff; }
       .edge { stroke: #46577e; }
     }
     text { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
   </style>
   <defs>
-    <marker id="pipe-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#9aa8cc"/>
+    <marker id="p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,1.5 L9,5 L0,8.5 z" fill="#9aa8cc"/>
     </marker>
   </defs>
 
-  <!-- Stage 1: coordinate policy (fail closed) -->
-  <text class="tag" x="20" y="34" font-size="11">1 · COORDINATE POLICY — fail closed</text>
-  <rect class="box pol" x="20" y="44" width="196" height="120" rx="12"/>
-  <text class="lbl" x="118" y="70" text-anchor="middle" font-size="13.5">Pick exactly one</text>
-  <text class="flag" x="36" y="94" font-size="12">--source-crs</text><text class="sub" x="130" y="94" font-size="11.5">+ PROJ reproject</text>
-  <text class="flag" x="36" y="116" font-size="12">--control-point</text><text class="sub" x="140" y="116" font-size="11.5">calibrate</text>
-  <text class="flag" x="36" y="138" font-size="12">--allow-local-…</text><text class="sub" x="146" y="138" font-size="11.5">raw units</text>
-  <text class="sub" x="118" y="156" text-anchor="middle" font-size="11">else: refuse</text>
+  <!-- Stage 1: coordinate policy -->
+  <text class="tag" x="24" y="34" font-size="11">1 · COORDINATE POLICY — fail closed</text>
+  <rect class="box pol" x="24" y="44" width="216" height="150" rx="12"/>
+  <text class="lbl" x="40" y="70" font-size="13">Pick exactly one</text>
+  <text class="flag" x="40" y="98"  font-size="12">--source-crs</text><text class="sub" x="40" y="114" font-size="11">reproject with PROJ</text>
+  <text class="flag" x="40" y="138" font-size="12">--control-point</text><text class="sub" x="40" y="154" font-size="11">local calibration</text>
+  <text class="flag" x="40" y="178" font-size="12">--allow-local-coordinates</text>
 
-  <path class="edge" d="M216,104 L250,104" marker-end="url(#pipe-arrow)"/>
+  <path class="edge" d="M240,119 L268,119" marker-end="url(#p)"/>
 
   <!-- Stage 2: units -->
-  <text class="tag" x="252" y="34" font-size="11">2 · UNITS</text>
-  <rect class="box" x="252" y="44" width="170" height="120" rx="12"/>
-  <text class="lbl" x="337" y="72" text-anchor="middle" font-size="13">Resolve unit</text>
-  <text class="sub" x="337" y="94" text-anchor="middle" font-size="11.5">header only if</text>
-  <text class="sub" x="337" y="110" text-anchor="middle" font-size="11.5">INSUNITS ↔ MEASUREMENT</text>
-  <text class="sub" x="337" y="126" text-anchor="middle" font-size="11.5">agree, else</text>
-  <text class="flag" x="337" y="146" text-anchor="middle" font-size="12">--source-units</text>
+  <text class="tag" x="272" y="34" font-size="11">2 · UNITS</text>
+  <rect class="box" x="272" y="44" width="150" height="150" rx="12"/>
+  <text class="lbl" x="347" y="82"  text-anchor="middle" font-size="13">Resolve unit</text>
+  <text class="sub" x="347" y="106" text-anchor="middle" font-size="11">header only when</text>
+  <text class="sub" x="347" y="122" text-anchor="middle" font-size="11">INSUNITS agrees</text>
+  <text class="sub" x="347" y="138" text-anchor="middle" font-size="11">with MEASUREMENT</text>
+  <text class="sub" x="347" y="158" text-anchor="middle" font-size="11">else require</text>
+  <text class="flag" x="347" y="176" text-anchor="middle" font-size="12">--source-units</text>
 
-  <path class="edge" d="M422,104 L456,104" marker-end="url(#pipe-arrow)"/>
+  <path class="edge" d="M422,119 L450,119" marker-end="url(#p)"/>
 
   <!-- Stage 3: geometry -->
-  <text class="tag" x="458" y="34" font-size="11">3 · GEOMETRY</text>
-  <rect class="box" x="458" y="44" width="180" height="120" rx="12"/>
-  <text class="lbl" x="548" y="72" text-anchor="middle" font-size="13">Per feature</text>
-  <text class="sub" x="548" y="94" text-anchor="middle" font-size="11.5">block expand · OCS→WCS</text>
-  <text class="sub" x="548" y="112" text-anchor="middle" font-size="11.5">tessellate under</text>
-  <text class="flag" x="548" y="130" text-anchor="middle" font-size="12">--curve-tolerance</text>
-  <text class="sub" x="548" y="150" text-anchor="middle" font-size="11.5">transform coordinates</text>
+  <text class="tag" x="454" y="34" font-size="11">3 · GEOMETRY</text>
+  <rect class="box" x="454" y="44" width="180" height="150" rx="12"/>
+  <text class="lbl" x="544" y="82"  text-anchor="middle" font-size="13">Per feature</text>
+  <text class="sub" x="544" y="106" text-anchor="middle" font-size="11">block expand · OCS→WCS</text>
+  <text class="sub" x="544" y="126" text-anchor="middle" font-size="11">tessellate under</text>
+  <text class="flag" x="544" y="144" text-anchor="middle" font-size="12">--curve-tolerance</text>
+  <text class="sub" x="544" y="168" text-anchor="middle" font-size="11">transform coordinates</text>
 
-  <path class="edge" d="M638,104 L672,104" marker-end="url(#pipe-arrow)"/>
+  <path class="edge" d="M634,119 L662,119" marker-end="url(#p)"/>
 
-  <!-- Stage 4: validate & account -->
-  <text class="tag" x="674" y="34" font-size="11">4 · VALIDATE</text>
-  <rect class="box" x="674" y="44" width="180" height="120" rx="12"/>
-  <text class="lbl" x="764" y="72" text-anchor="middle" font-size="13">Account &amp; check</text>
-  <text class="sub" x="764" y="94" text-anchor="middle" font-size="11.5">every entity accounted</text>
-  <text class="sub" x="764" y="112" text-anchor="middle" font-size="11.5">rings · bbox · outliers</text>
-  <text class="sub" x="764" y="130" text-anchor="middle" font-size="11.5">WGS84 extent (fail-safe)</text>
-  <text class="flag" x="764" y="150" text-anchor="middle" font-size="12">--validate-boundary</text>
+  <!-- Stage 4: validate -->
+  <text class="tag" x="666" y="34" font-size="11">4 · VALIDATE</text>
+  <rect class="box" x="666" y="44" width="192" height="150" rx="12"/>
+  <text class="lbl" x="762" y="82"  text-anchor="middle" font-size="13">Account &amp; check</text>
+  <text class="sub" x="762" y="106" text-anchor="middle" font-size="11">every entity accounted</text>
+  <text class="sub" x="762" y="124" text-anchor="middle" font-size="11">rings · bbox · outliers</text>
+  <text class="sub" x="762" y="142" text-anchor="middle" font-size="11">WGS84 extent (fail-safe)</text>
+  <text class="flag" x="762" y="170" text-anchor="middle" font-size="12">--validate-boundary</text>
 
-  <!-- down to outputs -->
-  <path class="edge" d="M764,164 L764,196" marker-end="url(#pipe-arrow)"/>
+  <!-- to output -->
+  <path class="edge" d="M762,194 L762,224" marker-end="url(#p)"/>
 
   <!-- Stage 5: output -->
-  <text class="tag" x="20" y="212" font-size="11">5 · OUTPUT — deterministic</text>
-  <rect class="box out" x="470" y="220" width="220" height="56" rx="12"/>
-  <text class="lbl" x="580" y="244" text-anchor="middle" font-size="13">GeoJSON / GeoJSONSeq</text>
-  <text class="sub" x="580" y="264" text-anchor="middle" font-size="11.5">via --output-format</text>
-  <rect class="box out" x="704" y="220" width="150" height="56" rx="12"/>
-  <text class="lbl" x="779" y="244" text-anchor="middle" font-size="13">report.json</text>
-  <text class="sub" x="779" y="264" text-anchor="middle" font-size="11.5">options · checks · hash</text>
-  <path class="edge" d="M690,248 L700,248" marker-end="url(#pipe-arrow)"/>
+  <text class="tag" x="452" y="244" font-size="11">5 · OUTPUT — deterministic</text>
+  <rect class="box out" x="452" y="254" width="230" height="60" rx="12"/>
+  <text class="lbl" x="567" y="280" text-anchor="middle" font-size="13">GeoJSON / GeoJSONSeq</text>
+  <text class="sub" x="567" y="300" text-anchor="middle" font-size="11">via --output-format</text>
+  <path class="edge" d="M682,284 L706,284" marker-end="url(#p)"/>
+  <rect class="box out" x="710" y="254" width="150" height="60" rx="12"/>
+  <text class="lbl" x="785" y="280" text-anchor="middle" font-size="13">report.json</text>
+  <text class="sub" x="785" y="300" text-anchor="middle" font-size="11">options · checks · hash</text>
 </svg>
