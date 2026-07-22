@@ -7,9 +7,8 @@
 *.dwg
 *.report.json
 
-# Sample data is client-derived; keep only the instructions in git.
-/samples/*
-!/samples/README.md
+# Sample data is client-derived — the whole folder stays local.
+/samples/
 
 .DS_Store
 .idea/
@@ -25,5 +24,6 @@
 /CLAUDE.md
 /AGENTS.md
 /PROMPT.md
-/docs/PLAN.md
 /prompts/
+# Internal documentation — kept local, not published
+/docs/

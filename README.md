@@ -31,7 +31,7 @@ Convert options for traceability and control:
 - `--include-layers` / `--exclude-layers` restrict the GDAL route to a comma-separated layer subset via an attribute filter; they require `--source-crs`.
 - Overwrites are explicit: an existing output fails without `--force`, and even with `--force` the previous file is replaced only after the new output is complete. Failed runs remove their partial output; nothing is silently truncated.
 
-The uploaded reference drawing and all data derived from it (metadata, entity histogram, validation notes) are **kept out of this repository** — the `samples/` directory is git-ignored except for `samples/README.md`. Regenerate the metadata and histogram locally with `dwg2geo inspect <file> --json`.
+The uploaded reference drawing and all data derived from it (metadata, entity histogram, validation notes) are **kept out of this repository** — the entire `samples/` directory is git-ignored. Regenerate the metadata and histogram locally with `dwg2geo inspect <file> --json`.
 
 ## Why fail closed on CRS?
 
@@ -118,20 +118,50 @@ With the feature enabled:
 - Without a known CRS, `--control-point "DX,DY=X,Y"` (two or more, native backend) georeferences by a local similarity calibration — rotation, uniform scale, and translation only, so geometry is never sheared. Three or more points report per-point residuals, RMS, and max error in the sidecar report; the output's `dwg2geo` member is marked `calibrated`.
 - `INSERT` block references are expanded into their block geometry by default (`--explode-blocks` documents the choice): translation, insert-normal orientation, rotation, non-uniform scale, MINSERT row/column grids, and nesting up to 16 levels are composed per instance, with recursive or missing block definitions reported as failed INSERTs. Expanded features carry a `block_path` property and instance-unique ids; block content on layer `0` inherits the insert's layer (the original is kept in `source_layer`). `--preserve-inserts` instead emits each INSERT as a point feature with `block_name`, rotation, and attribute values; inserts with attributes also emit that anchor point when exploding. Every feature carries resolved style metadata: ByLayer/ByBlock colors and linetypes are resolved through the layer table and the insert chain into `color_index`/`color_rgb`/`linetype` (unresolvable policies are emitted verbatim), and text rotation inside blocks follows the insert's rotation.
 
-The separate `native-reproject` feature adds the `proj` crate for native reprojection; it needs system PROJ >= 9.6 or a build toolchain with cmake and sqlite3 (see `docs/DECISIONS.md`, ADR-009).
+The separate `native-reproject` feature adds the `proj` crate for native reprojection; it needs system PROJ >= 9.6 or a build toolchain with cmake and sqlite3.
 
 ## Repository map
 
 ```text
-src/                    Rust CLI source
-samples/                local-only drawings and reference metadata
-docs/ARCHITECTURE.md    target architecture and boundaries
-docs/ENTITY_MAPPING.md  CAD-to-GeoJSON mapping rules
-docs/DECISIONS.md       architectural decisions (ADRs)
-docs/LICENSING.md       LibreDWG/GDAL licensing and distribution boundaries
-docs/DISTRIBUTION.md    container, SBOM, and license-report guidance
-docs/RISKS.md           engineering and delivery risks
+src/                     Rust CLI source
+tests/                   integration, golden, differential, and e2e tests
+samples/                 local-only drawings and derived data (git-ignored)
+THIRD-PARTY-LICENSES.md  full dependency license report
+sbom.cdx.json            CycloneDX software bill of materials
+Dockerfile               slim, native-only container image
 ```
+
+## Architecture
+
+```text
+DWG input
+   |
+   +--> header inspector (always available: signature, size, SHA-256)
+   |
+   +--> external backend: LibreDWG -> DXF -> GDAL reprojection -> GeoJSON
+   |
+   +--> native backend: acadrust -> CAD-neutral model (CadFeature/CadGeometry)
+                                       |
+                                       +--> block/INSERT expansion, OCS->WCS
+                                       +--> deterministic curve tessellation
+                                       +--> geometry validation & accounting
+                                       +--> CRS/unit transform or calibration
+                                       +--> single GeoJSON / GeoJSONSeq writer
+                                       +--> sidecar conversion report
+```
+
+- **CLI** parses arguments and rejects ambiguous CRS/unit behavior before any expensive work.
+- **Header inspector** reads only stable file-level metadata and works without any CAD library.
+- **Backend adapters** — `external` shells out to `dwgread`/`ogr2ogr`; `native` adapts `acadrust`. `acadrust` types never leak past the adapter.
+- **CAD-neutral model** (`CadFeature`/`CadGeometry`) is the internal contract every transform, validity check, and statistic operates on; the writer is the single place it becomes GeoJSON (ADR-004).
+- **Streaming pipeline** — extraction hands each feature to a sink; the GeoJSONSeq route writes and drops it immediately, so memory is bounded by the parsed document, not the feature count.
+
+## License
+
+`dwg2geo` is released under the **MIT license** (`LICENSE-MIT`). Its own binaries, the prebuilt releases, and the slim container are MIT-clean.
+
+- The native backend's Rust dependencies are permissive (MIT / Apache-2.0 / BSD-3-Clause / Unicode-3.0) plus exactly one weak-copyleft crate, **`acadrust` (MPL-2.0)** — file-level copyleft that places no terms on `dwg2geo`'s source and does not restrict binary distribution. No GPL/LGPL/AGPL dependency is present. See `THIRD-PARTY-LICENSES.md` and `sbom.cdx.json`.
+- The **external backend** shells out to **LibreDWG (`dwgread`, GPL-3.0)** and **GDAL (`ogr2ogr`, permissive)** as separate processes. It does not link, embed, or ship them: the copyleft stays with the tools the user installs, so every distributed `dwg2geo` artifact remains MIT. We deliberately do not bundle LibreDWG into any release or image.
 
 ## Important constraints
 

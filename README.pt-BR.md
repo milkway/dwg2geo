@@ -10,7 +10,7 @@ Este pacote contém um plano técnico, prompts para Codex CLI e Claude Code e um
 - backend nativo futuro com `acadrust`, isolado por feature do Cargo.
 - plano por marcos, arquitetura, mapeamento de entidades, riscos e decisões.
 
-O desenho `_Corredor Sul.dwg` não foi incluído no ZIP. Apenas sua assinatura, tamanho e hash foram registrados em `samples/corredor-sul.metadata.json`.
+O desenho `_Corredor Sul.dwg` e todos os dados derivados dele são mantidos fora deste repositório — o diretório `samples/` inteiro é ignorado pelo git.
 
 ## Como começar
 
