@@ -1,0 +1,329 @@
+{
+  "dwg2geo": {
+    "coordinate_status": "local-unreferenced",
+    "note": "coordinates are raw drawing units; no geographic CRS was established",
+    "source_sha256": "<ignored>"
+  },
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            10.0,
+            5.0
+          ]
+        ],
+        "type": "LineString"
+      },
+      "id": "0x2E",
+      "properties": {
+        "color_index": 7,
+        "color_rgb": "#FFFFFF",
+        "entity_type": "LINE",
+        "handle": "0x2E",
+        "layer": "GEOMETRY",
+        "linetype": "Continuous",
+        "space": "model"
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          2.5,
+          -1.0
+        ],
+        "type": "Point"
+      },
+      "id": "0x2F",
+      "properties": {
+        "color_index": 7,
+        "color_rgb": "#FFFFFF",
+        "entity_type": "POINT",
+        "handle": "0x2F",
+        "layer": "GEOMETRY",
+        "linetype": "Continuous",
+        "space": "model"
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            20.0,
+            0.0
+          ],
+          [
+            30.0,
+            0.0
+          ],
+          [
+            30.0,
+            8.0
+          ],
+          [
+            20.0,
+            8.0
+          ],
+          [
+            20.0,
+            0.0
+          ]
+        ],
+        "type": "LineString"
+      },
+      "id": "0x30",
+      "properties": {
+        "color_index": 7,
+        "color_rgb": "#FFFFFF",
+        "entity_type": "LWPOLYLINE",
+        "handle": "0x30",
+        "is_closed": true,
+        "layer": "GEOMETRY",
+        "linetype": "Continuous",
+        "space": "model"
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            40.0,
+            0.0
+          ],
+          [
+            40.99532850471395,
+            -1.0484483132407938
+          ],
+          [
+            42.204915028125264,
+            -1.8401699437494743
+          ],
+          [
+            43.564044246578995,
+            -2.3328061841733136
+          ],
+          [
+            45.0,
+            -2.5
+          ],
+          [
+            46.435955753421005,
+            -2.3328061841733136
+          ],
+          [
+            47.795084971874736,
+            -1.8401699437494743
+          ],
+          [
+            49.00467149528605,
+            -1.048448313240795
+          ],
+          [
+            50.0,
+            0.0
+          ]
+        ],
+        "type": "LineString"
+      },
+      "id": "0x31",
+      "properties": {
+        "approximated": true,
+        "color_index": 7,
+        "color_rgb": "#FFFFFF",
+        "entity_type": "LWPOLYLINE",
+        "handle": "0x31",
+        "is_closed": false,
+        "layer": "GEOMETRY",
+        "linetype": "Continuous",
+        "space": "model",
+        "warnings": [
+          "arc segments tessellated with chord tolerance 0.05 drawing units"
+        ]
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            68.0,
+            5.0
+          ],
+          [
+            67.8977774788672,
+            5.776457135307562
+          ],
+          [
+            67.59807621135332,
+            6.5
+          ],
+          [
+            67.12132034355965,
+            7.121320343559642
+          ],
+          [
+            66.5,
+            7.598076211353316
+          ],
+          [
+            65.77645713530757,
+            7.897777478867205
+          ],
+          [
+            65.0,
+            8.0
+          ],
+          [
+            64.22354286469243,
+            7.897777478867205
+          ],
+          [
+            63.5,
+            7.598076211353316
+          ],
+          [
+            62.878679656440355,
+            7.121320343559643
+          ],
+          [
+            62.40192378864669,
+            6.5
+          ],
+          [
+            62.102222521132795,
+            5.776457135307563
+          ],
+          [
+            62.0,
+            5.0
+          ],
+          [
+            62.102222521132795,
+            4.223542864692438
+          ],
+          [
+            62.40192378864669,
+            3.500000000000001
+          ],
+          [
+            62.878679656440355,
+            2.8786796564403585
+          ],
+          [
+            63.5,
+            2.401923788646685
+          ],
+          [
+            64.22354286469243,
+            2.102222521132795
+          ],
+          [
+            65.0,
+            2.0
+          ],
+          [
+            65.77645713530757,
+            2.102222521132795
+          ],
+          [
+            66.5,
+            2.401923788646684
+          ],
+          [
+            67.12132034355965,
+            2.878679656440357
+          ],
+          [
+            67.59807621135332,
+            3.4999999999999987
+          ],
+          [
+            67.8977774788672,
+            4.223542864692435
+          ],
+          [
+            68.0,
+            5.0
+          ]
+        ],
+        "type": "LineString"
+      },
+      "id": "0x32",
+      "properties": {
+        "approximated": true,
+        "color_index": 7,
+        "color_rgb": "#FFFFFF",
+        "entity_type": "CIRCLE",
+        "handle": "0x32",
+        "is_closed": true,
+        "layer": "GEOMETRY",
+        "linetype": "Continuous",
+        "space": "model",
+        "warnings": [
+          "arc segments tessellated with chord tolerance 0.05 drawing units"
+        ]
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          5.0,
+          20.0
+        ],
+        "type": "Point"
+      },
+      "id": "0x33",
+      "properties": {
+        "color_index": 7,
+        "color_rgb": "#FFFFFF",
+        "entity_type": "TEXT",
+        "handle": "0x33",
+        "layer": "ANNOTATION",
+        "linetype": "Continuous",
+        "space": "model",
+        "text": "GOLDEN LABEL",
+        "text_height": 2.5,
+        "text_rotation_deg": 30.000000000000004,
+        "text_style": "Standard"
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            80.0,
+            10.0
+          ],
+          [
+            80.0,
+            18.0
+          ]
+        ],
+        "type": "LineString"
+      },
+      "id": "0x36/0x35",
+      "properties": {
+        "block_path": "GOLDEN_BLOCK",
+        "color_index": 7,
+        "color_rgb": "#FFFFFF",
+        "entity_type": "LINE",
+        "handle": "0x35",
+        "layer": "BLOCKS",
+        "linetype": "Continuous",
+        "source_layer": "0",
+        "space": "model"
+      },
+      "type": "Feature"
+    }
+  ],
+  "type": "FeatureCollection"
+}

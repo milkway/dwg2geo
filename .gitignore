@@ -1,6 +1,7 @@
 /target/
 /output/
 *.geojson
+!/tests/golden/native-basic.geojson
 *.geojsonseq
 *.dxf
 *.dwg
