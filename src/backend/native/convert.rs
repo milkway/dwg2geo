@@ -3275,10 +3275,24 @@ fn evaluate_nurbs(
     Some((x / w, y / w, z / w))
 }
 
-/// TEXT anchors live in OCS; the second alignment point, when present, is
-/// the effective anchor for aligned text.
+/// TEXT anchors live in OCS. DXF uses the insertion point only for the
+/// default left/baseline alignment; other alignments use the second point
+/// when it is present.
 fn convert_text(text: &acadrust::entities::Text, placement: &Placement) -> EntityOutcome {
-    let anchor = text.alignment_point.unwrap_or(text.insertion_point);
+    let default_alignment = matches!(
+        text.horizontal_alignment,
+        acadrust::entities::TextHorizontalAlignment::Left
+    ) && matches!(
+        text.vertical_alignment,
+        acadrust::entities::TextVerticalAlignment::Baseline
+    );
+    let (anchor, anchor_name) = if default_alignment {
+        (text.insertion_point, "insertion")
+    } else if let Some(alignment_point) = text.alignment_point {
+        (alignment_point, "alignment")
+    } else {
+        (text.insertion_point, "insertion")
+    };
     if !is_finite(&anchor) {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
     }
@@ -3300,15 +3314,81 @@ fn convert_text(text: &acadrust::entities::Text, placement: &Placement) -> Entit
         placement,
     );
 
+    let mut extra_properties = vec![
+        ("text", JsonValue::from(text.value.clone())),
+        ("text_height", JsonValue::from(text.height)),
+        ("text_rotation_deg", JsonValue::from(rotation_deg)),
+        ("text_style", JsonValue::from(text.style.clone())),
+    ];
+    if !matches!(
+        text.horizontal_alignment,
+        acadrust::entities::TextHorizontalAlignment::Left
+    ) {
+        extra_properties.push((
+            "text_h_align",
+            JsonValue::from(text_horizontal_alignment_name(text.horizontal_alignment)),
+        ));
+    }
+    if !matches!(
+        text.vertical_alignment,
+        acadrust::entities::TextVerticalAlignment::Baseline
+    ) {
+        extra_properties.push((
+            "text_v_align",
+            JsonValue::from(text_vertical_alignment_name(text.vertical_alignment)),
+        ));
+    }
+    if !default_alignment || text.alignment_point.is_some() {
+        extra_properties.push(("text_anchor", JsonValue::from(anchor_name)));
+    }
+    if text.width_factor != 1.0 {
+        extra_properties.push(("text_width_factor", JsonValue::from(text.width_factor)));
+    }
+    if text.oblique_angle != 0.0 {
+        extra_properties.push((
+            "text_oblique_deg",
+            JsonValue::from(text.oblique_angle.to_degrees()),
+        ));
+    }
+    if text.generation_flags & 2 != 0 {
+        extra_properties.push(("text_mirrored_x", JsonValue::from(true)));
+    }
+    if text.generation_flags & 4 != 0 {
+        extra_properties.push(("text_mirrored_y", JsonValue::from(true)));
+    }
+
     EntityOutcome::Converted {
         geometry: GeometryValue::new_point(position),
-        extra_properties: vec![
-            ("text", JsonValue::from(text.value.clone())),
-            ("text_height", JsonValue::from(text.height)),
-            ("text_rotation_deg", JsonValue::from(rotation_deg)),
-            ("text_style", JsonValue::from(text.style.clone())),
-        ],
+        extra_properties,
         warnings,
+    }
+}
+
+fn text_horizontal_alignment_name(
+    alignment: acadrust::entities::TextHorizontalAlignment,
+) -> &'static str {
+    use acadrust::entities::TextHorizontalAlignment;
+
+    match alignment {
+        TextHorizontalAlignment::Left => "left",
+        TextHorizontalAlignment::Center => "center",
+        TextHorizontalAlignment::Right => "right",
+        TextHorizontalAlignment::Aligned => "aligned",
+        TextHorizontalAlignment::Middle => "middle",
+        TextHorizontalAlignment::Fit => "fit",
+    }
+}
+
+fn text_vertical_alignment_name(
+    alignment: acadrust::entities::TextVerticalAlignment,
+) -> &'static str {
+    use acadrust::entities::TextVerticalAlignment;
+
+    match alignment {
+        TextVerticalAlignment::Baseline => "baseline",
+        TextVerticalAlignment::Bottom => "bottom",
+        TextVerticalAlignment::Middle => "middle",
+        TextVerticalAlignment::Top => "top",
     }
 }
 
@@ -3362,11 +3442,96 @@ fn convert_mtext(mtext: &acadrust::entities::MText, placement: &Placement) -> En
     if plain != mtext.value {
         extra_properties.push(("text_raw", JsonValue::from(mtext.value.clone())));
     }
+    if !matches!(
+        mtext.attachment_point,
+        acadrust::entities::AttachmentPoint::TopLeft
+    ) {
+        extra_properties.push((
+            "text_attachment",
+            JsonValue::from(mtext_attachment_name(mtext.attachment_point)),
+        ));
+    }
+    if !matches!(
+        mtext.drawing_direction,
+        acadrust::entities::DrawingDirection::LeftToRight
+    ) {
+        extra_properties.push((
+            "text_direction",
+            JsonValue::from(mtext_direction_name(mtext.drawing_direction)),
+        ));
+    }
+    if mtext.rectangle_width != 10.0 {
+        extra_properties.push(("text_width", JsonValue::from(mtext.rectangle_width)));
+    }
+    if mtext.line_spacing_factor != 1.0 {
+        extra_properties.push((
+            "text_line_spacing_factor",
+            JsonValue::from(mtext.line_spacing_factor),
+        ));
+    }
+    if matches!(
+        mtext.line_spacing_style,
+        acadrust::entities::LineSpacingStyle::Exactly
+    ) {
+        extra_properties.push(("text_line_spacing_style", JsonValue::from("exactly")));
+    }
+    if mtext.column_data.column_type != 0 {
+        let columns = &mtext.column_data;
+        let column_type = match columns.column_type {
+            1 => JsonValue::from("static"),
+            2 => JsonValue::from("dynamic"),
+            other => JsonValue::from(other),
+        };
+        let mut properties = JsonObject::new();
+        properties.insert("type".to_string(), column_type);
+        properties.insert("count".to_string(), JsonValue::from(columns.column_count));
+        properties.insert("width".to_string(), JsonValue::from(columns.width));
+        properties.insert("gutter".to_string(), JsonValue::from(columns.gutter));
+        if columns.flow_reversed {
+            properties.insert("flow_reversed".to_string(), JsonValue::from(true));
+        }
+        if columns.auto_height {
+            properties.insert("auto_height".to_string(), JsonValue::from(true));
+        }
+        if !columns.heights.is_empty() {
+            properties.insert(
+                "heights".to_string(),
+                JsonValue::from(columns.heights.clone()),
+            );
+        }
+        extra_properties.push(("text_columns", JsonValue::Object(properties)));
+    }
 
     EntityOutcome::Converted {
         geometry: GeometryValue::new_point(position),
         extra_properties,
         warnings,
+    }
+}
+
+fn mtext_attachment_name(attachment: acadrust::entities::AttachmentPoint) -> &'static str {
+    use acadrust::entities::AttachmentPoint;
+
+    match attachment {
+        AttachmentPoint::TopLeft => "top-left",
+        AttachmentPoint::TopCenter => "top-center",
+        AttachmentPoint::TopRight => "top-right",
+        AttachmentPoint::MiddleLeft => "middle-left",
+        AttachmentPoint::MiddleCenter => "middle-center",
+        AttachmentPoint::MiddleRight => "middle-right",
+        AttachmentPoint::BottomLeft => "bottom-left",
+        AttachmentPoint::BottomCenter => "bottom-center",
+        AttachmentPoint::BottomRight => "bottom-right",
+    }
+}
+
+fn mtext_direction_name(direction: acadrust::entities::DrawingDirection) -> &'static str {
+    use acadrust::entities::DrawingDirection;
+
+    match direction {
+        DrawingDirection::LeftToRight => "left-to-right",
+        DrawingDirection::TopToBottom => "top-to-bottom",
+        DrawingDirection::ByStyle => "by-style",
     }
 }
 
@@ -5478,6 +5643,247 @@ mod tests {
             "finer tolerance must sample more: coarse {coarse}, fine {fine}"
         );
         assert!(coarse >= 9, "span floor applies: {coarse}");
+    }
+
+    fn extra_property<'a>(
+        properties: &'a [(&'static str, geojson::JsonValue)],
+        key: &str,
+    ) -> Option<&'a geojson::JsonValue> {
+        properties
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn text_alignment_mode_names_are_stable() {
+        use acadrust::entities::{TextHorizontalAlignment as H, TextVerticalAlignment as V};
+
+        for (alignment, expected) in [
+            (H::Left, "left"),
+            (H::Center, "center"),
+            (H::Right, "right"),
+            (H::Aligned, "aligned"),
+            (H::Middle, "middle"),
+            (H::Fit, "fit"),
+        ] {
+            assert_eq!(super::text_horizontal_alignment_name(alignment), expected);
+        }
+        for (alignment, expected) in [
+            (V::Baseline, "baseline"),
+            (V::Bottom, "bottom"),
+            (V::Middle, "middle"),
+            (V::Top, "top"),
+        ] {
+            assert_eq!(super::text_vertical_alignment_name(alignment), expected);
+        }
+    }
+
+    #[test]
+    fn text_anchor_follows_dxf_alignment_rules() {
+        use acadrust::{
+            entities::{Text, TextHorizontalAlignment},
+            types::Vector3,
+        };
+
+        let mut fit = Text::new();
+        fit.insertion_point = Vector3::new(1.0, 2.0, 0.0);
+        fit.alignment_point = Some(Vector3::new(7.0, 8.0, 0.0));
+        fit.horizontal_alignment = TextHorizontalAlignment::Fit;
+        match super::convert_text(&fit, &Placement::model_space()) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                ..
+            } => {
+                assert_eq!(geometry, GeometryValue::new_point((7.0, 8.0)));
+                assert_eq!(
+                    extra_property(&extra_properties, "text_anchor"),
+                    Some(&geojson::JsonValue::from("alignment"))
+                );
+            }
+            _ => panic!("fit TEXT must convert"),
+        }
+
+        let mut left_baseline = Text::new();
+        left_baseline.insertion_point = Vector3::new(3.0, 4.0, 0.0);
+        left_baseline.alignment_point = Some(Vector3::new(30.0, 40.0, 0.0));
+        match super::convert_text(&left_baseline, &Placement::model_space()) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                ..
+            } => {
+                assert_eq!(geometry, GeometryValue::new_point((3.0, 4.0)));
+                assert_eq!(
+                    extra_property(&extra_properties, "text_anchor"),
+                    Some(&geojson::JsonValue::from("insertion"))
+                );
+            }
+            _ => panic!("left/baseline TEXT must convert"),
+        }
+    }
+
+    #[test]
+    fn text_width_oblique_and_generation_flags_emit_only_when_non_default() {
+        use acadrust::entities::Text;
+
+        let mut text = Text::new();
+        text.width_factor = 1.25;
+        text.oblique_angle = std::f64::consts::FRAC_PI_6;
+        text.generation_flags = 2 | 4;
+        let EntityOutcome::Converted {
+            extra_properties, ..
+        } = super::convert_text(&text, &Placement::model_space())
+        else {
+            panic!("TEXT must convert");
+        };
+
+        assert_eq!(
+            extra_property(&extra_properties, "text_width_factor"),
+            Some(&geojson::JsonValue::from(1.25))
+        );
+        let oblique = extra_property(&extra_properties, "text_oblique_deg")
+            .and_then(geojson::JsonValue::as_f64)
+            .expect("numeric oblique angle");
+        assert!((oblique - 30.0).abs() < 1e-12, "got {oblique}");
+        assert_eq!(
+            extra_property(&extra_properties, "text_mirrored_x"),
+            Some(&geojson::JsonValue::from(true))
+        );
+        assert_eq!(
+            extra_property(&extra_properties, "text_mirrored_y"),
+            Some(&geojson::JsonValue::from(true))
+        );
+    }
+
+    #[test]
+    fn mtext_attachment_names_and_reference_width_are_preserved() {
+        use acadrust::entities::{AttachmentPoint as A, MText};
+
+        for (attachment, expected) in [
+            (A::TopLeft, "top-left"),
+            (A::TopCenter, "top-center"),
+            (A::TopRight, "top-right"),
+            (A::MiddleLeft, "middle-left"),
+            (A::MiddleCenter, "middle-center"),
+            (A::MiddleRight, "middle-right"),
+            (A::BottomLeft, "bottom-left"),
+            (A::BottomCenter, "bottom-center"),
+            (A::BottomRight, "bottom-right"),
+        ] {
+            assert_eq!(super::mtext_attachment_name(attachment), expected);
+        }
+
+        let mut mtext = MText::new();
+        mtext.attachment_point = A::BottomRight;
+        mtext.rectangle_width = 42.0;
+        let EntityOutcome::Converted {
+            extra_properties, ..
+        } = super::convert_mtext(&mtext, &Placement::model_space())
+        else {
+            panic!("MTEXT must convert");
+        };
+        assert_eq!(
+            extra_property(&extra_properties, "text_attachment"),
+            Some(&geojson::JsonValue::from("bottom-right"))
+        );
+        assert_eq!(
+            extra_property(&extra_properties, "text_width"),
+            Some(&geojson::JsonValue::from(42.0))
+        );
+    }
+
+    #[test]
+    fn mtext_direction_spacing_and_columns_are_preserved() {
+        use acadrust::entities::{DrawingDirection, LineSpacingStyle, MText};
+
+        for (direction, expected) in [
+            (DrawingDirection::LeftToRight, "left-to-right"),
+            (DrawingDirection::TopToBottom, "top-to-bottom"),
+            (DrawingDirection::ByStyle, "by-style"),
+        ] {
+            assert_eq!(super::mtext_direction_name(direction), expected);
+        }
+
+        let mut mtext = MText::new();
+        mtext.drawing_direction = DrawingDirection::TopToBottom;
+        mtext.line_spacing_factor = 1.5;
+        mtext.line_spacing_style = LineSpacingStyle::Exactly;
+        mtext.column_data.column_type = 1;
+        mtext.column_data.column_count = 2;
+        mtext.column_data.width = 12.0;
+        mtext.column_data.gutter = 1.25;
+        let EntityOutcome::Converted {
+            extra_properties, ..
+        } = super::convert_mtext(&mtext, &Placement::model_space())
+        else {
+            panic!("MTEXT must convert");
+        };
+
+        assert_eq!(
+            extra_property(&extra_properties, "text_direction"),
+            Some(&geojson::JsonValue::from("top-to-bottom"))
+        );
+        assert_eq!(
+            extra_property(&extra_properties, "text_line_spacing_factor"),
+            Some(&geojson::JsonValue::from(1.5))
+        );
+        assert_eq!(
+            extra_property(&extra_properties, "text_line_spacing_style"),
+            Some(&geojson::JsonValue::from("exactly"))
+        );
+        assert_eq!(
+            extra_property(&extra_properties, "text_columns"),
+            Some(&serde_json::json!({
+                "count": 2,
+                "gutter": 1.25,
+                "type": "static",
+                "width": 12.0
+            }))
+        );
+    }
+
+    #[test]
+    fn default_text_and_mtext_emit_no_layout_properties() {
+        use acadrust::entities::{MText, Text};
+
+        let EntityOutcome::Converted {
+            extra_properties: text_properties,
+            ..
+        } = super::convert_text(&Text::new(), &Placement::model_space())
+        else {
+            panic!("default TEXT must convert");
+        };
+        for key in [
+            "text_h_align",
+            "text_v_align",
+            "text_anchor",
+            "text_width_factor",
+            "text_oblique_deg",
+            "text_mirrored_x",
+            "text_mirrored_y",
+        ] {
+            assert_eq!(extra_property(&text_properties, key), None, "{key}");
+        }
+
+        let EntityOutcome::Converted {
+            extra_properties: mtext_properties,
+            ..
+        } = super::convert_mtext(&MText::new(), &Placement::model_space())
+        else {
+            panic!("default MTEXT must convert");
+        };
+        for key in [
+            "text_attachment",
+            "text_direction",
+            "text_width",
+            "text_line_spacing_factor",
+            "text_line_spacing_style",
+            "text_columns",
+        ] {
+            assert_eq!(extra_property(&mtext_properties, key), None, "{key}");
+        }
     }
 
     mod properties {
