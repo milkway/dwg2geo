@@ -52,6 +52,25 @@ const MAX_ANGLE_STEP: f64 = std::f64::consts::PI / 12.0;
 /// Hard cap on segments per arc; reaching it emits a warning.
 const MAX_ARC_SEGMENTS: usize = 256;
 
+/// Angular tolerance distinguishing a zero-length sweep from a full turn.
+const ANGLE_EPSILON: f64 = 1e-12;
+
+/// CCW sweep for an arc-family span. `None` for a zero-length span; raw
+/// spans at (multiples of) a full turn normalize to exactly 2 pi instead of
+/// collapsing to zero, and sub-epsilon spans are never promoted to full
+/// revolutions.
+fn ccw_sweep(start_angle: f64, end_angle: f64) -> Option<f64> {
+    let raw = end_angle - start_angle;
+    if raw.abs() <= ANGLE_EPSILON {
+        return None;
+    }
+    let mut sweep = raw.rem_euclid(std::f64::consts::TAU);
+    if sweep <= ANGLE_EPSILON || sweep >= std::f64::consts::TAU - ANGLE_EPSILON {
+        sweep = std::f64::consts::TAU;
+    }
+    Some(sweep)
+}
+
 /// Hard cap on nested INSERT expansion depth.
 const MAX_BLOCK_DEPTH: usize = 16;
 
@@ -60,6 +79,26 @@ struct GeometryOptions {
     polygonize_closed: bool,
     curve_tolerance: f64,
     preserve_inserts: bool,
+    /// Lowercased layer names; when non-empty, only these layers convert.
+    include_layers: Vec<String>,
+    /// Lowercased layer names excluded from conversion.
+    exclude_layers: Vec<String>,
+}
+
+impl GeometryOptions {
+    /// Whether a top-level entity on `layer` passes the layer filters
+    /// (case-insensitive, matching the GDAL route's semantics).
+    fn layer_passes(&self, layer: &str) -> bool {
+        let normalized = layer.to_ascii_lowercase();
+        if !self.include_layers.is_empty() {
+            return self.include_layers.contains(&normalized);
+        }
+        !self.exclude_layers.contains(&normalized)
+    }
+
+    fn has_layer_filters(&self) -> bool {
+        !self.include_layers.is_empty() || !self.exclude_layers.is_empty()
+    }
 }
 
 /// Row-major affine transform: `linear * v + translation`.
@@ -277,8 +316,11 @@ fn insert_matrix(
     column: u16,
     row: u16,
 ) -> Affine {
-    let to_insertion = Affine::from_translation(insert.insert_point);
-    let orient = Affine::from_linear(Matrix3::arbitrary_axis(insert.normal).m);
+    // DXF stores the INSERT insertion point in OCS (group 10); lift it
+    // through the arbitrary-axis transform before translating.
+    let ocs_to_wcs = Matrix3::arbitrary_axis(insert.normal);
+    let to_insertion = Affine::from_translation(ocs_to_wcs.transform_point(insert.insert_point));
+    let orient = Affine::from_linear(ocs_to_wcs.m);
     let rotate = Affine::rotation_z(insert.rotation);
     let cell = Affine::from_translation(Vector3::new(
         f64::from(column) * insert.column_spacing,
@@ -370,6 +412,16 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
         polygonize_closed: request.polygonize_closed,
         curve_tolerance: request.curve_tolerance.unwrap_or(DEFAULT_CURVE_TOLERANCE),
         preserve_inserts: request.preserve_inserts,
+        include_layers: request
+            .include_layers
+            .iter()
+            .map(|layer| layer.to_ascii_lowercase())
+            .collect(),
+        exclude_layers: request
+            .exclude_layers
+            .iter()
+            .map(|layer| layer.to_ascii_lowercase())
+            .collect(),
     };
 
     let extract_started = Instant::now();
@@ -579,6 +631,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
                 paper_space: extraction.excluded_paper_space,
                 block_definitions: extraction.excluded_block_definitions,
                 unowned: extraction.excluded_unowned,
+                by_layer_filter: extraction.excluded_by_layer_filter,
             },
             feature_warnings: extraction.feature_warnings,
             reprojection: reprojection_info,
@@ -747,9 +800,14 @@ fn detect_spatial_outliers(features: &[Feature]) -> report::SpatialOutliers {
         .iter()
         .map(|(_, _, y)| (y - median_y).abs())
         .collect();
-    // Floor the thresholds so exact-tie clusters do not flag float noise.
-    let threshold_x = (OUTLIER_MAD_FACTOR * median(&mut deviations_x)).max(1e-9);
-    let threshold_y = (OUTLIER_MAD_FACTOR * median(&mut deviations_y)).max(1e-9);
+    // Floor the thresholds so a zero-MAD (tightly clustered) drawing does
+    // not flag float- or millimeter-scale neighbors: never call anything
+    // closer than one drawing unit — or the coordinate magnitude's own
+    // float-noise scale — an outlier.
+    let magnitude = median_x.abs().max(median_y.abs());
+    let floor = (1e-6 * magnitude).max(1.0);
+    let threshold_x = (OUTLIER_MAD_FACTOR * median(&mut deviations_x)).max(floor);
+    let threshold_y = (OUTLIER_MAD_FACTOR * median(&mut deviations_y)).max(floor);
 
     let mut outliers = 0usize;
     let mut sample_ids = Vec::new();
@@ -781,43 +839,73 @@ fn check_boundary(features: &[Feature], path: &std::path::Path) -> Result<report
         .parse()
         .with_context(|| format!("boundary file {} is not valid GeoJSON", path.display()))?;
 
-    let mut polygons: Vec<Vec<Vec<(f64, f64)>>> = Vec::new();
-    let mut collect = |value: &GeometryValue| match value {
-        GeometryValue::Polygon { coordinates } => {
-            polygons.push(
-                coordinates
-                    .iter()
-                    .map(|ring| ring.iter().map(|p| (p[0], p[1])).collect())
-                    .collect(),
-            );
-        }
-        GeometryValue::MultiPolygon { coordinates } => {
-            for polygon in coordinates {
-                polygons.push(
-                    polygon
-                        .iter()
-                        .map(|ring| ring.iter().map(|p| (p[0], p[1])).collect())
-                        .collect(),
-                );
+    // Convert one boundary ring defensively: GeoJSON accepted by serde can
+    // still carry short positions, open rings, or non-finite numbers, and a
+    // reference boundary must be rejected loudly rather than panicking or
+    // classifying against garbage.
+    let convert_ring = |ring: &Vec<geojson::Position>| -> Result<Vec<(f64, f64)>> {
+        let mut points = Vec::with_capacity(ring.len());
+        for position in ring {
+            if position.len() < 2 {
+                bail!("a boundary position has fewer than two coordinates");
             }
+            let (x, y) = (position[0], position[1]);
+            if !x.is_finite() || !y.is_finite() {
+                bail!("a boundary position is not finite");
+            }
+            points.push((x, y));
         }
-        _ => {}
+        if points.len() < 4 {
+            bail!("a boundary ring has fewer than four positions");
+        }
+        if points.first() != points.last() {
+            bail!("a boundary ring is not closed (first and last positions differ)");
+        }
+        Ok(points)
     };
-    match &boundary {
-        geojson::GeoJson::Geometry(geometry) => collect(&geometry.value),
-        geojson::GeoJson::Feature(feature) => {
-            if let Some(geometry) = &feature.geometry {
-                collect(&geometry.value);
-            }
-        }
-        geojson::GeoJson::FeatureCollection(collection) => {
-            for feature in &collection.features {
-                if let Some(geometry) = &feature.geometry {
-                    collect(&geometry.value);
+
+    let mut polygons: Vec<Vec<Vec<(f64, f64)>>> = Vec::new();
+    let mut collect = |value: &GeometryValue| -> Result<()> {
+        match value {
+            GeometryValue::Polygon { coordinates } => {
+                if !coordinates.is_empty() {
+                    polygons.push(
+                        coordinates
+                            .iter()
+                            .map(&convert_ring)
+                            .collect::<Result<Vec<_>>>()?,
+                    );
                 }
             }
+            GeometryValue::MultiPolygon { coordinates } => {
+                for polygon in coordinates {
+                    if !polygon.is_empty() {
+                        polygons.push(
+                            polygon
+                                .iter()
+                                .map(&convert_ring)
+                                .collect::<Result<Vec<_>>>()?,
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
-    }
+        Ok(())
+    };
+    let collected: Result<()> = match &boundary {
+        geojson::GeoJson::Geometry(geometry) => collect(&geometry.value),
+        geojson::GeoJson::Feature(feature) => match &feature.geometry {
+            Some(geometry) => collect(&geometry.value),
+            None => Ok(()),
+        },
+        geojson::GeoJson::FeatureCollection(collection) => collection
+            .features
+            .iter()
+            .filter_map(|feature| feature.geometry.as_ref())
+            .try_for_each(|geometry| collect(&geometry.value)),
+    };
+    collected.with_context(|| format!("invalid boundary file {}", path.display()))?;
     if polygons.is_empty() {
         bail!(
             "boundary file {} contains no Polygon or MultiPolygon geometry",
@@ -854,13 +942,27 @@ fn check_boundary(features: &[Feature], path: &std::path::Path) -> Result<report
                 out_count += 1;
             }
         });
-        let bucket = match (in_count, out_count) {
-            (_, 0) => &mut features_inside,
-            (0, _) => &mut features_outside,
+        // A segment can leave and re-enter the boundary between two inside
+        // vertices (concavities, holes); a proper crossing forces partial.
+        let mut crossed = false;
+        visit_segments(&geometry.value, &mut |a, b| {
+            if !crossed {
+                crossed = polygons.iter().any(|rings| {
+                    rings.iter().any(|ring| {
+                        ring.windows(2)
+                            .any(|edge| segments_cross(a, b, edge[0], edge[1]))
+                    })
+                });
+            }
+        });
+        let bucket = match (in_count, out_count, crossed) {
+            (_, _, true) => &mut features_partial,
+            (_, 0, false) => &mut features_inside,
+            (0, _, false) => &mut features_outside,
             _ => &mut features_partial,
         };
         *bucket += 1;
-        if out_count > 0 && sample_not_inside_ids.len() < MAX_HANDLE_SAMPLES {
+        if (out_count > 0 || crossed) && sample_not_inside_ids.len() < MAX_HANDLE_SAMPLES {
             if let Some(Id::String(id)) = &feature.id {
                 sample_not_inside_ids.push(id.clone());
             }
@@ -968,8 +1070,17 @@ fn check_rings(value: &GeometryValue, checks: &mut report::GeometryChecks) {
                 checks.unclosed_rings += 1;
             }
             let mut area = 0.0;
+            let mut extent: f64 = 0.0;
+            let first_position = &ring[0];
             for pair in ring.windows(2) {
                 area -= (pair[1][0] - pair[0][0]) * (pair[1][1] + pair[0][1]);
+                extent = extent
+                    .max((pair[1][0] - first_position[0]).abs())
+                    .max((pair[1][1] - first_position[1]).abs());
+            }
+            if !extent.is_finite() || area.abs() <= 1e-12 * extent * extent {
+                checks.degenerate_rings += 1;
+                continue;
             }
             let ccw = area > 0.0;
             let is_shell = index == 0;
@@ -992,6 +1103,51 @@ fn check_rings(value: &GeometryValue, checks: &mut report::GeometryChecks) {
         }
         _ => {}
     }
+}
+
+/// Visit every consecutive-position segment of a geometry's lines and rings.
+fn visit_segments(value: &GeometryValue, visit: &mut impl FnMut((f64, f64), (f64, f64))) {
+    let mut walk_line = |line: &[geojson::Position]| {
+        for pair in line.windows(2) {
+            visit((pair[0][0], pair[0][1]), (pair[1][0], pair[1][1]));
+        }
+    };
+    match value {
+        GeometryValue::Point { .. } | GeometryValue::MultiPoint { .. } => {}
+        GeometryValue::LineString { coordinates } => walk_line(coordinates),
+        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
+            for line in coordinates {
+                walk_line(line);
+            }
+        }
+        GeometryValue::MultiPolygon { coordinates } => {
+            for polygon in coordinates {
+                for ring in polygon {
+                    walk_line(ring);
+                }
+            }
+        }
+        GeometryValue::GeometryCollection { geometries } => {
+            for geometry in geometries {
+                visit_segments(&geometry.value, visit);
+            }
+        }
+    }
+}
+
+/// Strictly proper segment intersection (shared endpoints and collinear
+/// touches do not count; boundary-inclusive vertex classification already
+/// covers those).
+fn segments_cross(a1: (f64, f64), a2: (f64, f64), b1: (f64, f64), b2: (f64, f64)) -> bool {
+    let orient = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| -> f64 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let d1 = orient(b1, b2, a1);
+    let d2 = orient(b1, b2, a2);
+    let d3 = orient(a1, a2, b1);
+    let d4 = orient(a1, a2, b2);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
 }
 
 /// Visit every (x, y) position of a geometry.
@@ -1190,6 +1346,8 @@ struct Extraction {
     feature_warnings: usize,
     approximated_features: usize,
     inserts_expanded: usize,
+    /// Top-level model-space entities dropped by --include/--exclude-layers.
+    excluded_by_layer_filter: usize,
     /// Top-level model-space entities encountered.
     model_space_entities: usize,
     /// Top-level entities that reached an outcome; must equal
@@ -1236,14 +1394,19 @@ fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extracti
 
         for handle in &record.entity_handles {
             let Some(entity) = document.get_entity(*handle) else {
-                // Inspection reports unresolved handles; conversion counts
-                // them as failed so the totals still add up.
-                record_outcome(
-                    &mut extraction.failed,
-                    "UNRESOLVED".to_string(),
-                    "entity handle does not resolve to an entity".to_string(),
-                    &format!("{handle}"),
-                );
+                // Inspection reports unresolved handles; model-space ones
+                // count as failed outcomes AND as source entities so the
+                // accounting denominator still balances.
+                if is_model {
+                    extraction.model_space_entities += 1;
+                    extraction.top_level_accounted += 1;
+                    record_outcome(
+                        &mut extraction.failed,
+                        "UNRESOLVED".to_string(),
+                        "entity handle does not resolve to an entity".to_string(),
+                        &format!("{handle}"),
+                    );
+                }
                 continue;
             };
             if matches!(entity, EntityType::Block(_) | EntityType::BlockEnd(_)) {
@@ -1257,6 +1420,11 @@ fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extracti
             }
             if !is_model {
                 extraction.excluded_block_definitions += 1;
+                continue;
+            }
+
+            if options.has_layer_filters() && !options.layer_passes(&entity.common().layer) {
+                extraction.excluded_by_layer_filter += 1;
                 continue;
             }
 
@@ -1299,7 +1467,7 @@ fn process_entity(
 ) {
     if let EntityType::Insert(insert) = entity {
         process_insert(
-            document, entity, insert, options, extraction, placement, depth,
+            document, entity, insert, index, options, extraction, placement, depth,
         );
         return;
     }
@@ -1368,12 +1536,23 @@ fn process_insert(
     document: &CadDocument,
     entity: &EntityType,
     insert: &acadrust::entities::Insert,
+    index: usize,
     options: &GeometryOptions,
     extraction: &mut Extraction,
     placement: &Placement,
     depth: usize,
 ) {
-    let id = feature_id(entity, 0, placement);
+    let id = feature_id(entity, index, placement);
+
+    if !valid_normal(&insert.normal) {
+        record_outcome(
+            &mut extraction.failed,
+            "INSERT".to_string(),
+            "zero or non-finite extrusion normal".to_string(),
+            &id,
+        );
+        return;
+    }
 
     // Every INSERT reaches a terminal outcome (anchor, expansion, or a
     // failure) on all paths below.
@@ -1400,7 +1579,15 @@ fn process_insert(
         .collect();
 
     if options.preserve_inserts {
-        emit_insert_anchor(document, entity, insert, &attributes, extraction, placement);
+        emit_insert_anchor(
+            document,
+            entity,
+            insert,
+            index,
+            &attributes,
+            extraction,
+            placement,
+        );
         return;
     }
 
@@ -1473,7 +1660,7 @@ fn process_insert(
                 max_scale: placement.max_scale * instance_scale,
             };
 
-            for handle in &record.entity_handles {
+            for (child_index, handle) in record.entity_handles.iter().enumerate() {
                 let Some(child) = document.get_entity(*handle) else {
                     record_outcome(
                         &mut extraction.failed,
@@ -1499,7 +1686,7 @@ fn process_insert(
                 process_entity(
                     document,
                     child,
-                    0,
+                    child_index,
                     options,
                     extraction,
                     &child_placement,
@@ -1511,7 +1698,15 @@ fn process_insert(
 
     extraction.inserts_expanded += 1;
     if !attributes.is_empty() {
-        emit_insert_anchor(document, entity, insert, &attributes, extraction, placement);
+        emit_insert_anchor(
+            document,
+            entity,
+            insert,
+            index,
+            &attributes,
+            extraction,
+            placement,
+        );
     }
 }
 
@@ -1521,13 +1716,16 @@ fn emit_insert_anchor(
     document: &CadDocument,
     entity: &EntityType,
     insert: &acadrust::entities::Insert,
+    index: usize,
     attributes: &BTreeMap<String, String>,
     extraction: &mut Extraction,
     placement: &Placement,
 ) {
-    let id = feature_id(entity, 0, placement);
+    let id = feature_id(entity, index, placement);
+    // The insertion point is OCS; lift it before the placement transform.
+    let anchor = Matrix3::arbitrary_axis(insert.normal).transform_point(insert.insert_point);
     let mut max_abs_z: f64 = 0.0;
-    let Some(position) = project(placement, insert.insert_point, &mut max_abs_z) else {
+    let Some(position) = project(placement, anchor, &mut max_abs_z) else {
         record_outcome(
             &mut extraction.failed,
             "INSERT".to_string(),
@@ -1765,8 +1963,11 @@ fn convert_solid(solid: &acadrust::entities::Solid, placement: &Placement) -> En
         solid.fourth_corner,
         solid.third_corner,
     ];
-    if corners.iter().any(|corner| !is_finite(corner)) || !is_finite(&solid.normal) {
+    if corners.iter().any(|corner| !is_finite(corner)) {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    if !valid_normal(&solid.normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
     }
 
     let ocs_to_wcs = Matrix3::arbitrary_axis(solid.normal);
@@ -1824,8 +2025,11 @@ fn convert_hatch(
     if hatch.paths.is_empty() {
         return EntityOutcome::Skipped("hatch has no boundary paths".to_string());
     }
-    if !is_finite(&hatch.normal) || !hatch.elevation.is_finite() {
+    if !hatch.elevation.is_finite() {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    if !valid_normal(&hatch.normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
     }
 
     let mut warnings = Vec::new();
@@ -1933,6 +2137,9 @@ fn boundary_ring(
     if count_distinct(&ring) < 3 {
         return Err("fewer than three distinct points".to_string());
     }
+    if ring_is_zero_area(&ring) {
+        return Err("zero-area (collinear) loop".to_string());
+    }
     Ok(BoundaryLoop { ring, approximated })
 }
 
@@ -2017,7 +2224,12 @@ fn boundary_edge_points(
                 return Err("circular arc edge with non-positive radius".to_string());
             }
             *approximated = true;
-            let (start, sweep) = edge_sweep(arc.start_angle, arc.end_angle, arc.counter_clockwise)?;
+            let Some((start, sweep)) =
+                edge_sweep(arc.start_angle, arc.end_angle, arc.counter_clockwise)?
+            else {
+                warnings.push("zero-sweep circular arc edge ignored".to_string());
+                return Ok(Vec::new());
+            };
             Ok(arc_points(
                 (arc.center.x, arc.center.y),
                 arc.radius,
@@ -2038,11 +2250,15 @@ fn boundary_edge_points(
                 return Err("degenerate elliptic arc edge".to_string());
             }
             *approximated = true;
-            let (start, sweep) = edge_sweep(
+            let Some((start, sweep)) = edge_sweep(
                 ellipse.start_angle,
                 ellipse.end_angle,
                 ellipse.counter_clockwise,
-            )?;
+            )?
+            else {
+                warnings.push("zero-sweep elliptic arc edge ignored".to_string());
+                return Ok(Vec::new());
+            };
             let minor = (
                 -major.1 * ellipse.minor_axis_ratio,
                 major.0 * ellipse.minor_axis_ratio,
@@ -2141,18 +2357,19 @@ fn edge_sweep(
     start_angle: f64,
     end_angle: f64,
     counter_clockwise: bool,
-) -> Result<(f64, f64), String> {
+) -> Result<Option<(f64, f64)>, String> {
     if !start_angle.is_finite() || !end_angle.is_finite() {
         return Err("non-finite arc edge angles".to_string());
     }
-    let mut sweep = (end_angle - start_angle).rem_euclid(std::f64::consts::TAU);
-    if sweep <= f64::EPSILON {
-        sweep = std::f64::consts::TAU;
-    }
+    // A zero-sweep edge contributes nothing; the caller skips it with a
+    // warning instead of dropping the whole loop.
+    let Some(sweep) = ccw_sweep(start_angle, end_angle) else {
+        return Ok(None);
+    };
     if counter_clockwise {
-        Ok((start_angle, sweep))
+        Ok(Some((start_angle, sweep)))
     } else {
-        Ok((-start_angle, -sweep))
+        Ok(Some((-start_angle, -sweep)))
     }
 }
 
@@ -2367,6 +2584,9 @@ fn finish_ocs_path(
     options: &GeometryOptions,
     placement: &Placement,
 ) -> EntityOutcome {
+    if !valid_normal(&normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
+    }
     if vertices.len() < 2 {
         return EntityOutcome::Skipped("polyline has fewer than two vertices".to_string());
     }
@@ -2664,10 +2884,9 @@ fn convert_arc(
         return EntityOutcome::Skipped("degenerate arc: non-positive radius".to_string());
     }
 
-    let mut sweep = (arc.end_angle - arc.start_angle).rem_euclid(std::f64::consts::TAU);
-    if sweep <= f64::EPSILON {
-        sweep = std::f64::consts::TAU;
-    }
+    let Some(sweep) = ccw_sweep(arc.start_angle, arc.end_angle) else {
+        return EntityOutcome::Skipped("degenerate arc: zero angular sweep".to_string());
+    };
 
     let mut warnings = Vec::new();
     let ocs_points = arc_points(
@@ -2721,12 +2940,10 @@ fn convert_ellipse(
     let minor_axis =
         minor_direction * (major_length * ellipse.minor_axis_ratio / minor_direction_length);
 
-    let mut sweep =
-        (ellipse.end_parameter - ellipse.start_parameter).rem_euclid(std::f64::consts::TAU);
-    let closed = sweep <= f64::EPSILON;
-    if closed {
-        sweep = std::f64::consts::TAU;
-    }
+    let Some(sweep) = ccw_sweep(ellipse.start_parameter, ellipse.end_parameter) else {
+        return EntityOutcome::Skipped("degenerate ellipse: zero parameter sweep".to_string());
+    };
+    let closed = sweep >= std::f64::consts::TAU - ANGLE_EPSILON;
 
     // The circle step formula with the major radius bounds the ellipse chord
     // error: local error is ~step^2 * axis / 8 and the major axis dominates.
@@ -2883,12 +3100,17 @@ fn evaluate_nurbs(
         }
     }
 
+    // Zero-denominator detection must scale with the knot domain: an
+    // absolute epsilon misreads tiny-but-valid knot spans as repeated knots.
+    let knot_scale = knots.iter().fold(0.0f64, |max, knot| max.max(knot.abs()));
+    let knot_epsilon = knot_scale * f64::EPSILON;
+
     let mut d: Vec<[f64; 4]> = (0..=degree).map(|j| control[j + span - degree]).collect();
     for r in 1..=degree {
         for j in (r..=degree).rev() {
             let i = j + span - degree;
             let denominator = knots[i + degree - r + 1] - knots[i];
-            let alpha = if denominator.abs() <= f64::EPSILON {
+            let alpha = if denominator.abs() <= knot_epsilon {
                 0.0
             } else {
                 (t - knots[i]) / denominator
@@ -2913,6 +3135,9 @@ fn convert_text(text: &acadrust::entities::Text, placement: &Placement) -> Entit
     let anchor = text.alignment_point.unwrap_or(text.insertion_point);
     if !is_finite(&anchor) {
         return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    if !valid_normal(&text.normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
     }
     let wcs = Matrix3::arbitrary_axis(text.normal).transform_point(anchor);
     let mut max_abs_z: f64 = 0.0;
@@ -3055,6 +3280,9 @@ fn finish_curve(
     placement: &Placement,
     mut warnings: Vec<String>,
 ) -> EntityOutcome {
+    if !valid_normal(&normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
+    }
     let ocs_to_wcs = Matrix3::arbitrary_axis(normal);
     let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(ocs_points.len() + 1);
     let mut max_abs_z: f64 = 0.0;
@@ -3084,6 +3312,12 @@ fn is_finite(vector: &Vector3) -> bool {
     vector.x.is_finite() && vector.y.is_finite() && vector.z.is_finite()
 }
 
+/// An OCS extrusion normal must be finite and robustly nonzero; feeding a
+/// zero vector to the arbitrary-axis transform silently collapses geometry.
+fn valid_normal(normal: &Vector3) -> bool {
+    is_finite(normal) && normal.length() > 1e-12
+}
+
 fn count_distinct(coordinates: &[(f64, f64)]) -> usize {
     let mut distinct: Vec<(f64, f64)> = Vec::new();
     for coordinate in coordinates {
@@ -3092,6 +3326,23 @@ fn count_distinct(coordinates: &[(f64, f64)]) -> usize {
         }
     }
     distinct.len()
+}
+
+/// A ring whose area is negligible relative to its own extent encloses
+/// nothing (collinear or duplicated points).
+fn ring_is_zero_area(ring: &[(f64, f64)]) -> bool {
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for (x, y) in ring {
+        min_x = min_x.min(*x);
+        min_y = min_y.min(*y);
+        max_x = max_x.max(*x);
+        max_y = max_y.max(*y);
+    }
+    let extent = (max_x - min_x).max(max_y - min_y);
+    if !extent.is_finite() || extent <= 0.0 {
+        return true;
+    }
+    signed_area(ring).abs() <= 1e-12 * extent * extent
 }
 
 /// Shoelace formula; positive for counter-clockwise rings.
@@ -3122,6 +3373,8 @@ mod tests {
             polygonize_closed,
             curve_tolerance: DEFAULT_CURVE_TOLERANCE,
             preserve_inserts: false,
+            include_layers: Vec::new(),
+            exclude_layers: Vec::new(),
         }
     }
 
@@ -4755,6 +5008,287 @@ mod tests {
         assert_eq!(
             extraction.top_level_accounted, extraction.model_space_entities,
             "every top-level entity must reach exactly one outcome"
+        );
+    }
+
+    #[test]
+    fn insert_with_non_default_normal_lifts_insertion_point_from_ocs() {
+        use acadrust::entities::Insert;
+        use acadrust::types::Vector3;
+
+        // Audit case A1: normal (0,1,0), OCS insertion (10,20,30), block
+        // point at the origin. Arbitrary axis maps it to WCS (-10,30,20),
+        // so the 2D feature must land at (-10, 30).
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "P",
+            Vector3::ZERO,
+            vec![EntityType::Point(Point::from_coords(0.0, 0.0, 0.0))],
+        );
+        let mut insert = Insert::new("P", Vector3::new(10.0, 20.0, 30.0));
+        insert.normal = Vector3::new(0.0, 1.0, 0.0);
+        document
+            .add_entity(EntityType::Insert(insert))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+        assert_eq!(extraction.features.len(), 1);
+        let geometry = extraction.features[0].geometry.as_ref().expect("geometry");
+        let GeometryValue::Point { coordinates } = &geometry.value else {
+            panic!("expected Point");
+        };
+        assert!(
+            (coordinates[0] - -10.0).abs() < 1e-9 && (coordinates[1] - 30.0).abs() < 1e-9,
+            "got ({}, {})",
+            coordinates[0],
+            coordinates[1]
+        );
+    }
+
+    #[test]
+    fn zero_sweep_arcs_are_skipped_and_full_turns_stay_full() {
+        use acadrust::entities::Arc;
+        use acadrust::types::Vector3;
+
+        let mut zero = Arc::new();
+        zero.center = Vector3::new(0.0, 0.0, 0.0);
+        zero.radius = 5.0;
+        zero.start_angle = 0.75;
+        zero.end_angle = 0.75;
+        match convert_entity(&EntityType::Arc(zero), &opts(false)) {
+            EntityOutcome::Skipped(reason) => assert!(reason.contains("zero"), "{reason}"),
+            other => panic!("zero-sweep arc must be skipped, got {other:?}"),
+        }
+
+        let mut full = Arc::new();
+        full.center = Vector3::new(0.0, 0.0, 0.0);
+        full.radius = 5.0;
+        full.start_angle = 0.0;
+        full.end_angle = std::f64::consts::TAU;
+        match convert_entity(&EntityType::Arc(full), &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => {
+                let GeometryValue::LineString { coordinates } = geometry else {
+                    panic!("expected LineString");
+                };
+                assert!(coordinates.len() > 8, "full turn must tessellate");
+            }
+            other => panic!("full-turn arc must convert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_normals_fail_instead_of_collapsing_geometry() {
+        let mut circle = Circle::from_coords(10.0, 20.0, 3.0, 5.0);
+        circle.normal = acadrust::types::Vector3::new(0.0, 0.0, 0.0);
+        match convert_entity(&EntityType::Circle(circle), &opts(false)) {
+            EntityOutcome::Failed(reason) => {
+                assert!(reason.contains("extrusion normal"), "{reason}");
+            }
+            other => panic!("zero-normal circle must fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collinear_hatch_loops_are_dropped_as_zero_area() {
+        use acadrust::entities::{BoundaryEdge, Hatch, PolylineEdge};
+        use acadrust::types::Vector2;
+
+        let mut hatch = Hatch::new();
+        hatch.paths.push(square_path((0.0, 0.0), (10.0, 10.0)));
+        let mut collinear = acadrust::entities::BoundaryPath::new();
+        collinear.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(
+            vec![
+                Vector2::new(2.0, 2.0),
+                Vector2::new(3.0, 2.0),
+                Vector2::new(4.0, 2.0),
+            ],
+            true,
+        )));
+        hatch.paths.push(collinear);
+
+        match convert_entity(&EntityType::Hatch(hatch), &opts(false)) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                warnings,
+            } => {
+                let GeometryValue::Polygon { coordinates } = geometry else {
+                    panic!("expected Polygon");
+                };
+                assert_eq!(coordinates.len(), 1, "zero-area hole must be dropped");
+                assert!(
+                    extra_properties
+                        .iter()
+                        .any(|(k, v)| *k == "hatch_loops_dropped" && *v == serde_json::json!(1)),
+                    "{extra_properties:?}"
+                );
+                assert!(
+                    warnings.iter().any(|w| w.contains("zero-area")),
+                    "{warnings:?}"
+                );
+            }
+            other => panic!("hatch must convert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nurbs_evaluation_is_invariant_to_knot_domain_scale() {
+        use super::evaluate_nurbs;
+
+        let control = [
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+            [2.0, 0.0, 0.0, 1.0],
+        ];
+        let knots_unit = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let knots_tiny: Vec<f64> = knots_unit.iter().map(|k| k * 1e-20).collect();
+        let at_unit = evaluate_nurbs(0.5, 2, &knots_unit, &control).expect("evaluate");
+        let at_tiny = evaluate_nurbs(0.5e-20, 2, &knots_tiny, &control).expect("evaluate");
+        assert!(
+            (at_unit.0 - at_tiny.0).abs() < 1e-9 && (at_unit.1 - at_tiny.1).abs() < 1e-9,
+            "{at_unit:?} vs {at_tiny:?}"
+        );
+        assert!((at_unit.0 - 1.0).abs() < 1e-12 && (at_unit.1 - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unresolved_model_space_handles_stay_in_the_accounting() {
+        use acadrust::types::Handle;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        document
+            .add_entity(EntityType::Point(Point::from_coords(1.0, 1.0, 0.0)))
+            .expect("add point");
+        document
+            .block_records
+            .get_mut("*Model_Space")
+            .expect("model space record")
+            .entity_handles
+            .push(Handle::new(0xDEAD));
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+        assert_eq!(extraction.model_space_entities, 2);
+        assert_eq!(extraction.top_level_accounted, 2);
+        assert!(
+            extraction
+                .failed
+                .keys()
+                .any(|(entity_type, _)| entity_type == "UNRESOLVED"),
+            "{:?}",
+            extraction.failed.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn boundary_segments_crossing_the_boundary_force_partial() {
+        use super::check_boundary;
+        use geojson::{Feature, Geometry, feature::Id};
+        use std::io::Write;
+
+        // U-shaped boundary: a 4x4 square with a notch cut from the top
+        // between x=1..3 down to y=1.
+        let boundary = serde_json::json!({
+            "type": "Polygon",
+            "coordinates": [[
+                [0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [3.0, 4.0], [3.0, 1.0],
+                [1.0, 1.0], [1.0, 4.0], [0.0, 4.0], [0.0, 0.0]
+            ]]
+        });
+        let mut file = tempfile::NamedTempFile::new().expect("temp boundary");
+        write!(file, "{boundary}").expect("write boundary");
+
+        // Both endpoints are inside the arms of the U, but the segment
+        // crosses the notch.
+        let feature = Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(GeometryValue::new_line_string(vec![
+                (0.5, 3.0),
+                (3.5, 3.0),
+            ]))),
+            id: Some(Id::String("BRIDGE".to_string())),
+            properties: None,
+            foreign_members: None,
+        };
+        let check = check_boundary(&[feature], file.path()).expect("boundary check");
+        assert_eq!(check.features_partial, 1, "{check:?}");
+        assert_eq!(check.features_inside, 0);
+    }
+
+    #[test]
+    fn malformed_boundaries_error_instead_of_panicking() {
+        use super::check_boundary;
+        use std::io::Write;
+
+        let cases = [
+            // Position with a single number (previously a panic).
+            r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[1],[2],[3],[1]]]}}"#,
+            // Open ring.
+            r#"{"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10]]]}"#,
+            // Ring with too few positions.
+            r#"{"type":"Polygon","coordinates":[[[0,0],[10,0],[0,0]]]}"#,
+            // Empty polygon carries no boundary at all.
+            r#"{"type":"Polygon","coordinates":[]}"#,
+        ];
+        for case in cases {
+            let mut file = tempfile::NamedTempFile::new().expect("temp boundary");
+            write!(file, "{case}").expect("write");
+            assert!(
+                check_boundary(&[], file.path()).is_err(),
+                "must reject: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn millimeter_neighbors_in_tight_clusters_are_not_outliers() {
+        use super::detect_spatial_outliers;
+        use geojson::{Feature, Geometry, feature::Id};
+
+        let feature = |id: &str, x: f64, y: f64| Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(GeometryValue::new_point((x, y)))),
+            id: Some(Id::String(id.to_string())),
+            properties: None,
+            foreign_members: None,
+        };
+        let mut features: Vec<Feature> = (0..20)
+            .map(|i| feature(&format!("C{i}"), 248_000.0, 7_396_000.0))
+            .collect();
+        features.push(feature("NEAR", 248_000.001, 7_396_000.0));
+
+        let scan = detect_spatial_outliers(&features);
+        assert_eq!(scan.outlier_features, 0, "{scan:?}");
+    }
+
+    #[test]
+    fn native_layer_filters_exclude_top_level_entities() {
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        let mut on_eixo = EntityType::Point(Point::from_coords(1.0, 1.0, 0.0));
+        on_eixo.common_mut().layer = "EIXO".to_string();
+        document.add_entity(on_eixo).expect("add point");
+        let mut on_pista = EntityType::Point(Point::from_coords(2.0, 2.0, 0.0));
+        on_pista.common_mut().layer = "PISTA".to_string();
+        document.add_entity(on_pista).expect("add point");
+
+        let mut options = opts(false);
+        options.exclude_layers = vec!["eixo".to_string()];
+        let extraction = extract(&document, &options).expect("extract");
+        assert_eq!(extraction.features.len(), 1);
+        assert_eq!(extraction.excluded_by_layer_filter, 1);
+
+        let mut options = opts(false);
+        options.include_layers = vec!["eixo".to_string()];
+        let extraction = extract(&document, &options).expect("extract");
+        assert_eq!(extraction.features.len(), 1);
+        assert_eq!(extraction.excluded_by_layer_filter, 1);
+        let properties = extraction.features[0]
+            .properties
+            .as_ref()
+            .expect("properties");
+        assert_eq!(
+            properties.get("layer"),
+            Some(&geojson::JsonValue::from("EIXO"))
         );
     }
 

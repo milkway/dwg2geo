@@ -140,18 +140,18 @@ Findings from the three-way audit recorded in `docs/AUDIT-2026-07-22.md`; fix in
 
 Correctness (wrong geometry or wrong diagnostics):
 
-- [ ] A1: transform INSERT insertion points as OCS (arbitrary axis), not WCS; fix preserved anchors too.
-- [ ] B2: make `--include-layers`/`--exclude-layers` actually filter on the native backend (or reject them there).
-- [ ] C1: reject malformed boundary GeoJSON (short positions, empty polygons) with an error instead of panicking.
+- [x] A1: transform INSERT insertion points as OCS (arbitrary axis), not WCS; fix preserved anchors too. (Verified against the audit's numeric case; default-normal output is byte-identical.)
+- [x] B2: make `--include-layers`/`--exclude-layers` actually filter on the native backend (or reject them there). (Case-insensitive top-level filtering in any native mode; dropped entities counted in `excluded.by_layer_filter`.)
+- [x] C1: reject malformed boundary GeoJSON (short positions, empty polygons) with an error instead of panicking. (Short/non-finite positions, open rings, sub-minimal rings, and empty polygons are actionable errors.)
 - [ ] A2: stop assuming meter-based source CRSs — resolve the CRS's native unit via PROJ or reject non-meter CRSs explicitly.
-- [ ] A3: zero/sub-epsilon ARC and ELLIPSE sweeps must be skipped as zero-length, not promoted to full revolutions.
-- [ ] A4: validate OCS normals as finite and nonzero; fail the entity instead of collapsing geometry to (0,0).
-- [ ] A5: reject zero-area hatch loops and count zero-area rings as degenerate in `geometry_checks`.
-- [ ] A6: use knot-scale-relative tolerance in De Boor denominators.
-- [ ] A7: boundary containment should consider segment crossings, not vertices only.
-- [ ] A8: include the document/child index in null-handle INSERT feature ids.
-- [ ] A9: count unresolved model-space handles in the accounting denominator.
-- [ ] A10: scale-aware fallback when MAD is zero in the outlier scan.
+- [x] A3: zero/sub-epsilon ARC and ELLIPSE sweeps must be skipped as zero-length, not promoted to full revolutions. (Shared `ccw_sweep` helper; raw full turns still normalize to 2 pi; zero-sweep hatch edges are ignored with a warning rather than dropping the loop.)
+- [x] A4: validate OCS normals as finite and nonzero; fail the entity instead of collapsing geometry to (0,0). (`valid_normal` applied to polylines, curves, solids, text, hatches, and inserts.)
+- [x] A5: reject zero-area hatch loops and count zero-area rings as degenerate in `geometry_checks`. (Extent-relative area epsilon.)
+- [x] A6: use knot-scale-relative tolerance in De Boor denominators. (Evaluation is now invariant to knot-domain scaling.)
+- [x] A7: boundary containment should consider segment crossings, not vertices only. (Proper segment-boundary intersection forces partial; U-notch case covered.)
+- [x] A8: include the document/child index in null-handle INSERT feature ids. (Both top-level and block-child indices propagate.)
+- [x] A9: count unresolved model-space handles in the accounting denominator. (Model-space unresolved handles count as source entities and failed outcomes; non-model ones no longer pollute conversion failures.)
+- [x] A10: scale-aware fallback when MAD is zero in the outlier scan. (Threshold floor of max(1 drawing unit, 1e-6 x coordinate magnitude).)
 
 Contract and completeness:
 

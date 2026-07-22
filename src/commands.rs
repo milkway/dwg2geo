@@ -134,10 +134,10 @@ pub fn execute(command: Command) -> Result<()> {
                 );
             }
 
-            if allow_local_coordinates && (!include_layers.is_empty() || !exclude_layers.is_empty())
-            {
+            let has_layer_filters = !include_layers.is_empty() || !exclude_layers.is_empty();
+            if has_layer_filters && backend != BackendChoice::Native && source_crs.is_none() {
                 bail!(
-                    "layer filtering runs on the GDAL route and requires --source-crs; it cannot be combined with --allow-local-coordinates"
+                    "on the external backend, layer filtering runs on the GDAL route and requires --source-crs; the native backend filters in any mode (--backend native)"
                 );
             }
 

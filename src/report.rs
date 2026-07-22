@@ -191,6 +191,8 @@ pub struct ExcludedCounts {
     pub paper_space: usize,
     pub block_definitions: usize,
     pub unowned: usize,
+    /// Top-level model-space entities dropped by layer filters.
+    pub by_layer_filter: usize,
 }
 
 #[derive(Debug, Serialize)]

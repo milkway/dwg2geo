@@ -76,11 +76,13 @@ pub enum Command {
         #[arg(long)]
         keep_intermediate: bool,
 
-        /// Convert only these layers (comma-separated). GDAL route only.
+        /// Convert only these layers (comma-separated, case-insensitive).
+        /// Native backend: any mode; external backend: GDAL route only.
         #[arg(long, value_delimiter = ',', value_name = "LAYER")]
         include_layers: Vec<String>,
 
-        /// Skip these layers (comma-separated). GDAL route only.
+        /// Skip these layers (comma-separated, case-insensitive). Native
+        /// backend: any mode; external backend: GDAL route only.
         #[arg(
             long,
             value_delimiter = ',',
@@ -151,6 +153,7 @@ pub enum BackendChoice {
     /// Use the installed LibreDWG and GDAL command-line tools.
     External,
 
-    /// Use the optional native Rust backend. This is a roadmap feature.
+    /// Use the pure-Rust native backend (requires a build with the
+    /// native-backend feature; reprojection needs native-reproject).
     Native,
 }
