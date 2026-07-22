@@ -4,6 +4,7 @@
 //! the CLI is a CAD-neutral, serializable summary. Conversion to GeoJSON is
 //! Milestone 3; this module only reads and reports.
 
+pub mod calibrate;
 pub mod convert;
 
 use std::{
