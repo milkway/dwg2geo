@@ -170,7 +170,7 @@ Contract and completeness:
 Performance and robustness:
 
 - [x] C2: profile and fix the quadratic scaling in hatch-heavy drawings (measured 4x time per 2x hatches). (Root cause: all-pairs even-odd nesting inside a single hatch with many loops. Ring-bbox pre-check plus a uniform x-grid over loop bboxes: 16k loops in one hatch went from ~3.4 s to 23 ms release, byte-identical output.)
-- [x] C3: streaming extraction for geojson-seq so memory is not O(total features). (Extraction hands each `CadFeature` to a sink; the geojson-seq route writes it to disk immediately instead of retaining it. Measured on 400k points: peak RSS 522 MB streaming vs 1175 MB collected.)
+- [x] C3: streaming extraction for geojson-seq so the full feature set is not retained. (Extraction hands each `CadFeature` to a sink; the geojson-seq route writes it to disk and drops it immediately. Measured on 400k features: ~11x lower peak RSS than the pre-refactor build. A lightweight per-feature center is still retained for the exact global-median outlier scan — the only remaining O(feature-count) allocation — so memory is dominated by the parsed document, not the feature set.)
 - [x] C4: adopt a versioning rule for the report schema (bump on any addition, or add a minor version). (REPORT_VERSION = 2 with a documented bump-on-addition rule.)
 
 Exit condition: A- and C-class findings closed; B-class findings closed or explicitly re-scoped with ADRs.

@@ -1059,6 +1059,16 @@ fn native_reprojection_transforms_and_records_provenance() {
     );
     assert_eq!(report["options"]["source_units"], "m");
     assert_eq!(report["options"]["source_crs"], "EPSG:31982");
+
+    // The reprojection step must appear in the audit trail even though the
+    // transform is interleaved with streaming extraction.
+    let steps = report["steps"].as_array().expect("steps");
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["purpose"] == "coordinate reprojection"),
+        "reprojection step missing: {steps:?}"
+    );
 }
 
 #[cfg(feature = "native-backend")]
@@ -1129,6 +1139,14 @@ fn control_point_calibration_transforms_and_reports_residuals() {
     let rms = calibration["rms_error"].as_f64().expect("rms");
     assert!(rms < 1e-9, "rms {rms}");
     assert_eq!(calibration["target_crs"], "EPSG:31982");
+
+    let steps = report["steps"].as_array().expect("steps");
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["purpose"] == "control-point calibration"),
+        "calibration step missing: {steps:?}"
+    );
 }
 
 #[cfg(feature = "native-backend")]

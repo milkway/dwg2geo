@@ -453,8 +453,19 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let mut bbox_drawing: Option<[f64; 4]> = None;
     let mut bbox_output: Option<[f64; 4]> = None;
     let mut geometry_checks = empty_geometry_checks();
+    // The spatial-outlier scan needs a global median, so a lightweight
+    // per-feature center is retained (this is the only O(feature-count)
+    // retention on the streaming path — the features themselves are written
+    // and dropped). Ids are kept only to name up to ten outlier samples.
     let mut centers: Vec<(String, f64, f64)> = Vec::new();
     let mut features_written = 0usize;
+    // Transforms are interleaved with extraction in the streaming pipeline;
+    // accumulate their time so the report still shows them as distinct
+    // audit-trail steps rather than folding them into extraction.
+    // `reproject_elapsed` is only mutated on the native-reproject path.
+    #[cfg_attr(not(feature = "native-reproject"), allow(unused_mut))]
+    let mut reproject_elapsed = std::time::Duration::ZERO;
+    let mut calibrate_elapsed = std::time::Duration::ZERO;
 
     let extract_started = Instant::now();
     let extraction = {
@@ -466,16 +477,20 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             #[cfg(feature = "native-reproject")]
             if let Some(plan) = &reprojection_plan {
                 let reprojector = &plan.reprojector;
+                let started = Instant::now();
                 feature
                     .geometry
                     .transform(&|x, y| reprojector.transform(x, y))
                     .with_context(|| format!("while reprojecting feature {}", feature.id))?;
+                reproject_elapsed += started.elapsed();
             }
             if let Some((calibration, _)) = &calibration_plan {
+                let started = Instant::now();
                 feature
                     .geometry
                     .transform(&|x, y| Ok(calibration.apply((x, y))))
                     .with_context(|| format!("while calibrating feature {}", feature.id))?;
+                calibrate_elapsed += started.elapsed();
             }
             if enforce_wgs84_extents {
                 if let Some((x, y)) = wgs84_violation(&feature) {
@@ -511,11 +526,32 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             }
         }
     };
+    // The interleaved transform time is reported as its own step, so
+    // subtract it from the extraction total to keep the audit trail honest.
+    let total_elapsed = extract_started.elapsed();
+    let extraction_only = total_elapsed
+        .saturating_sub(reproject_elapsed)
+        .saturating_sub(calibrate_elapsed);
     steps.push(Step {
         purpose: "entity extraction and GeoJSON mapping".to_string(),
         command: "(in-process converter)".to_string(),
-        duration_ms: extract_started.elapsed().as_millis() as u64,
+        duration_ms: extraction_only.as_millis() as u64,
     });
+    #[cfg(feature = "native-reproject")]
+    if let Some(plan) = &reprojection_plan {
+        steps.push(Step {
+            purpose: "coordinate reprojection".to_string(),
+            command: format!("(in-process PROJ {})", plan.info.proj_version),
+            duration_ms: reproject_elapsed.as_millis() as u64,
+        });
+    }
+    if calibration_plan.is_some() {
+        steps.push(Step {
+            purpose: "control-point calibration".to_string(),
+            command: "(in-process similarity transform)".to_string(),
+            duration_ms: calibrate_elapsed.as_millis() as u64,
+        });
+    }
 
     if features_written == 0 {
         warnings.push(
@@ -1046,7 +1082,9 @@ fn update_geometry_checks(checks: &mut report::GeometryChecks, feature: &CadFeat
                     .max((point.0 - first.0).abs())
                     .max((point.1 - first.1).abs())
             });
-            if !extent.is_finite() || area.abs() <= 1e-12 * extent * extent {
+            // The threshold is on twice the area, matching the pre-model
+            // batch check so degenerate-ring diagnostics stay stable.
+            if !extent.is_finite() || 2.0 * area.abs() <= 1e-12 * extent * extent {
                 checks.degenerate_rings += 1;
                 continue;
             }
@@ -1414,6 +1452,13 @@ fn process_insert(
 ) -> Result<()> {
     let id = feature_id(entity, index, placement);
 
+    // Every top-level INSERT reaches a terminal outcome (anchor, expansion,
+    // or a failure) on all paths below; count it before any early return so
+    // the accounting denominator stays balanced.
+    if placement.block_path.is_empty() {
+        extraction.top_level_accounted += 1;
+    }
+
     if !valid_normal(&insert.normal) {
         record_outcome(
             &mut extraction.failed,
@@ -1422,12 +1467,6 @@ fn process_insert(
             &id,
         );
         return Ok(());
-    }
-
-    // Every INSERT reaches a terminal outcome (anchor, expansion, or a
-    // failure) on all paths below.
-    if placement.block_path.is_empty() {
-        extraction.top_level_accounted += 1;
     }
 
     // Entities on layer "0" inside a block conventionally take the insert's
@@ -5239,6 +5278,40 @@ mod tests {
             }
             other => panic!("zero-normal circle must fail, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_normal_insert_stays_in_the_accounting() {
+        use acadrust::entities::Insert;
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "P",
+            Vector3::ZERO,
+            vec![EntityType::Point(Point::from_coords(0.0, 0.0, 0.0))],
+        );
+        let mut insert = Insert::new("P", Vector3::ZERO);
+        insert.normal = Vector3::new(0.0, 0.0, 0.0);
+        document
+            .add_entity(EntityType::Insert(insert))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+        // The failed INSERT must count toward the denominator so accounting
+        // still balances (an early return must not skip the increment).
+        assert_eq!(extraction.model_space_entities, 1);
+        assert_eq!(extraction.top_level_accounted, 1);
+        assert!(
+            extraction
+                .failed
+                .keys()
+                .any(|(entity_type, reason)| entity_type == "INSERT"
+                    && reason.contains("extrusion normal")),
+            "{:?}",
+            extraction.failed.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
