@@ -6,6 +6,11 @@ rust-version = "1.85"
 description = "Convert engineering DWG drawings to auditable GeoJSON"
 publish = false
 license = "MIT"
+repository = "https://github.com/milkway/dwg2geo"
+homepage = "https://github.com/milkway/dwg2geo"
+readme = "README.md"
+keywords = ["dwg", "geojson", "cad", "gis", "conversion"]
+categories = ["command-line-utilities", "science::geo"]
 
 [features]
 default = ["external-backend"]

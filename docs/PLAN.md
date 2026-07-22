@@ -116,12 +116,12 @@ Exit condition: releases have measurable correctness criteria rather than visual
 
 ## Milestone 7 — distribution
 
-- [ ] Linux, macOS, and Windows CI.
-- [ ] Release binaries and checksums.
+- [x] Linux, macOS, and Windows CI. (`.github/workflows/ci.yml`: fmt/clippy/test matrix across the three OSes for the self-contained default and native-backend builds, plus a dedicated Linux job that installs PROJ >= 9.6 and covers native-reproject.)
+- [x] Release binaries and checksums. (`.github/workflows/release.yml`: on a `v*` tag, builds the self-contained native-backend binary for linux-gnu, macOS x86_64+arm64, and windows-msvc, packages each with a SHA-256, aggregates SHA256SUMS, and publishes a GitHub Release.)
 - [ ] Shell completion and man page.
 - [ ] Container image with external tools as an optional distribution.
 - [ ] SBOM and dependency-license report.
-- [ ] Document external LibreDWG/GDAL licensing and distribution boundaries.
+- [x] Document external LibreDWG/GDAL licensing and distribution boundaries. (`docs/LICENSING.md`: LibreDWG is GPL-3.0 and invoked as a separate process (no linkage, not bundled), GDAL/PROJ are permissive; every distributed artifact stays MIT because none bundles LibreDWG.)
 
 Exit condition: users can install a repeatable build and understand its dependencies and limitations.
 

@@ -5,16 +5,54 @@ on:
   pull_request:
 
 jobs:
-  rust:
-    runs-on: ubuntu-latest
+  # Core matrix: the self-contained builds (default external-backend and the
+  # in-process native-backend) on all three target platforms. Neither needs a
+  # system CAD/GIS library, so these run everywhere without extra setup.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo clippy --all-targets --features native-backend -- -D warnings
-      - run: cargo test --features native-backend
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (default)
+        run: cargo test
+      - name: Clippy (native-backend)
+        run: cargo clippy --all-targets --features native-backend -- -D warnings
+      - name: Test (native-backend)
+        run: cargo test --features native-backend
+
+  # Reprojection needs system PROJ >= 9.6 (see docs/DECISIONS.md ADR-009), so
+  # it is covered in a dedicated Linux job that installs a recent PROJ rather
+  # than in the cross-platform matrix.
+  reproject:
+    name: test (native-reproject)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install PROJ >= 9.6 (ubuntugis)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:ubuntugis/ppa
+          sudo apt-get update
+          sudo apt-get install -y proj-bin libproj-dev cmake libsqlite3-dev
+          pkg-config --modversion proj
+      - name: Clippy (native-reproject)
+        run: cargo clippy --all-targets --features native-reproject -- -D warnings
+      - name: Test (native-reproject)
+        run: cargo test --features native-reproject
