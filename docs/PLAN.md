@@ -143,7 +143,7 @@ Correctness (wrong geometry or wrong diagnostics):
 - [x] A1: transform INSERT insertion points as OCS (arbitrary axis), not WCS; fix preserved anchors too. (Verified against the audit's numeric case; default-normal output is byte-identical.)
 - [x] B2: make `--include-layers`/`--exclude-layers` actually filter on the native backend (or reject them there). (Case-insensitive top-level filtering in any native mode; dropped entities counted in `excluded.by_layer_filter`.)
 - [x] C1: reject malformed boundary GeoJSON (short positions, empty polygons) with an error instead of panicking. (Short/non-finite positions, open rings, sub-minimal rings, and empty polygons are actionable errors.)
-- [ ] A2: stop assuming meter-based source CRSs — resolve the CRS's native unit via PROJ or reject non-meter CRSs explicitly.
+- [x] A2: stop assuming meter-based source CRSs — resolve the CRS's native unit via PROJ or reject non-meter CRSs explicitly. (proj-sys axis query; usft drawings into EPSG:2263 scale by 1.0 and reproduce the audit's expected coordinates; geographic CRSs reject linear units; unresolvable units fail closed.)
 - [x] A3: zero/sub-epsilon ARC and ELLIPSE sweeps must be skipped as zero-length, not promoted to full revolutions. (Shared `ccw_sweep` helper; raw full turns still normalize to 2 pi; zero-sweep hatch edges are ignored with a warning rather than dropping the loop.)
 - [x] A4: validate OCS normals as finite and nonzero; fail the entity instead of collapsing geometry to (0,0). (`valid_normal` applied to polylines, curves, solids, text, hatches, and inserts.)
 - [x] A5: reject zero-area hatch loops and count zero-area rings as degenerate in `geometry_checks`. (Extent-relative area epsilon.)
@@ -155,22 +155,22 @@ Correctness (wrong geometry or wrong diagnostics):
 
 Contract and completeness:
 
-- [ ] B1: capture external-tool diagnostics and add entity reconciliation to the external report ("no silent loss" applies to both backends).
-- [ ] B3: canonicalize temp paths in external report steps; add a determinism test for external reports.
-- [ ] B4: exhaustive per-entity-type support policy table checked against the acadrust enum.
+- [x] B1: capture external-tool diagnostics and add entity reconciliation to the external report ("no silent loss" applies to both backends). (Bounded stdout/stderr excerpts in `external_diagnostics`, stderr as warnings, and `external_summary` feature/geometry-type counts.)
+- [x] B3: canonicalize temp paths in external report steps; add a determinism test for external reports. (`<tmp>/` placeholder; repeated-run byte-identical test modulo durations.)
+- [x] B4: exhaustive per-entity-type support policy table checked against the acadrust enum. (All 44 variants classified in ENTITY_MAPPING.md — 16 converted, 11 deliberately unsupported, 17 not yet converted — enforced by `tests/entity_policy.rs`.)
 - [ ] B6: choose and version one feature-property schema (resolve the `cad_*` drift), then regenerate the golden file.
 - [ ] B5: commit a non-sensitive aggregate entity histogram of the reference drawing.
 - [ ] B7: emit text alignment/layout semantics (alignment modes, width factor, oblique; MTEXT attachment/columns).
 - [ ] B8: tolerance-driven spline sampling; implement or explicitly re-roadmap curve-fit/spline-fit polylines and meshes.
 - [ ] B9: introduce the CAD-neutral internal model promised by ADR-004 before expanding entity coverage further.
 - [ ] B10: reader-to-output integration fixtures per entity class (supported and deliberately unsupported).
-- [ ] B11: refresh stale CLI help/README claims; record disposition of `entities`/`validate`/`calibrate` future commands.
-- [ ] B12: make `doctor` health reflect per-route capability.
+- [x] B11: refresh stale CLI help/README claims; record disposition of `entities`/`validate`/`calibrate` future commands. (README current-scope rewritten; `--backend native` help updated; dispositions in docs/DECISIONS-FUTURE-COMMANDS.md.)
+- [x] B12: make `doctor` health reflect per-route capability. (Per-route capability in JSON and human output; healthy/exit 0 requires both tools; ADR-013.)
 
 Performance and robustness:
 
 - [ ] C2: profile and fix the quadratic scaling in hatch-heavy drawings (measured 4x time per 2x hatches).
 - [ ] C3: streaming extraction for geojson-seq so memory is not O(total features) (~2.5 GB per million features today).
-- [ ] C4: adopt a versioning rule for the report schema (bump on any addition, or add a minor version).
+- [x] C4: adopt a versioning rule for the report schema (bump on any addition, or add a minor version). (REPORT_VERSION = 2 with a documented bump-on-addition rule.)
 
 Exit condition: A- and C-class findings closed; B-class findings closed or explicitly re-scoped with ADRs.
