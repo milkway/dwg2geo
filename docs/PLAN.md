@@ -107,8 +107,8 @@ Exit condition: output positioning is explicit, reproducible, and sanity checked
 - [x] Validate polygon ring closure and orientation. (Same pass: every Polygon/MultiPolygon ring is checked for closure, CCW shells/CW holes, and minimum size.)
 - [x] Add golden GeoJSON tests with coordinate tolerances. (A synthetic AC1027 fixture pins seven native features; coordinates compare recursively within 1e-9; `UPDATE_GOLDEN=1` regenerates, and a sensitivity test proves the comparator catches 1e-6 drift.)
 - [ ] Add property-based tests for arc tessellation and affine transforms.
-- [ ] Differentially compare native output with LibreDWG/GDAL on a fixture corpus.
-- [ ] Establish acceptable loss thresholds per entity class.
+- [x] Differentially compare native output with LibreDWG/GDAL on a fixture corpus. (Three generated AC1027 drawings exercise primitive, curve, text, and block/INSERT behavior in `tests/differential.rs`.)
+- [x] Establish acceptable loss thresholds per entity class. (Exact count and spatial thresholds are established in `docs/DIFFERENTIAL.md`; any new divergence is a release blocker.)
 - [ ] Detect spatial outliers relative to the main coordinate cluster (dispersion/percentile based). Motivated by the reference drawing: ~18% of features are title blocks and legends near the drawing origin that reproject into geometry scattered across ±50° of longitude without tripping the global WGS 84 extent check.
 - [ ] Validate output containment against a reference boundary polygon (e.g. an IBGE municipal boundary fetched by `scripts/fetch-sorocaba-boundary.sh`); this technique conclusively identified the reference drawing's CRS.
 
