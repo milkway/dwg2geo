@@ -38,6 +38,8 @@ pub struct NativeConversionSummary {
     pub read_mode: String,
     pub read_errors: Vec<String>,
     pub features_written: usize,
+    /// Features whose geometry required curve approximation.
+    pub approximated_features: usize,
     pub converted: Vec<ConvertedCount>,
     pub skipped: Vec<OutcomeCount>,
     pub failed: Vec<OutcomeCount>,
@@ -93,6 +95,9 @@ pub struct ConversionOptions {
     pub include_layers: Vec<String>,
     pub exclude_layers: Vec<String>,
     pub polygonize_closed: bool,
+    /// Effective chord-error tolerance for arc tessellation, in drawing
+    /// units. `None` on routes that do not tessellate.
+    pub curve_tolerance: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,6 +159,7 @@ mod tests {
                 include_layers: vec!["EIXO".to_string()],
                 exclude_layers: Vec::new(),
                 polygonize_closed: false,
+                curve_tolerance: None,
             },
             external_tools: Vec::new(),
             steps: vec![Step {

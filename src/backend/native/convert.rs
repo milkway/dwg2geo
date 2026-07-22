@@ -35,6 +35,19 @@ use crate::{
 const MAX_HANDLE_SAMPLES: usize = 10;
 const Z_EPSILON: f64 = 1e-9;
 
+/// Default maximum chord error for arc tessellation, in drawing units.
+const DEFAULT_CURVE_TOLERANCE: f64 = 0.05;
+/// Angular safety cap per tessellated segment (15 degrees).
+const MAX_ANGLE_STEP: f64 = std::f64::consts::PI / 12.0;
+/// Hard cap on segments per arc; reaching it emits a warning.
+const MAX_ARC_SEGMENTS: usize = 256;
+
+/// Geometry-mapping options resolved from the CLI.
+struct GeometryOptions {
+    polygonize_closed: bool,
+    curve_tolerance: f64,
+}
+
 pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
     let started = Instant::now();
 
@@ -80,8 +93,13 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
         duration_ms: parse_started.elapsed().as_millis() as u64,
     });
 
+    let geometry_options = GeometryOptions {
+        polygonize_closed: request.polygonize_closed,
+        curve_tolerance: request.curve_tolerance.unwrap_or(DEFAULT_CURVE_TOLERANCE),
+    };
+
     let extract_started = Instant::now();
-    let extraction = extract(&document, request.polygonize_closed)?;
+    let extraction = extract(&document, &geometry_options)?;
     steps.push(Step {
         purpose: "entity extraction and GeoJSON mapping".to_string(),
         command: "(in-process converter)".to_string(),
@@ -138,6 +156,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             include_layers: request.include_layers.to_vec(),
             exclude_layers: request.exclude_layers.to_vec(),
             polygonize_closed: request.polygonize_closed,
+            curve_tolerance: Some(geometry_options.curve_tolerance),
         },
         external_tools: Vec::new(),
         steps,
@@ -149,6 +168,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             },
             read_errors,
             features_written,
+            approximated_features: extraction.approximated_features,
             converted: extraction
                 .converted
                 .into_iter()
@@ -210,6 +230,7 @@ struct Extraction {
     excluded_block_definitions: usize,
     excluded_unowned: usize,
     feature_warnings: usize,
+    approximated_features: usize,
 }
 
 fn outcome_counts(map: BTreeMap<(String, String), HandleSamples>) -> Vec<OutcomeCount> {
@@ -236,7 +257,7 @@ enum EntityOutcome {
 /// Convert every model-space entity in document order; count paper-space,
 /// block-definition, and unowned entities as excluded by the documented
 /// model-space filter.
-fn extract(document: &CadDocument, polygonize_closed: bool) -> Result<Extraction> {
+fn extract(document: &CadDocument, options: &GeometryOptions) -> Result<Extraction> {
     let mut extraction = Extraction::default();
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut model_index: usize = 0;
@@ -273,7 +294,7 @@ fn extract(document: &CadDocument, polygonize_closed: bool) -> Result<Extraction
                 continue;
             }
 
-            process_entity(entity, model_index, polygonize_closed, &mut extraction);
+            process_entity(entity, model_index, options, &mut extraction);
             model_index += 1;
         }
     }
@@ -294,19 +315,25 @@ fn extract(document: &CadDocument, polygonize_closed: bool) -> Result<Extraction
 fn process_entity(
     entity: &EntityType,
     index: usize,
-    polygonize_closed: bool,
+    options: &GeometryOptions,
     extraction: &mut Extraction,
 ) {
     let entity_type = entity.as_entity().entity_type().to_string();
     let handle_text = format!("{}", entity.common().handle);
 
-    match convert_entity(entity, polygonize_closed) {
+    match convert_entity(entity, options) {
         EntityOutcome::Converted {
             geometry,
             extra_properties,
             warnings,
         } => {
             extraction.feature_warnings += warnings.len();
+            if extra_properties
+                .iter()
+                .any(|(key, value)| *key == "approximated" && *value == JsonValue::Bool(true))
+            {
+                extraction.approximated_features += 1;
+            }
             *extraction.converted.entry(entity_type.clone()).or_default() += 1;
             extraction.features.push(build_feature(
                 entity,
@@ -379,11 +406,14 @@ fn build_feature(
     }
 }
 
-fn convert_entity(entity: &EntityType, polygonize_closed: bool) -> EntityOutcome {
+fn convert_entity(entity: &EntityType, options: &GeometryOptions) -> EntityOutcome {
     match entity {
         EntityType::Point(point) => convert_point(point),
         EntityType::Line(line) => convert_line(line),
-        EntityType::LwPolyline(polyline) => convert_lwpolyline(polyline, polygonize_closed),
+        EntityType::LwPolyline(polyline) => convert_lwpolyline(polyline, options),
+        EntityType::Polyline2D(polyline) => convert_polyline2d(polyline, options),
+        EntityType::Polyline3D(polyline) => convert_polyline3d(polyline, options),
+        EntityType::Polyline(polyline) => convert_polyline_generic(polyline, options),
         _ => EntityOutcome::Skipped(
             "entity type is not converted by the native backend yet".to_string(),
         ),
@@ -427,28 +457,187 @@ fn convert_line(line: &acadrust::entities::Line) -> EntityOutcome {
     }
 }
 
+/// One OCS polyline vertex: 2D location plus the bulge of the segment that
+/// starts at it (`bulge = tan(included_angle / 4)`).
+struct OcsVertex {
+    x: f64,
+    y: f64,
+    bulge: f64,
+}
+
 fn convert_lwpolyline(
     polyline: &acadrust::entities::LwPolyline,
-    polygonize_closed: bool,
+    options: &GeometryOptions,
 ) -> EntityOutcome {
-    if polyline.vertices.len() < 2 {
-        return EntityOutcome::Skipped("polyline has fewer than two vertices".to_string());
-    }
-    if polyline.vertices.iter().any(|vertex| vertex.bulge != 0.0) {
-        return EntityOutcome::Skipped("bulge arc segments are not tessellated yet".to_string());
+    let vertices: Vec<OcsVertex> = polyline
+        .vertices
+        .iter()
+        .map(|vertex| OcsVertex {
+            x: vertex.location.x,
+            y: vertex.location.y,
+            bulge: vertex.bulge,
+        })
+        .collect();
+    finish_ocs_path(
+        &vertices,
+        polyline.is_closed,
+        polyline.elevation,
+        polyline.normal,
+        options,
+    )
+}
+
+fn convert_polyline2d(
+    polyline: &acadrust::entities::Polyline2D,
+    options: &GeometryOptions,
+) -> EntityOutcome {
+    use acadrust::entities::PolylineFlags;
+
+    let flags = polyline.flags.bits();
+    if flags & (PolylineFlags::CURVE_FIT.bits() | PolylineFlags::SPLINE_FIT.bits()) != 0 {
+        return EntityOutcome::Skipped(
+            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+        );
     }
 
-    // LWPOLYLINE vertices live in OCS; lift them to WCS via the arbitrary
-    // axis algorithm (identity for the default normal).
-    let ocs_to_wcs = Matrix3::arbitrary_axis(polyline.normal);
-    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(polyline.vertices.len() + 1);
+    // 2D POLYLINE vertices share the polyline elevation; some files carry it
+    // on the vertices' z instead.
+    let elevation = if polyline.elevation != 0.0 {
+        polyline.elevation
+    } else {
+        polyline
+            .vertices
+            .first()
+            .map(|vertex| vertex.location.z)
+            .unwrap_or(0.0)
+    };
+    let vertices: Vec<OcsVertex> = polyline
+        .vertices
+        .iter()
+        .map(|vertex| OcsVertex {
+            x: vertex.location.x,
+            y: vertex.location.y,
+            bulge: vertex.bulge,
+        })
+        .collect();
+    finish_ocs_path(
+        &vertices,
+        polyline.is_closed(),
+        elevation,
+        polyline.normal,
+        options,
+    )
+}
+
+fn convert_polyline3d(
+    polyline: &acadrust::entities::Polyline3D,
+    options: &GeometryOptions,
+) -> EntityOutcome {
+    if polyline.flags.spline_fit {
+        return EntityOutcome::Skipped(
+            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+        );
+    }
+    if polyline.flags.is_3d_mesh || polyline.flags.is_polyface_mesh {
+        return EntityOutcome::Skipped(
+            "polygon/polyface meshes are not converted by the native backend yet".to_string(),
+        );
+    }
+
+    let points: Vec<Vector3> = polyline
+        .vertices
+        .iter()
+        .map(|vertex| vertex.position)
+        .collect();
+    finish_wcs_path(&points, polyline.flags.closed, options)
+}
+
+fn convert_polyline_generic(
+    polyline: &acadrust::entities::Polyline,
+    options: &GeometryOptions,
+) -> EntityOutcome {
+    use acadrust::entities::PolylineFlags;
+
+    let flags = polyline.flags.bits();
+    if flags & (PolylineFlags::CURVE_FIT.bits() | PolylineFlags::SPLINE_FIT.bits()) != 0 {
+        return EntityOutcome::Skipped(
+            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+        );
+    }
+    if flags & (PolylineFlags::POLYGON_MESH.bits() | PolylineFlags::POLYFACE_MESH.bits()) != 0 {
+        return EntityOutcome::Skipped(
+            "polygon/polyface meshes are not converted by the native backend yet".to_string(),
+        );
+    }
+
+    let points: Vec<Vector3> = polyline
+        .vertices
+        .iter()
+        .map(|vertex| vertex.location)
+        .collect();
+    finish_wcs_path(&points, polyline.is_closed(), options)
+}
+
+/// Expand bulge arcs in the OCS plane, lift to WCS via the arbitrary axis
+/// algorithm (identity for the default normal), and build the line/polygon.
+fn finish_ocs_path(
+    vertices: &[OcsVertex],
+    closed: bool,
+    elevation: f64,
+    normal: Vector3,
+    options: &GeometryOptions,
+) -> EntityOutcome {
+    if vertices.len() < 2 {
+        return EntityOutcome::Skipped("polyline has fewer than two vertices".to_string());
+    }
+    if vertices
+        .iter()
+        .any(|v| !v.x.is_finite() || !v.y.is_finite() || !v.bulge.is_finite())
+        || !elevation.is_finite()
+    {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+
+    let mut warnings = Vec::new();
+    let mut approximated = false;
+
+    // Expand each segment: its start vertex, then tessellated interior
+    // points when the segment is an arc. The closing segment of a closed
+    // polyline can carry a bulge too.
+    let mut ocs_points: Vec<(f64, f64)> = Vec::with_capacity(vertices.len());
+    let segment_count = if closed {
+        vertices.len()
+    } else {
+        vertices.len() - 1
+    };
+    for index in 0..segment_count {
+        let start = &vertices[index];
+        let end = &vertices[(index + 1) % vertices.len()];
+        ocs_points.push((start.x, start.y));
+        if start.bulge != 0.0 {
+            let interior = tessellate_bulge(
+                (start.x, start.y),
+                (end.x, end.y),
+                start.bulge,
+                options.curve_tolerance,
+                &mut warnings,
+            );
+            if !interior.is_empty() {
+                approximated = true;
+            }
+            ocs_points.extend(interior);
+        }
+    }
+    if !closed {
+        let last = vertices.last().expect("length checked above");
+        ocs_points.push((last.x, last.y));
+    }
+
+    let ocs_to_wcs = Matrix3::arbitrary_axis(normal);
+    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(ocs_points.len() + 1);
     let mut max_abs_z: f64 = 0.0;
-    for vertex in &polyline.vertices {
-        let wcs = ocs_to_wcs.transform_point(Vector3::new(
-            vertex.location.x,
-            vertex.location.y,
-            polyline.elevation,
-        ));
+    for (x, y) in ocs_points {
+        let wcs = ocs_to_wcs.transform_point(Vector3::new(x, y, elevation));
         if !is_finite(&wcs) {
             return EntityOutcome::Failed("non-finite coordinates".to_string());
         }
@@ -456,12 +645,50 @@ fn convert_lwpolyline(
         coordinates.push((wcs.x, wcs.y));
     }
 
+    push_z_warning(&mut warnings, max_abs_z);
+    if approximated {
+        warnings.push(format!(
+            "arc segments tessellated with chord tolerance {} drawing units",
+            options.curve_tolerance
+        ));
+    }
+    finish_coordinates(coordinates, closed, approximated, options, warnings)
+}
+
+/// 3D polylines carry WCS positions and no bulges; drop z with a warning.
+fn finish_wcs_path(points: &[Vector3], closed: bool, options: &GeometryOptions) -> EntityOutcome {
+    if points.len() < 2 {
+        return EntityOutcome::Skipped("polyline has fewer than two vertices".to_string());
+    }
+    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(points.len() + 1);
+    let mut max_abs_z: f64 = 0.0;
+    for point in points {
+        if !is_finite(point) {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        }
+        max_abs_z = max_abs_z.max(point.z.abs());
+        coordinates.push((point.x, point.y));
+    }
+
     let mut warnings = Vec::new();
     push_z_warning(&mut warnings, max_abs_z);
+    finish_coordinates(coordinates, closed, false, options, warnings)
+}
 
-    if polyline.is_closed && polygonize_closed {
-        let distinct = count_distinct(&coordinates);
-        if distinct < 3 {
+fn finish_coordinates(
+    mut coordinates: Vec<(f64, f64)>,
+    closed: bool,
+    approximated: bool,
+    options: &GeometryOptions,
+    warnings: Vec<String>,
+) -> EntityOutcome {
+    let mut extra_properties = vec![("is_closed", JsonValue::from(closed))];
+    if approximated {
+        extra_properties.push(("approximated", JsonValue::from(true)));
+    }
+
+    if closed && options.polygonize_closed {
+        if count_distinct(&coordinates) < 3 {
             return EntityOutcome::Skipped(
                 "closed polyline has fewer than three distinct vertices; cannot form a polygon ring"
                     .to_string(),
@@ -477,21 +704,81 @@ fn convert_lwpolyline(
         }
         return EntityOutcome::Converted {
             geometry: GeometryValue::new_polygon(vec![ring]),
-            extra_properties: vec![("is_closed", JsonValue::from(true))],
+            extra_properties,
             warnings,
         };
     }
 
-    let is_closed = polyline.is_closed;
-    if is_closed && coordinates.first() != coordinates.last() {
+    if closed && coordinates.first() != coordinates.last() {
         coordinates.push(coordinates[0]);
     }
 
     EntityOutcome::Converted {
         geometry: GeometryValue::new_line_string(coordinates),
-        extra_properties: vec![("is_closed", JsonValue::from(is_closed))],
+        extra_properties,
         warnings,
     }
+}
+
+/// Interior points of a bulge arc between `start` and `end` (both endpoints
+/// excluded), tessellated so the chord error stays within `tolerance` drawing
+/// units, capped at [`MAX_ANGLE_STEP`] per segment and [`MAX_ARC_SEGMENTS`]
+/// segments per arc. Deterministic: pure arithmetic on the inputs.
+fn tessellate_bulge(
+    start: (f64, f64),
+    end: (f64, f64),
+    bulge: f64,
+    tolerance: f64,
+    warnings: &mut Vec<String>,
+) -> Vec<(f64, f64)> {
+    let chord_x = end.0 - start.0;
+    let chord_y = end.1 - start.1;
+    let chord = (chord_x * chord_x + chord_y * chord_y).sqrt();
+    if chord <= f64::EPSILON {
+        warnings.push("arc segment with coincident endpoints collapsed to a point".to_string());
+        return Vec::new();
+    }
+
+    // bulge = tan(theta / 4); theta is the included angle, signed CCW.
+    let theta = 4.0 * bulge.atan();
+    let half_chord = chord / 2.0;
+    let sagitta = bulge.abs() * half_chord;
+    let radius = (half_chord * half_chord + sagitta * sagitta) / (2.0 * sagitta);
+    let apothem = radius - sagitta;
+
+    // Center sits on the perpendicular bisector; for positive bulge (CCW)
+    // it lies on the left of start->end, mirrored for negative bulge.
+    let left_x = -chord_y / chord;
+    let left_y = chord_x / chord;
+    let side = if bulge > 0.0 { 1.0 } else { -1.0 };
+    let center_x = (start.0 + end.0) / 2.0 + left_x * apothem * side;
+    let center_y = (start.1 + end.1) / 2.0 + left_y * apothem * side;
+
+    let chord_limited_step = if tolerance >= radius {
+        std::f64::consts::TAU
+    } else {
+        2.0 * (1.0 - tolerance / radius).acos()
+    };
+    let step = chord_limited_step.clamp(f64::EPSILON, MAX_ANGLE_STEP);
+    let mut segments = (theta.abs() / step).ceil() as usize;
+    segments = segments.max(1);
+    if segments > MAX_ARC_SEGMENTS {
+        segments = MAX_ARC_SEGMENTS;
+        warnings.push(format!(
+            "arc tessellation capped at {MAX_ARC_SEGMENTS} segments; chord tolerance not met"
+        ));
+    }
+
+    let start_angle = (start.1 - center_y).atan2(start.0 - center_x);
+    (1..segments)
+        .map(|i| {
+            let angle = start_angle + theta * (i as f64) / (segments as f64);
+            (
+                center_x + radius * angle.cos(),
+                center_y + radius * angle.sin(),
+            )
+        })
+        .collect()
 }
 
 fn push_z_warning(warnings: &mut Vec<String>, max_abs_z: f64) {
@@ -532,7 +819,17 @@ mod tests {
     };
     use geojson::GeometryValue;
 
-    use super::{EntityOutcome, convert_entity, extract, signed_area};
+    use super::{
+        DEFAULT_CURVE_TOLERANCE, EntityOutcome, GeometryOptions, convert_entity, extract,
+        signed_area, tessellate_bulge,
+    };
+
+    fn opts(polygonize_closed: bool) -> GeometryOptions {
+        GeometryOptions {
+            polygonize_closed,
+            curve_tolerance: DEFAULT_CURVE_TOLERANCE,
+        }
+    }
 
     fn lwpolyline(points: &[(f64, f64)], closed: bool) -> LwPolyline {
         let mut polyline = LwPolyline::new();
@@ -546,7 +843,7 @@ mod tests {
     #[test]
     fn point_and_line_map_to_2d_geometries() {
         let point = EntityType::Point(Point::from_coords(1.0, 2.0, 0.0));
-        match convert_entity(&point, false) {
+        match convert_entity(&point, &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => {
                 assert_eq!(geometry, GeometryValue::new_point((1.0, 2.0)));
             }
@@ -554,7 +851,7 @@ mod tests {
         }
 
         let line = EntityType::Line(Line::from_coords(0.0, 0.0, 3.0, 4.0, 5.0, 3.0));
-        match convert_entity(&line, false) {
+        match convert_entity(&line, &opts(false)) {
             EntityOutcome::Converted {
                 geometry, warnings, ..
             } => {
@@ -571,7 +868,7 @@ mod tests {
     #[test]
     fn degenerate_line_is_skipped_with_reason() {
         let line = EntityType::Line(Line::from_coords(1.0, 1.0, 0.0, 1.0, 1.0, 0.0));
-        match convert_entity(&line, false) {
+        match convert_entity(&line, &opts(false)) {
             EntityOutcome::Skipped(reason) => assert!(reason.contains("degenerate")),
             _ => panic!("degenerate line must be skipped"),
         }
@@ -581,7 +878,7 @@ mod tests {
     fn closed_polyline_becomes_closed_linestring_by_default() {
         let polyline =
             EntityType::LwPolyline(lwpolyline(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], true));
-        match convert_entity(&polyline, false) {
+        match convert_entity(&polyline, &opts(false)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
                 GeometryValue::LineString { coordinates } => {
                     assert_eq!(coordinates.len(), 4);
@@ -600,7 +897,7 @@ mod tests {
             &[(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)],
             true,
         ));
-        match convert_entity(&polyline, true) {
+        match convert_entity(&polyline, &opts(true)) {
             EntityOutcome::Converted { geometry, .. } => match geometry {
                 GeometryValue::Polygon { coordinates } => {
                     assert_eq!(coordinates.len(), 1);
@@ -619,12 +916,168 @@ mod tests {
     }
 
     #[test]
-    fn bulged_polyline_is_skipped_not_flattened() {
+    fn quarter_circle_bulge_tessellates_on_the_unit_circle() {
+        let mut warnings = Vec::new();
+        let bulge = (std::f64::consts::PI / 8.0).tan();
+        let interior = tessellate_bulge((1.0, 0.0), (0.0, 1.0), bulge, 0.05, &mut warnings);
+
+        assert!(warnings.is_empty());
+        assert!((4..=6).contains(&interior.len()), "got {}", interior.len());
+        for (x, y) in &interior {
+            let radius = (x * x + y * y).sqrt();
+            assert!((radius - 1.0).abs() < 1e-9, "point off circle: {x},{y}");
+            assert!(
+                *x > 0.0 && *y > 0.0,
+                "point outside first quadrant: {x},{y}"
+            );
+        }
+    }
+
+    #[test]
+    fn bulge_sign_selects_arc_side() {
+        let mut warnings = Vec::new();
+        let ccw = tessellate_bulge((0.0, 0.0), (10.0, 0.0), 1.0, 0.01, &mut warnings);
+        let min_y = ccw.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        assert!(
+            (min_y + 5.0).abs() < 0.05,
+            "CCW semicircle apex, got {min_y}"
+        );
+
+        let cw = tessellate_bulge((0.0, 0.0), (10.0, 0.0), -1.0, 0.01, &mut warnings);
+        let max_y = cw.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (max_y - 5.0).abs() < 0.05,
+            "CW semicircle apex, got {max_y}"
+        );
+
+        for (x, y) in ccw.iter().chain(cw.iter()) {
+            let radius = ((x - 5.0).powi(2) + y.powi(2)).sqrt();
+            assert!((radius - 5.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn bulged_polyline_is_tessellated_and_marked_approximated() {
         let mut polyline = lwpolyline(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], false);
         polyline.vertices[1].bulge = 0.5;
-        match convert_entity(&EntityType::LwPolyline(polyline), false) {
-            EntityOutcome::Skipped(reason) => assert!(reason.contains("bulge")),
-            _ => panic!("bulged polyline must be skipped, not approximated silently"),
+        match convert_entity(&EntityType::LwPolyline(polyline), &opts(false)) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                warnings,
+            } => {
+                match geometry {
+                    GeometryValue::LineString { coordinates } => {
+                        assert!(coordinates.len() > 3, "arc must add interior points");
+                    }
+                    other => panic!("expected LineString, got {other:?}"),
+                }
+                assert!(
+                    extra_properties
+                        .iter()
+                        .any(|(key, value)| *key == "approximated"
+                            && *value == serde_json::Value::Bool(true))
+                );
+                assert!(warnings.iter().any(|w| w.contains("chord tolerance")));
+            }
+            _ => panic!("bulged polyline must convert via tessellation"),
+        }
+    }
+
+    #[test]
+    fn closing_segment_bulge_forms_a_full_circle() {
+        let mut polyline = lwpolyline(&[(0.0, 0.0), (10.0, 0.0)], true);
+        polyline.vertices[0].bulge = 1.0;
+        polyline.vertices[1].bulge = 1.0;
+        match convert_entity(&EntityType::LwPolyline(polyline), &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => match geometry {
+                GeometryValue::LineString { coordinates } => {
+                    assert_eq!(coordinates.first(), coordinates.last(), "ring must close");
+                    assert!(coordinates.len() > 12);
+                    for position in &coordinates {
+                        let radius = ((position[0] - 5.0).powi(2) + position[1].powi(2)).sqrt();
+                        assert!((radius - 5.0).abs() < 1e-9);
+                    }
+                }
+                other => panic!("expected LineString, got {other:?}"),
+            },
+            _ => panic!("circle-shaped polyline must convert"),
+        }
+    }
+
+    #[test]
+    fn arc_segment_cap_is_reported() {
+        let mut warnings = Vec::new();
+        let interior = tessellate_bulge((0.0, 0.0), (10.0, 0.0), 1.0, 1e-7, &mut warnings);
+        assert_eq!(interior.len(), super::MAX_ARC_SEGMENTS - 1);
+        assert!(warnings.iter().any(|w| w.contains("capped")));
+    }
+
+    #[test]
+    fn classic_2d_polyline_converts_and_smoothing_is_skipped() {
+        use acadrust::entities::{Polyline2D, PolylineFlags, Vertex2D};
+        use acadrust::types::Vector3;
+
+        let mut plain = Polyline2D::new();
+        plain.vertices = vec![
+            Vertex2D::new(Vector3::new(0.0, 0.0, 0.0)),
+            Vertex2D::new(Vector3::new(10.0, 0.0, 0.0)),
+            Vertex2D::new(Vector3::new(10.0, 10.0, 0.0)),
+        ];
+        plain.flags = PolylineFlags::from_bits(PolylineFlags::CLOSED.bits());
+        match convert_entity(&EntityType::Polyline2D(plain), &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => match geometry {
+                GeometryValue::LineString { coordinates } => {
+                    assert_eq!(coordinates.len(), 4);
+                    assert_eq!(coordinates.first(), coordinates.last());
+                }
+                other => panic!("expected LineString, got {other:?}"),
+            },
+            _ => panic!("classic 2D polyline must convert"),
+        }
+
+        let mut smoothed = Polyline2D::new();
+        smoothed.vertices = vec![
+            Vertex2D::new(Vector3::new(0.0, 0.0, 0.0)),
+            Vertex2D::new(Vector3::new(10.0, 0.0, 0.0)),
+        ];
+        smoothed.flags = PolylineFlags::from_bits(PolylineFlags::SPLINE_FIT.bits());
+        match convert_entity(&EntityType::Polyline2D(smoothed), &opts(false)) {
+            EntityOutcome::Skipped(reason) => assert!(reason.contains("smoothing")),
+            _ => panic!("spline-fit polyline must be skipped"),
+        }
+    }
+
+    #[test]
+    fn polyline3d_drops_z_with_warning() {
+        use acadrust::entities::{Polyline3D, Vertex3DPolyline};
+        use acadrust::types::{Handle, Vector3};
+
+        let mut polyline = Polyline3D::new();
+        polyline.flags.closed = true;
+        polyline.vertices = [(0.0, 0.0, 2.0), (10.0, 0.0, 2.0), (10.0, 10.0, 2.0)]
+            .into_iter()
+            .map(|(x, y, z)| Vertex3DPolyline {
+                handle: Handle::NULL,
+                layer: "0".to_string(),
+                position: Vector3::new(x, y, z),
+                flags: 0,
+            })
+            .collect();
+        match convert_entity(&EntityType::Polyline3D(polyline), &opts(false)) {
+            EntityOutcome::Converted {
+                geometry, warnings, ..
+            } => {
+                match geometry {
+                    GeometryValue::LineString { coordinates } => {
+                        assert_eq!(coordinates.len(), 4);
+                        assert_eq!(coordinates.first(), coordinates.last());
+                    }
+                    other => panic!("expected LineString, got {other:?}"),
+                }
+                assert!(warnings.iter().any(|w| w.contains("z coordinates dropped")));
+            }
+            _ => panic!("3D polyline must convert"),
         }
     }
 
@@ -641,7 +1094,7 @@ mod tests {
             .add_paper_space_entity(EntityType::Point(Point::from_coords(2.0, 2.0, 0.0)))
             .expect("add paper point");
 
-        let extraction = extract(&document, false).expect("extract");
+        let extraction = extract(&document, &opts(false)).expect("extract");
 
         assert_eq!(extraction.features.len(), 1);
         assert_eq!(extraction.converted.get("POINT"), Some(&1));
@@ -664,8 +1117,8 @@ mod tests {
                 .expect("add point");
         }
 
-        let first = extract(&document, false).expect("extract");
-        let second = extract(&document, false).expect("extract");
+        let first = extract(&document, &opts(false)).expect("extract");
+        let second = extract(&document, &opts(false)).expect("extract");
 
         let ids = |extraction: &super::Extraction| -> Vec<String> {
             extraction

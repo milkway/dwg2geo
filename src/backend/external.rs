@@ -137,6 +137,9 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             include_layers: request.include_layers.to_vec(),
             exclude_layers: request.exclude_layers.to_vec(),
             polygonize_closed: request.polygonize_closed,
+            // Always None here: the CLI rejects --curve-tolerance for the
+            // external backend, which does not tessellate.
+            curve_tolerance: request.curve_tolerance,
         },
         external_tools,
         steps,

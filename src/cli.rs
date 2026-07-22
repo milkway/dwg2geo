@@ -88,6 +88,11 @@ pub enum Command {
         /// (native backend only; see ADR-006).
         #[arg(long)]
         polygonize_closed: bool,
+
+        /// Maximum chord error, in drawing units, when tessellating arcs
+        /// (native backend only; default 0.05).
+        #[arg(long, value_name = "UNITS")]
+        curve_tolerance: Option<f64>,
     },
 }
 

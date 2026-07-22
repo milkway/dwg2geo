@@ -558,7 +558,7 @@ fn native_convert_writes_geojson_and_accounted_report() {
     );
 
     let features = geojson["features"].as_array().expect("features");
-    assert_eq!(features.len(), 3);
+    assert_eq!(features.len(), 4);
     let kinds: Vec<(&str, &str)> = features
         .iter()
         .map(|feature| {
@@ -574,12 +574,23 @@ fn native_convert_writes_geojson_and_accounted_report() {
             ("LINE", "LineString"),
             ("POINT", "Point"),
             ("LWPOLYLINE", "Polygon"),
+            ("LWPOLYLINE", "LineString"),
         ]
     );
     for feature in features {
         assert_eq!(feature["properties"]["space"], "model");
         assert!(feature["id"].is_string(), "feature must have a stable id");
     }
+    // The bulged polyline is tessellated and marked as approximated.
+    let bulged = &features[3];
+    assert_eq!(bulged["properties"]["approximated"], true);
+    assert!(
+        bulged["geometry"]["coordinates"]
+            .as_array()
+            .expect("coordinates")
+            .len()
+            > 2
+    );
 
     let report_path = dir.path().join("saída ç.geojson.report.json");
     let report: serde_json::Value =
@@ -587,26 +598,17 @@ fn native_convert_writes_geojson_and_accounted_report() {
             .expect("report is JSON");
     assert_eq!(report["options"]["backend"], "native");
     assert_eq!(report["options"]["polygonize_closed"], true);
+    assert_eq!(report["options"]["curve_tolerance"], 0.05);
 
     let native = &report["native"];
     assert_eq!(native["read_mode"], "strict");
-    assert_eq!(native["features_written"], 3);
+    assert_eq!(native["features_written"], 4);
+    assert_eq!(native["approximated_features"], 1);
     assert_eq!(native["excluded"]["paper_space"], 1);
 
     let skipped = native["skipped"].as_array().expect("skipped");
-    let mut skip_pairs: Vec<(&str, &str)> = skipped
-        .iter()
-        .map(|entry| {
-            (
-                entry["entity_type"].as_str().expect("type"),
-                entry["reason"].as_str().expect("reason"),
-            )
-        })
-        .collect();
-    skip_pairs.sort_unstable();
-    assert_eq!(skip_pairs.len(), 2);
-    assert_eq!(skip_pairs[0].0, "CIRCLE");
-    assert!(skip_pairs[1].1.contains("bulge"));
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["entity_type"], "CIRCLE");
 }
 
 #[cfg(feature = "native-backend")]

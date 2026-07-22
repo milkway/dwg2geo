@@ -99,6 +99,7 @@ pub fn execute(command: Command) -> Result<()> {
             include_layers,
             exclude_layers,
             polygonize_closed,
+            curve_tolerance,
         } => {
             if source_crs.is_none() && !allow_local_coordinates {
                 bail!(
@@ -119,6 +120,17 @@ pub fn execute(command: Command) -> Result<()> {
                 );
             }
 
+            if curve_tolerance.is_some() && backend != BackendChoice::Native {
+                bail!(
+                    "--curve-tolerance is only supported by the native backend; pass --backend native"
+                );
+            }
+            if let Some(tolerance) = curve_tolerance {
+                if !tolerance.is_finite() || tolerance <= 0.0 {
+                    bail!("--curve-tolerance must be a positive number of drawing units");
+                }
+            }
+
             if allow_local_coordinates {
                 eprintln!(
                     "warning: exporting local CAD coordinates without establishing a geographic CRS"
@@ -136,6 +148,7 @@ pub fn execute(command: Command) -> Result<()> {
                 include_layers: &include_layers,
                 exclude_layers: &exclude_layers,
                 polygonize_closed,
+                curve_tolerance,
             };
 
             match backend {
