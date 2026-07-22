@@ -13,7 +13,7 @@ use std::{collections::BTreeMap, fs, time::Instant};
 use acadrust::{
     CadDocument,
     entities::EntityType,
-    types::{Matrix3, Vector3},
+    types::{Color, Matrix3, Vector3},
 };
 use anyhow::{Context, Result, bail};
 use geojson::{
@@ -98,6 +98,16 @@ impl Affine {
         )
     }
 
+    /// Apply only the linear part (no translation); for directions.
+    fn apply_linear(&self, v: Vector3) -> Vector3 {
+        let m = &self.linear;
+        Vector3::new(
+            m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z,
+            m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
+            m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z,
+        )
+    }
+
     /// `self` after `inner` (apply `inner` first).
     fn compose(&self, inner: &Affine) -> Affine {
         let mut linear = [[0.0; 3]; 3];
@@ -132,6 +142,12 @@ struct Placement {
     /// Layer substituted for block entities on layer "0" (the conventional
     /// BYBLOCK-style inheritance); None outside block content.
     inherited_layer: Option<String>,
+    /// Resolved color of the enclosing insert, substituted for ByBlock
+    /// entity colors; None outside block content or when unresolvable.
+    inherited_color: Option<Color>,
+    /// Resolved linetype of the enclosing insert, substituted for ByBlock
+    /// entity linetypes; None outside block content or when unresolvable.
+    inherited_linetype: Option<String>,
     /// Largest accumulated |scale| factor, for tessellation-error warnings.
     max_scale: f64,
 }
@@ -143,9 +159,93 @@ impl Placement {
             block_path: Vec::new(),
             id_prefix: String::new(),
             inherited_layer: None,
+            inherited_color: None,
+            inherited_linetype: None,
             max_scale: 1.0,
         }
     }
+}
+
+/// Layer "0" content inside a block takes the insert's effective layer.
+fn effective_layer(source_layer: &str, placement: &Placement) -> String {
+    if source_layer == "0" {
+        placement
+            .inherited_layer
+            .clone()
+            .unwrap_or_else(|| source_layer.to_string())
+    } else {
+        source_layer.to_string()
+    }
+}
+
+/// Resolve a color policy to a concrete color: ByLayer through the effective
+/// layer's table entry, ByBlock through the enclosing insert. None when the
+/// policy cannot be resolved (missing layer, or ByBlock outside a block).
+fn resolve_color(
+    document: &CadDocument,
+    color: Color,
+    layer: &str,
+    placement: &Placement,
+) -> Option<Color> {
+    match color {
+        Color::Index(_) | Color::Rgb { .. } => Some(color),
+        Color::ByLayer => document
+            .layers
+            .get(layer)
+            .map(|entry| entry.color)
+            .filter(|resolved| matches!(resolved, Color::Index(_) | Color::Rgb { .. })),
+        Color::ByBlock => placement.inherited_color,
+    }
+}
+
+/// Resolve a linetype name the same way; an empty name means ByLayer.
+fn resolve_linetype(
+    document: &CadDocument,
+    linetype: &str,
+    layer: &str,
+    placement: &Placement,
+) -> Option<String> {
+    if linetype.is_empty() || linetype.eq_ignore_ascii_case("bylayer") {
+        document
+            .layers
+            .get(layer)
+            .map(|entry| entry.line_type.clone())
+    } else if linetype.eq_ignore_ascii_case("byblock") {
+        placement.inherited_linetype.clone()
+    } else {
+        Some(linetype.to_string())
+    }
+}
+
+/// Style properties for a feature: resolved color (ACI index and/or RGB) and
+/// linetype. Unresolvable policies are emitted verbatim ("ByLayer" or
+/// "ByBlock") instead of being dropped.
+fn style_properties(
+    document: &CadDocument,
+    common: &acadrust::entities::EntityCommon,
+    layer: &str,
+    placement: &Placement,
+) -> Vec<(&'static str, JsonValue)> {
+    let mut properties = Vec::new();
+    match resolve_color(document, common.color, layer, placement) {
+        Some(color) => {
+            if let Some(index) = color.index() {
+                properties.push(("color_index", JsonValue::from(index)));
+            }
+            if let Some((r, g, b)) = color.rgb() {
+                properties.push((
+                    "color_rgb",
+                    JsonValue::from(format!("#{r:02X}{g:02X}{b:02X}")),
+                ));
+            }
+        }
+        None => properties.push(("color", JsonValue::from(common.color.to_string()))),
+    }
+    match resolve_linetype(document, &common.linetype, layer, placement) {
+        Some(name) => properties.push(("linetype", JsonValue::from(name))),
+        None => properties.push(("linetype", JsonValue::from("ByBlock"))),
+    }
+    properties
 }
 
 /// Apply the placement and project to 2D, tracking dropped |z|. None on
@@ -494,9 +594,16 @@ fn process_entity(
     match convert_entity(entity, options, placement) {
         EntityOutcome::Converted {
             geometry,
-            extra_properties,
+            mut extra_properties,
             warnings,
         } => {
+            let layer = effective_layer(&entity.common().layer, placement);
+            extra_properties.extend(style_properties(
+                document,
+                entity.common(),
+                &layer,
+                placement,
+            ));
             extraction.feature_warnings += warnings.len();
             if extra_properties
                 .iter()
@@ -548,17 +655,16 @@ fn process_insert(
     let id = feature_id(entity, 0, placement);
 
     // Entities on layer "0" inside a block conventionally take the insert's
-    // layer; resolve the insert's own effective layer first so the rule
-    // composes through nesting.
-    let insert_layer = &entity.common().layer;
-    let effective_layer = if insert_layer == "0" {
-        placement
-            .inherited_layer
-            .clone()
-            .unwrap_or_else(|| insert_layer.clone())
-    } else {
-        insert_layer.clone()
-    };
+    // layer; resolve the insert's own effective layer, color, and linetype
+    // first so the rules compose through nesting.
+    let insert_layer = effective_layer(&entity.common().layer, placement);
+    let insert_color = resolve_color(document, entity.common().color, &insert_layer, placement);
+    let insert_linetype = resolve_linetype(
+        document,
+        &entity.common().linetype,
+        &insert_layer,
+        placement,
+    );
 
     let attributes: BTreeMap<String, String> = insert
         .attributes
@@ -567,7 +673,7 @@ fn process_insert(
         .collect();
 
     if options.preserve_inserts {
-        emit_insert_anchor(entity, insert, &attributes, extraction, placement);
+        emit_insert_anchor(document, entity, insert, &attributes, extraction, placement);
         return;
     }
 
@@ -634,7 +740,9 @@ fn process_insert(
                 )),
                 block_path: block_path.clone(),
                 id_prefix: format!("{id}{cell_suffix}/"),
-                inherited_layer: Some(effective_layer.clone()),
+                inherited_layer: Some(insert_layer.clone()),
+                inherited_color: insert_color,
+                inherited_linetype: insert_linetype.clone(),
                 max_scale: placement.max_scale * instance_scale,
             };
 
@@ -676,13 +784,14 @@ fn process_insert(
 
     extraction.inserts_expanded += 1;
     if !attributes.is_empty() {
-        emit_insert_anchor(entity, insert, &attributes, extraction, placement);
+        emit_insert_anchor(document, entity, insert, &attributes, extraction, placement);
     }
 }
 
 /// Point feature at the (transformed) insertion point carrying the block
 /// name and attribute values.
 fn emit_insert_anchor(
+    document: &CadDocument,
     entity: &EntityType,
     insert: &acadrust::entities::Insert,
     attributes: &BTreeMap<String, String>,
@@ -718,6 +827,13 @@ fn emit_insert_anchor(
             .collect();
         extra_properties.push(("attributes", JsonValue::Object(map)));
     }
+    let layer = effective_layer(&entity.common().layer, placement);
+    extra_properties.extend(style_properties(
+        document,
+        entity.common(),
+        &layer,
+        placement,
+    ));
 
     extraction.feature_warnings += warnings.len();
     *extraction
@@ -759,16 +875,8 @@ fn build_feature(
 ) -> Feature {
     let common = entity.common();
 
-    // Layer "0" content inside a block takes the insert's layer.
     let source_layer = common.layer.clone();
-    let layer = if source_layer == "0" {
-        placement
-            .inherited_layer
-            .clone()
-            .unwrap_or_else(|| source_layer.clone())
-    } else {
-        source_layer.clone()
-    };
+    let layer = effective_layer(&source_layer, placement);
 
     let mut properties = JsonObject::new();
     properties.insert("layer".to_string(), JsonValue::from(layer.clone()));
@@ -1567,19 +1675,46 @@ fn convert_text(text: &acadrust::entities::Text, placement: &Placement) -> Entit
     let mut warnings = Vec::new();
     push_z_warning(&mut warnings, max_abs_z);
 
+    let rotation_deg = effective_rotation_degrees(
+        text.rotation,
+        Some(&Matrix3::arbitrary_axis(text.normal)),
+        placement,
+    );
+
     EntityOutcome::Converted {
         geometry: GeometryValue::new_point(position),
         extra_properties: vec![
             ("text", JsonValue::from(text.value.clone())),
             ("text_height", JsonValue::from(text.height)),
-            (
-                "text_rotation_deg",
-                JsonValue::from(text.rotation.to_degrees()),
-            ),
+            ("text_rotation_deg", JsonValue::from(rotation_deg)),
             ("text_style", JsonValue::from(text.style.clone())),
         ],
         warnings,
     }
+}
+
+/// Rotation of a text baseline after the placement transform, in degrees.
+/// Model-space text keeps its stored rotation verbatim; block content gets
+/// the direction of the transformed baseline (well-defined even under
+/// non-uniform scale), normalized to [0, 360).
+fn effective_rotation_degrees(
+    rotation: f64,
+    ocs_to_wcs: Option<&Matrix3>,
+    placement: &Placement,
+) -> f64 {
+    if placement.block_path.is_empty() {
+        return rotation.to_degrees();
+    }
+    let (sin, cos) = rotation.sin_cos();
+    let mut direction = Vector3::new(cos, sin, 0.0);
+    if let Some(matrix) = ocs_to_wcs {
+        direction = matrix.transform_point(direction);
+    }
+    let placed = placement.matrix.apply_linear(direction);
+    if !placed.x.is_finite() || !placed.y.is_finite() || placed.x.hypot(placed.y) <= f64::EPSILON {
+        return rotation.to_degrees();
+    }
+    placed.y.atan2(placed.x).to_degrees().rem_euclid(360.0)
 }
 
 /// MTEXT insertion points are WCS; the value may carry inline format codes,
@@ -1598,13 +1733,11 @@ fn convert_mtext(mtext: &acadrust::entities::MText, placement: &Placement) -> En
     push_z_warning(&mut warnings, max_abs_z);
 
     let plain = strip_mtext_codes(&mtext.value);
+    let rotation_deg = effective_rotation_degrees(mtext.rotation, None, placement);
     let mut extra_properties = vec![
         ("text", JsonValue::from(plain.clone())),
         ("text_height", JsonValue::from(mtext.height)),
-        (
-            "text_rotation_deg",
-            JsonValue::from(mtext.rotation.to_degrees()),
-        ),
+        ("text_rotation_deg", JsonValue::from(rotation_deg)),
         ("text_style", JsonValue::from(mtext.style.clone())),
     ];
     if plain != mtext.value {
@@ -2595,5 +2728,128 @@ mod tests {
             "{ids:?}"
         );
         assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn bylayer_styles_resolve_from_the_layer_table() {
+        use acadrust::Layer;
+        use acadrust::types::Color;
+        use geojson::JsonValue;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        let mut layer = Layer::new("PIPES");
+        layer.color = Color::GREEN;
+        layer.line_type = "CENTER".to_string();
+        document.layers.add(layer).expect("add layer");
+
+        let mut point = EntityType::Point(Point::from_coords(1.0, 1.0, 0.0));
+        point.common_mut().layer = "PIPES".to_string();
+        document.add_entity(point).expect("add point");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        let properties = extraction.features[0]
+            .properties
+            .as_ref()
+            .expect("properties");
+        assert_eq!(properties.get("color_index"), Some(&JsonValue::from(3)));
+        assert_eq!(
+            properties.get("color_rgb"),
+            Some(&JsonValue::from("#00FF00"))
+        );
+        assert_eq!(properties.get("linetype"), Some(&JsonValue::from("CENTER")));
+        assert!(properties.get("color").is_none());
+    }
+
+    #[test]
+    fn byblock_styles_resolve_through_the_insert_chain() {
+        use acadrust::entities::Insert;
+        use acadrust::types::{Color, Vector3};
+        use geojson::JsonValue;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        let mut block_point = EntityType::Point(Point::from_coords(0.0, 0.0, 0.0));
+        block_point.common_mut().color = Color::ByBlock;
+        block_point.common_mut().linetype = "BYBLOCK".to_string();
+        add_block(&mut document, "SYM", Vector3::ZERO, vec![block_point]);
+
+        let mut insert = EntityType::Insert(Insert::new("SYM", Vector3::ZERO));
+        insert.common_mut().color = Color::RED;
+        insert.common_mut().linetype = "DASHED".to_string();
+        document.add_entity(insert).expect("add insert");
+
+        // A second ByBlock point directly in model space stays unresolved.
+        let mut loose_point = EntityType::Point(Point::from_coords(9.0, 9.0, 0.0));
+        loose_point.common_mut().color = Color::ByBlock;
+        loose_point.common_mut().linetype = "ByBlock".to_string();
+        document.add_entity(loose_point).expect("add point");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.features.len(), 2);
+        let block_properties = extraction.features[0]
+            .properties
+            .as_ref()
+            .expect("properties");
+        assert_eq!(
+            block_properties.get("color_index"),
+            Some(&JsonValue::from(1))
+        );
+        assert_eq!(
+            block_properties.get("linetype"),
+            Some(&JsonValue::from("DASHED"))
+        );
+        let loose_properties = extraction.features[1]
+            .properties
+            .as_ref()
+            .expect("properties");
+        assert_eq!(
+            loose_properties.get("color"),
+            Some(&JsonValue::from("ByBlock"))
+        );
+        assert_eq!(
+            loose_properties.get("linetype"),
+            Some(&JsonValue::from("ByBlock"))
+        );
+    }
+
+    #[test]
+    fn text_rotation_composes_with_the_insert_rotation() {
+        use acadrust::entities::{Insert, Text};
+        use acadrust::types::Vector3;
+        use geojson::JsonValue;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        let mut text = Text::new();
+        text.value = "LABEL".to_string();
+        text.insertion_point = Vector3::ZERO;
+        text.rotation = std::f64::consts::FRAC_PI_6; // 30 degrees
+        add_block(
+            &mut document,
+            "LBL",
+            Vector3::ZERO,
+            vec![EntityType::Text(text)],
+        );
+
+        let mut insert = Insert::new("LBL", Vector3::ZERO);
+        insert.rotation = std::f64::consts::FRAC_PI_2; // +90 degrees
+        document
+            .add_entity(EntityType::Insert(insert))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        let properties = extraction.features[0]
+            .properties
+            .as_ref()
+            .expect("properties");
+        let Some(JsonValue::Number(rotation)) = properties.get("text_rotation_deg") else {
+            panic!("text_rotation_deg must be present");
+        };
+        let rotation = rotation.as_f64().expect("finite rotation");
+        assert!(
+            (rotation - 120.0).abs() < 1e-9,
+            "expected 120 degrees, got {rotation}"
+        );
     }
 }

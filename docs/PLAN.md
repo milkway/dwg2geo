@@ -83,7 +83,7 @@ Exit condition: common civil/utility plan geometry converts natively with quanti
 - [x] Detect recursive block references. (Case-insensitive block-name chain check; recursion is a failed INSERT with the block name in the reason.)
 - [x] Add `--explode-blocks` and `--preserve-inserts` modes. (Explode is the default and the flag documents the choice; the two flags conflict; both are native-backend-only and rejected elsewhere. The report records `block_mode`.)
 - [x] Preserve block path and attributes in feature properties. (`block_path` joined with `/`; feature ids are prefixed by the insert-handle chain so repeated inserts stay unique; attribute values are emitted on an INSERT anchor point in both modes; ATTDEF templates are counted as skipped.)
-- [ ] Resolve BYLAYER/BYBLOCK metadata where relevant. (Done for layers: block content on layer "0" takes the insert's effective layer, keeping `source_layer`. Color/linetype resolution is not converted yet — style properties are not emitted at all.)
+- [x] Resolve BYLAYER/BYBLOCK metadata where relevant. (Layers: block content on layer "0" takes the insert's effective layer, keeping `source_layer`. Colors: ByLayer resolves through the effective layer's table entry and ByBlock through the enclosing insert, recursively; resolved colors emit `color_index` (ACI) and/or `color_rgb`, unresolvable policies emit the raw policy string in `color`. Linetypes resolve the same way into `linetype`. TEXT/MTEXT `text_rotation_deg` inside blocks is the direction of the transformed baseline, so insert rotations compose; model-space text keeps its stored rotation verbatim.)
 
 Exit condition: nested engineering symbols and repeated structures are spatially correct and traceable.
 

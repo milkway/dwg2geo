@@ -41,6 +41,8 @@ Recommended minimum properties:
 
 Optional style fields may include color, line type, line weight, text style, and visibility. Keep style separate from geometry correctness.
 
+The native backend emits resolved style properties on every feature: `color_index` (ACI 1-255) and/or `color_rgb` (`#RRGGBB`) after resolving ByLayer through the effective layer and ByBlock through the enclosing insert chain; `linetype` resolved the same way. Policies that cannot be resolved (missing layer, ByBlock outside a block) are emitted verbatim as `color`/`linetype` strings — never silently dropped.
+
 ## Polygon policy
 
 A closed CAD curve is not automatically an area feature. Support policies such as:
