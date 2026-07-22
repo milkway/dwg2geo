@@ -1,17 +1,18 @@
 # dwg2geo
 
-Starter repository for an open-source CLI that converts engineering DWG drawings to GeoJSON with explicit coordinate-reference handling, diagnostics, and traceable conversion reports.
+An open-source CLI that converts engineering DWG drawings to GeoJSON with explicit coordinate-reference handling, diagnostics, and traceable conversion reports.
 
 ## Current scope
 
-The starter implements a conservative external-tool MVP:
+The CLI ships a conservative external-tool MVP in the default build and an in-process native backend behind optional Cargo features:
 
 - `dwg2geo inspect`: reads the six-byte DWG signature, reports the AutoCAD generation, size, and SHA-256 without requiring LibreDWG or GDAL.
 - `dwg2geo doctor`: checks whether `dwgread` and `ogr2ogr` are available, including versions; `--json` emits a machine-readable report and the exit code reflects tool health.
 - `dwg2geo convert`: either:
   - converts DWG -> DXF with LibreDWG and reprojects DXF -> GeoJSON with GDAL, when `--source-crs` is provided; or
   - exports raw/local coordinates directly through LibreDWG only when `--allow-local-coordinates` is explicit.
-- `--backend native` conversion is reserved for the roadmap, but native *inspection* is available today behind the `native-backend` feature (see below).
+- `native-backend` adds full native inspection, `layers`, native conversion for the supported entity set, block expansion, local-coordinate output, and control-point calibration without requiring LibreDWG or GDAL.
+- `native-reproject` extends that native path with in-process PROJ reprojection, explicit source-unit handling, and geographic sanity checks.
 
 Every successful conversion also writes a sidecar report at `<output>.report.json` recording the CLI options, external tool versions, source signature and SHA-256, executed commands with timings, and warnings. Apart from the duration fields, the report is deterministic for the same input and options.
 
@@ -88,7 +89,7 @@ cargo run -- convert \
   --allow-local-coordinates
 ```
 
-## Native inspection (optional feature)
+## Native backend (optional features)
 
 Building with the pure-Rust `acadrust` reader enables entity-level inspection without LibreDWG or GDAL:
 
@@ -101,14 +102,14 @@ With the feature enabled:
 - `inspect` additionally reports the DWG version, measurement system, insertion units, model extents, layer and block counts, and an entity histogram split by model space, paper space, block definitions, and unowned entities. A parse failure never hides the file-level report; it appears as an explicit `native_error`.
 - `dwg2geo layers <FILE> [--json]` lists every layer with its flags and entity counts by type and space, plus any layer names referenced by entities but missing from the layer table.
 - Corrupt files are retried in failsafe mode; recovered reports are labeled `failsafe_recovery` and carry the strict-parse error. Unknown entities and unresolved handles are counted, never dropped.
-- `convert --backend native --allow-local-coordinates` converts model-space `POINT`, `LINE`, `LWPOLYLINE`, classic `POLYLINE` (2D and 3D), `ARC`, `CIRCLE`, `ELLIPSE`, `SPLINE`, `3DFACE`, `SOLID`, `HATCH` (boundary loops nested into Polygons/MultiPolygons with holes and explicit ring-repair warnings), and `TEXT`/`MTEXT` (as point features with text properties) to GeoJSON in raw drawing coordinates, entirely in-process. Bulge arc segments are tessellated deterministically under `--curve-tolerance` (max chord error in drawing units, default 0.05, with a 15° angular cap per segment); approximated features are flagged and counted. Closed polylines become closed LineStrings, or Polygons with CCW rings when `--polygonize-closed` is passed. Every skipped or failed entity appears in the report's `native` section with a reason and sample handles; the output carries a `dwg2geo` foreign member marking it as non-geographic. Reprojection (`--source-crs`) on the native backend is rejected until Milestone 5 (`native-reproject`).
+- `convert --backend native --allow-local-coordinates` converts model-space `POINT`, `LINE`, `LWPOLYLINE`, classic `POLYLINE` (2D and 3D), `ARC`, `CIRCLE`, `ELLIPSE`, `SPLINE`, `3DFACE`, `SOLID`, `HATCH` (boundary loops nested into Polygons/MultiPolygons with holes and explicit ring-repair warnings), and `TEXT`/`MTEXT` (as point features with text properties) to GeoJSON in raw drawing coordinates, entirely in-process. Bulge arc segments are tessellated deterministically under `--curve-tolerance` (max chord error in drawing units, default 0.05, with a 15° angular cap per segment); approximated features are flagged and counted. Closed polylines become closed LineStrings, or Polygons with CCW rings when `--polygonize-closed` is passed. Every skipped or failed entity appears in the report's `native` section with a reason and sample handles; the output carries a `dwg2geo` foreign member marking it as non-geographic. Native reprojection with `--source-crs` is available when the `native-reproject` feature is enabled.
 - `convert --backend native --output-format geojson-seq` writes one GeoJSON Feature per line with no FeatureCollection wrapper. Because the wrapper-level non-geographic marker cannot be emitted in this format, it remains recorded with the chosen format in the sidecar report.
 - With the `native-reproject` feature, `convert --backend native --source-crs EPSG:xxxxx` reprojects in-process with PROJ. Drawing units come from the DWG header only when `$INSUNITS` and `$MEASUREMENT` agree unambiguously; otherwise the conversion demands `--source-units` (m, mm, cm, dm, km, in, ft, usft). Output targeting EPSG:4326 fails closed when coordinates leave the plausible longitude/latitude range unless `--allow-suspect-extents` is passed, and the report records the resolved unit and provenance, axis order, PROJ pipeline, and PROJ version.
 - Every native conversion self-audits in the report: `native.accounting` proves each model-space entity reached exactly one outcome, `native.bbox_drawing`/`bbox_output` record extents before and after any transform, and `native.geometry_checks` validates the final output (non-finite coordinates, empty or degenerate geometry, ring closure and orientation, duplicate vertices) — violations surface as explicit converter-bug warnings. `native.spatial_outliers` additionally flags features far from the main coordinate cluster (title blocks and legends drawn in model space are the typical hit), and `--validate-boundary <GEOJSON>` checks every feature against a reference polygon in the output CRS (e.g. an IBGE municipal boundary) and reports inside/partial/outside counts.
 - Without a known CRS, `--control-point "DX,DY=X,Y"` (two or more, native backend) georeferences by a local similarity calibration — rotation, uniform scale, and translation only, so geometry is never sheared. Three or more points report per-point residuals, RMS, and max error in the sidecar report; the output's `dwg2geo` member is marked `calibrated`.
 - `INSERT` block references are expanded into their block geometry by default (`--explode-blocks` documents the choice): translation, insert-normal orientation, rotation, non-uniform scale, MINSERT row/column grids, and nesting up to 16 levels are composed per instance, with recursive or missing block definitions reported as failed INSERTs. Expanded features carry a `block_path` property and instance-unique ids; block content on layer `0` inherits the insert's layer (the original is kept in `source_layer`). `--preserve-inserts` instead emits each INSERT as a point feature with `block_name`, rotation, and attribute values; inserts with attributes also emit that anchor point when exploding. Every feature carries resolved style metadata: ByLayer/ByBlock colors and linetypes are resolved through the layer table and the insert chain into `color_index`/`color_rgb`/`linetype` (unresolvable policies are emitted verbatim), and text rotation inside blocks follows the insert's rotation.
 
-The separate `native-reproject` feature adds the `proj` crate for Milestone 5 reprojection; it needs system PROJ >= 9.6 or a build toolchain with cmake and sqlite3 (see `docs/DECISIONS.md`, ADR-009).
+The separate `native-reproject` feature adds the `proj` crate for native reprojection; it needs system PROJ >= 9.6 or a build toolchain with cmake and sqlite3 (see `docs/DECISIONS.md`, ADR-009).
 
 ## Continue with an AI coding agent
 
