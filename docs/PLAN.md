@@ -160,10 +160,10 @@ Contract and completeness:
 - [x] B4: exhaustive per-entity-type support policy table checked against the acadrust enum. (All 44 variants classified in ENTITY_MAPPING.md — 16 converted, 11 deliberately unsupported, 17 not yet converted — enforced by `tests/entity_policy.rs`.)
 - [x] B6: choose and version one feature-property schema (resolve the `cad_*` drift), then regenerate the golden file. (ADR-014: the shipped unprefixed names are canonical v1; ENTITY_MAPPING documents the schema exhaustively; the golden file already pins it, so no regeneration was needed; renames are declared breaking.)
 - [x] B5: commit a non-sensitive aggregate entity histogram of the reference drawing. (`samples/corredor-sul-histogram.json`: 17 entity types by space, unit metadata, source sha256 — the "8/17 match" and outlier claims are now auditable.)
-- [ ] B7: emit text alignment/layout semantics (alignment modes, width factor, oblique; MTEXT attachment/columns).
+- [x] B7: emit text alignment/layout semantics (alignment modes, width factor, oblique; MTEXT attachment/columns). (Non-default-only emission keeps golden output unchanged; anchor selection now follows DXF rules — left/baseline uses the insertion point even with a stray alignment point.)
 - [x] B8: tolerance-driven spline sampling; implement or explicitly re-roadmap curve-fit/spline-fit polylines and meshes. (SPLINE and hatch spline edges double segment counts from a span floor until the midpoint chord-error estimate meets `--curve-tolerance`, capped at 256 with a warning. Curve-fit/spline-fit polylines and meshes are re-roadmapped in ENTITY_MAPPING's not-yet-converted table.)
 - [ ] B9: introduce the CAD-neutral internal model promised by ADR-004 before expanding entity coverage further.
-- [ ] B10: reader-to-output integration fixtures per entity class (supported and deliberately unsupported).
+- [x] B10: reader-to-output integration fixtures per entity class (supported and deliberately unsupported). (tests/entity_e2e.rs: 9 supported classes end-to-end plus XLINE/3DSOLID/LEADER skip-and-account; Surface cannot round-trip through the acadrust writer, documented in-file.)
 - [x] B11: refresh stale CLI help/README claims; record disposition of `entities`/`validate`/`calibrate` future commands. (README current-scope rewritten; `--backend native` help updated; dispositions in docs/DECISIONS-FUTURE-COMMANDS.md.)
 - [x] B12: make `doctor` health reflect per-route capability. (Per-route capability in JSON and human output; healthy/exit 0 requires both tools; ADR-013.)
 
