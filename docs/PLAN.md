@@ -59,9 +59,9 @@ Implement entities in this order:
 - [x] Classic `POLYLINE` / `VERTEX`. (2D and 3D variants; curve-fit/spline-fit smoothing and meshes are skipped with explicit reasons until implemented.)
 - [x] Bulge arc tessellation with deterministic tolerance. (`--curve-tolerance`, default 0.05 drawing units; 15°/segment angular cap and 256-segment arc cap with a warning; applies to LWPOLYLINE and 2D POLYLINE segments including the closing segment.)
 - [x] `ARC` and `CIRCLE` tessellation. (Shared arc tessellator with the bulge path: same chord tolerance, angular cap, and segment cap. Circles close their ring and honor `--polygonize-closed`; arcs sweep CCW in the OCS plane; features are marked approximated.)
-- [ ] `ELLIPSE` tessellation.
-- [ ] `SPLINE` evaluation/tessellation.
-- [ ] `TEXT` and `MTEXT` as point features with text properties.
+- [x] `ELLIPSE` tessellation. (Parametric evaluation in WCS; the circle step formula with the major radius bounds the chord error. Full ellipses close their ring and honor `--polygonize-closed`.)
+- [x] `SPLINE` evaluation/tessellation. (De Boor on homogeneous coordinates, rational weights supported; uniform parameter sampling at 8 segments/span within [16, 256] — chord tolerance is not applied to splines yet. Invalid NURBS data falls back to a polyline through fit points with a warning, or an explicit skip.)
+- [x] `TEXT` and `MTEXT` as point features with text properties. (Anchor point, value, height, rotation in degrees, style. TEXT anchors are lifted from OCS; MTEXT inline format codes are stripped into `text` with the raw value kept in `text_raw` when different.)
 - [ ] `3DFACE` projected to configured XY behavior.
 - [ ] `HATCH` boundary extraction with holes and ring repair diagnostics.
 

@@ -1,11 +1,12 @@
 //! Native DWG -> GeoJSON conversion (Milestone 3).
 //!
-//! Current slice: `POINT`, `LINE`, and `LWPOLYLINE` without bulge arcs,
-//! model space only, in raw drawing coordinates (reprojection arrives with
-//! the `native-reproject` feature in Milestone 5). Every entity that is not
-//! converted is counted in the report with a reason — nothing is silently
-//! dropped. Output is deterministic: features follow model-space document
-//! order and identifiers come from entity handles.
+//! Converts model-space geometry (points, lines, polylines with bulge arcs,
+//! arcs, circles, ellipses, splines, and text anchors) in raw drawing
+//! coordinates; reprojection arrives with the `native-reproject` feature in
+//! Milestone 5. Every entity that is not converted is counted in the report
+//! with a reason — nothing is silently dropped. Output is deterministic:
+//! features follow model-space document order, identifiers come from entity
+//! handles, and all curve approximation uses pure arithmetic on the inputs.
 
 use std::{collections::BTreeMap, fs, time::Instant};
 
@@ -416,6 +417,10 @@ fn convert_entity(entity: &EntityType, options: &GeometryOptions) -> EntityOutco
         EntityType::Polyline(polyline) => convert_polyline_generic(polyline, options),
         EntityType::Circle(circle) => convert_circle(circle, options),
         EntityType::Arc(arc) => convert_arc(arc, options),
+        EntityType::Ellipse(ellipse) => convert_ellipse(ellipse, options),
+        EntityType::Spline(spline) => convert_spline(spline, options),
+        EntityType::Text(text) => convert_text(text),
+        EntityType::MText(mtext) => convert_mtext(mtext),
         _ => EntityOutcome::Skipped(
             "entity type is not converted by the native backend yet".to_string(),
         ),
@@ -882,6 +887,311 @@ fn convert_arc(arc: &acadrust::entities::Arc, options: &GeometryOptions) -> Enti
     )
 }
 
+/// DXF ellipses are parametric in WCS: center and major-axis vector are
+/// world coordinates and the minor axis is `normal x major * ratio`.
+fn convert_ellipse(
+    ellipse: &acadrust::entities::Ellipse,
+    options: &GeometryOptions,
+) -> EntityOutcome {
+    if !is_finite(&ellipse.center)
+        || !is_finite(&ellipse.major_axis)
+        || !ellipse.minor_axis_ratio.is_finite()
+        || !ellipse.start_parameter.is_finite()
+        || !ellipse.end_parameter.is_finite()
+    {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    let major_length = ellipse.major_axis.length();
+    if major_length <= 0.0 || ellipse.minor_axis_ratio <= 0.0 {
+        return EntityOutcome::Skipped(
+            "degenerate ellipse: non-positive axis length or ratio".to_string(),
+        );
+    }
+    let minor_direction = ellipse.normal.cross(&ellipse.major_axis);
+    let minor_direction_length = minor_direction.length();
+    if minor_direction_length <= 0.0 {
+        return EntityOutcome::Skipped(
+            "degenerate ellipse: normal is parallel to the major axis".to_string(),
+        );
+    }
+    let minor_axis =
+        minor_direction * (major_length * ellipse.minor_axis_ratio / minor_direction_length);
+
+    let mut sweep =
+        (ellipse.end_parameter - ellipse.start_parameter).rem_euclid(std::f64::consts::TAU);
+    let closed = sweep <= f64::EPSILON;
+    if closed {
+        sweep = std::f64::consts::TAU;
+    }
+
+    // The circle step formula with the major radius bounds the ellipse chord
+    // error: local error is ~step^2 * axis / 8 and the major axis dominates.
+    let mut warnings = Vec::new();
+    let parameters = arc_points(
+        (0.0, 0.0),
+        1.0,
+        ellipse.start_parameter,
+        sweep,
+        options.curve_tolerance / major_length,
+        &mut warnings,
+    );
+
+    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(parameters.len());
+    let mut max_abs_z: f64 = 0.0;
+    for (cos_t, sin_t) in parameters {
+        let point = ellipse.center + ellipse.major_axis * cos_t + minor_axis * sin_t;
+        if !is_finite(&point) {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        }
+        max_abs_z = max_abs_z.max(point.z.abs());
+        coordinates.push((point.x, point.y));
+    }
+    if closed {
+        coordinates.pop();
+    }
+
+    push_z_warning(&mut warnings, max_abs_z);
+    warnings.push(format!(
+        "arc segments tessellated with chord tolerance {} drawing units",
+        options.curve_tolerance
+    ));
+    finish_coordinates(coordinates, closed, true, options, warnings)
+}
+
+/// Fixed sampling density for spline evaluation, per knot span.
+const SPLINE_SEGMENTS_PER_SPAN: usize = 8;
+const SPLINE_MIN_SEGMENTS: usize = 16;
+
+/// Evaluate the NURBS control net with de Boor's algorithm; when the NURBS
+/// data is invalid, fall back to a polyline through the fit points rather
+/// than dropping the entity silently.
+fn convert_spline(spline: &acadrust::entities::Spline, options: &GeometryOptions) -> EntityOutcome {
+    let degree = spline.degree;
+    let control_count = spline.control_points.len();
+    let nurbs_valid = degree >= 1
+        && control_count > degree as usize
+        && spline.knots.len() == control_count + degree as usize + 1
+        && spline.knots.windows(2).all(|pair| pair[0] <= pair[1])
+        && spline.knots.iter().all(|knot| knot.is_finite())
+        && spline.control_points.iter().all(is_finite);
+
+    if !nurbs_valid {
+        if spline.fit_points.len() >= 2 && spline.fit_points.iter().all(is_finite) {
+            let mut outcome = finish_wcs_path(&spline.fit_points, spline.flags.closed, options);
+            if let EntityOutcome::Converted {
+                extra_properties,
+                warnings,
+                ..
+            } = &mut outcome
+            {
+                extra_properties.push(("approximated", JsonValue::Bool(true)));
+                warnings.push(format!(
+                    "spline rendered as a polyline through its {} fit points (invalid or missing NURBS data)",
+                    spline.fit_points.len()
+                ));
+            }
+            return outcome;
+        }
+        return EntityOutcome::Skipped(
+            "spline has invalid NURBS data and no fit points".to_string(),
+        );
+    }
+
+    let degree = degree as usize;
+    let uniform_weights =
+        spline.weights.len() != control_count || spline.weights.iter().any(|w| !w.is_finite());
+    let homogeneous: Vec<[f64; 4]> = spline
+        .control_points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            let weight = if uniform_weights {
+                1.0
+            } else {
+                spline.weights[index]
+            };
+            [point.x * weight, point.y * weight, point.z * weight, weight]
+        })
+        .collect();
+
+    let domain_start = spline.knots[degree];
+    let domain_end = spline.knots[control_count];
+    if !(domain_end > domain_start) {
+        return EntityOutcome::Skipped("spline has an empty parameter domain".to_string());
+    }
+
+    let spans = control_count - degree;
+    let segments = (spans * SPLINE_SEGMENTS_PER_SPAN).clamp(SPLINE_MIN_SEGMENTS, MAX_ARC_SEGMENTS);
+
+    let mut coordinates: Vec<(f64, f64)> = Vec::with_capacity(segments + 1);
+    let mut max_abs_z: f64 = 0.0;
+    for i in 0..=segments {
+        let t = domain_start + (domain_end - domain_start) * (i as f64) / (segments as f64);
+        let Some(point) = evaluate_nurbs(t, degree, &spline.knots, &homogeneous) else {
+            return EntityOutcome::Failed(
+                "spline evaluation produced a non-finite or zero-weight point".to_string(),
+            );
+        };
+        max_abs_z = max_abs_z.max(point.2.abs());
+        coordinates.push((point.0, point.1));
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+    warnings.push(format!(
+        "spline sampled at {} points with uniform parameter spacing; chord tolerance is not applied to splines yet",
+        segments + 1
+    ));
+    finish_coordinates(coordinates, spline.flags.closed, true, options, warnings)
+}
+
+/// De Boor evaluation on homogeneous coordinates. Returns the Cartesian
+/// point, or None on zero weight or non-finite arithmetic.
+fn evaluate_nurbs(
+    t: f64,
+    degree: usize,
+    knots: &[f64],
+    control: &[[f64; 4]],
+) -> Option<(f64, f64, f64)> {
+    let count = control.len();
+    let mut span = count - 1;
+    for i in degree..count {
+        if t < knots[i + 1] {
+            span = i;
+            break;
+        }
+    }
+
+    let mut d: Vec<[f64; 4]> = (0..=degree).map(|j| control[j + span - degree]).collect();
+    for r in 1..=degree {
+        for j in (r..=degree).rev() {
+            let i = j + span - degree;
+            let denominator = knots[i + degree - r + 1] - knots[i];
+            let alpha = if denominator.abs() <= f64::EPSILON {
+                0.0
+            } else {
+                (t - knots[i]) / denominator
+            };
+            for c in 0..4 {
+                d[j][c] = (1.0 - alpha) * d[j - 1][c] + alpha * d[j][c];
+            }
+        }
+    }
+
+    let [x, y, z, w] = d[degree];
+    if w.abs() <= f64::EPSILON || !(x / w).is_finite() || !(y / w).is_finite() {
+        return None;
+    }
+    Some((x / w, y / w, z / w))
+}
+
+/// TEXT anchors live in OCS; the second alignment point, when present, is
+/// the effective anchor for aligned text.
+fn convert_text(text: &acadrust::entities::Text) -> EntityOutcome {
+    let anchor = text.alignment_point.unwrap_or(text.insertion_point);
+    if !is_finite(&anchor) {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    let wcs = Matrix3::arbitrary_axis(text.normal).transform_point(anchor);
+    if !is_finite(&wcs) {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, wcs.z.abs());
+
+    EntityOutcome::Converted {
+        geometry: GeometryValue::new_point((wcs.x, wcs.y)),
+        extra_properties: vec![
+            ("text", JsonValue::from(text.value.clone())),
+            ("text_height", JsonValue::from(text.height)),
+            (
+                "text_rotation_deg",
+                JsonValue::from(text.rotation.to_degrees()),
+            ),
+            ("text_style", JsonValue::from(text.style.clone())),
+        ],
+        warnings,
+    }
+}
+
+/// MTEXT insertion points are WCS; the value may carry inline format codes,
+/// which are stripped into a plain-text property (raw kept when different).
+fn convert_mtext(mtext: &acadrust::entities::MText) -> EntityOutcome {
+    let anchor = mtext.insertion_point;
+    if !is_finite(&anchor) {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, anchor.z.abs());
+
+    let plain = strip_mtext_codes(&mtext.value);
+    let mut extra_properties = vec![
+        ("text", JsonValue::from(plain.clone())),
+        ("text_height", JsonValue::from(mtext.height)),
+        (
+            "text_rotation_deg",
+            JsonValue::from(mtext.rotation.to_degrees()),
+        ),
+        ("text_style", JsonValue::from(mtext.style.clone())),
+    ];
+    if plain != mtext.value {
+        extra_properties.push(("text_raw", JsonValue::from(mtext.value.clone())));
+    }
+
+    EntityOutcome::Converted {
+        geometry: GeometryValue::new_point((anchor.x, anchor.y)),
+        extra_properties,
+        warnings,
+    }
+}
+
+/// Best-effort removal of MTEXT inline format codes: paragraph breaks become
+/// newlines, format commands with `;` terminators are dropped, grouping
+/// braces are removed, and stacked fractions keep their text.
+fn strip_mtext_codes(raw: &str) -> String {
+    let mut plain = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' | '}' => {}
+            '\\' => match chars.next() {
+                Some('P') => plain.push('\n'),
+                Some('~') => plain.push(' '),
+                Some('\\') => plain.push('\\'),
+                Some('{') => plain.push('{'),
+                Some('}') => plain.push('}'),
+                Some('S') => {
+                    for stacked in chars.by_ref() {
+                        if stacked == ';' {
+                            break;
+                        }
+                        plain.push(match stacked {
+                            '^' | '#' => '/',
+                            other => other,
+                        });
+                    }
+                }
+                Some('f') | Some('F') | Some('H') | Some('C') | Some('c') | Some('T')
+                | Some('Q') | Some('W') | Some('A') | Some('p') => {
+                    for skipped in chars.by_ref() {
+                        if skipped == ';' {
+                            break;
+                        }
+                    }
+                }
+                Some('L') | Some('l') | Some('O') | Some('o') | Some('K') | Some('k')
+                | Some('X') => {}
+                Some(other) => plain.push(other),
+                None => {}
+            },
+            other => plain.push(other),
+        }
+    }
+    plain
+}
+
 /// Lift tessellated OCS curve points to WCS and build the final geometry,
 /// always marked as approximated.
 fn finish_curve(
@@ -1220,6 +1530,180 @@ mod tests {
     }
 
     #[test]
+    fn full_ellipse_tessellates_on_the_ellipse_and_closes() {
+        use acadrust::entities::Ellipse;
+        use acadrust::types::Vector3;
+
+        let mut ellipse = Ellipse::new();
+        ellipse.center = Vector3::new(10.0, 5.0, 0.0);
+        ellipse.major_axis = Vector3::new(4.0, 0.0, 0.0);
+        ellipse.minor_axis_ratio = 0.5;
+        ellipse.start_parameter = 0.0;
+        ellipse.end_parameter = std::f64::consts::TAU;
+        match convert_entity(&EntityType::Ellipse(ellipse), &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => match geometry {
+                GeometryValue::LineString { coordinates } => {
+                    assert_eq!(coordinates.first(), coordinates.last());
+                    assert!(coordinates.len() > 20);
+                    for position in &coordinates {
+                        let ellipse_eq = ((position[0] - 10.0) / 4.0).powi(2)
+                            + ((position[1] - 5.0) / 2.0).powi(2);
+                        assert!((ellipse_eq - 1.0).abs() < 1e-9, "off ellipse: {position:?}");
+                    }
+                }
+                other => panic!("expected LineString, got {other:?}"),
+            },
+            _ => panic!("ellipse must convert"),
+        }
+    }
+
+    #[test]
+    fn quarter_ellipse_arc_preserves_parametric_endpoints() {
+        use acadrust::entities::Ellipse;
+        use acadrust::types::Vector3;
+
+        let mut ellipse = Ellipse::new();
+        ellipse.major_axis = Vector3::new(4.0, 0.0, 0.0);
+        ellipse.minor_axis_ratio = 0.5;
+        ellipse.start_parameter = 0.0;
+        ellipse.end_parameter = std::f64::consts::PI / 2.0;
+        match convert_entity(&EntityType::Ellipse(ellipse), &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => match geometry {
+                GeometryValue::LineString { coordinates } => {
+                    let first = coordinates.first().expect("start");
+                    let last = coordinates.last().expect("end");
+                    assert!((first[0] - 4.0).abs() < 1e-9 && first[1].abs() < 1e-9);
+                    assert!(last[0].abs() < 1e-9 && (last[1] - 2.0).abs() < 1e-9);
+                }
+                other => panic!("expected LineString, got {other:?}"),
+            },
+            _ => panic!("ellipse arc must convert"),
+        }
+    }
+
+    #[test]
+    fn clamped_cubic_spline_through_collinear_controls_stays_on_the_line() {
+        use acadrust::entities::Spline;
+        use acadrust::types::Vector3;
+
+        let mut spline = Spline::new();
+        spline.degree = 3;
+        spline.control_points = vec![
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::new(2.0, 2.0, 0.0),
+            Vector3::new(3.0, 3.0, 0.0),
+        ];
+        spline.knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        match convert_entity(&EntityType::Spline(spline), &opts(false)) {
+            EntityOutcome::Converted {
+                geometry, warnings, ..
+            } => {
+                match geometry {
+                    GeometryValue::LineString { coordinates } => {
+                        let first = coordinates.first().expect("start");
+                        let last = coordinates.last().expect("end");
+                        assert!(first[0].abs() < 1e-9 && first[1].abs() < 1e-9);
+                        assert!((last[0] - 3.0).abs() < 1e-9 && (last[1] - 3.0).abs() < 1e-9);
+                        for position in &coordinates {
+                            assert!(
+                                (position[0] - position[1]).abs() < 1e-9,
+                                "off line: {position:?}"
+                            );
+                        }
+                    }
+                    other => panic!("expected LineString, got {other:?}"),
+                }
+                assert!(warnings.iter().any(|w| w.contains("spline sampled")));
+            }
+            _ => panic!("spline must convert"),
+        }
+    }
+
+    #[test]
+    fn invalid_spline_falls_back_to_fit_points_or_skips() {
+        use acadrust::entities::Spline;
+        use acadrust::types::Vector3;
+
+        let mut with_fit = Spline::new();
+        with_fit.degree = 3;
+        with_fit.fit_points = vec![Vector3::new(0.0, 0.0, 0.0), Vector3::new(5.0, 5.0, 0.0)];
+        match convert_entity(&EntityType::Spline(with_fit), &opts(false)) {
+            EntityOutcome::Converted { warnings, .. } => {
+                assert!(warnings.iter().any(|w| w.contains("fit points")));
+            }
+            _ => panic!("spline with fit points must fall back, not vanish"),
+        }
+
+        let empty = Spline::new();
+        match convert_entity(&EntityType::Spline(empty), &opts(false)) {
+            EntityOutcome::Skipped(reason) => assert!(reason.contains("NURBS")),
+            _ => panic!("empty spline must be skipped"),
+        }
+    }
+
+    #[test]
+    fn text_becomes_point_with_text_properties() {
+        use acadrust::entities::Text;
+        use acadrust::types::Vector3;
+
+        let mut text = Text::new();
+        text.value = "COTA 123".to_string();
+        text.insertion_point = Vector3::new(7.0, 8.0, 0.0);
+        text.height = 2.5;
+        text.rotation = std::f64::consts::PI / 2.0;
+        match convert_entity(&EntityType::Text(text), &opts(false)) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                ..
+            } => {
+                assert_eq!(geometry, GeometryValue::new_point((7.0, 8.0)));
+                let get = |key: &str| {
+                    extra_properties
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.clone())
+                };
+                assert_eq!(get("text"), Some(serde_json::json!("COTA 123")));
+                assert_eq!(get("text_height"), Some(serde_json::json!(2.5)));
+                assert_eq!(get("text_rotation_deg"), Some(serde_json::json!(90.0)));
+            }
+            _ => panic!("text must convert"),
+        }
+    }
+
+    #[test]
+    fn mtext_strips_format_codes_and_keeps_raw() {
+        use acadrust::entities::MText;
+        use acadrust::types::Vector3;
+
+        let mut mtext = MText::new();
+        mtext.value = r"{\fArial|b0;CORREDOR} SUL\Ptrecho \S1^2; km".to_string();
+        mtext.insertion_point = Vector3::new(1.0, 2.0, 0.0);
+        match convert_entity(&EntityType::MText(mtext), &opts(false)) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                ..
+            } => {
+                assert_eq!(geometry, GeometryValue::new_point((1.0, 2.0)));
+                let text = extra_properties
+                    .iter()
+                    .find(|(k, _)| *k == "text")
+                    .map(|(_, v)| v.as_str().expect("string").to_string())
+                    .expect("text property");
+                assert_eq!(text, "CORREDOR SUL\ntrecho 1/2 km");
+                assert!(
+                    extra_properties.iter().any(|(k, _)| *k == "text_raw"),
+                    "raw value must be preserved when stripping changed it"
+                );
+            }
+            _ => panic!("mtext must convert"),
+        }
+    }
+
+    #[test]
     fn degenerate_circle_is_skipped() {
         let circle = EntityType::Circle(Circle::from_coords(0.0, 0.0, 0.0, 0.0));
         match convert_entity(&circle, &opts(false)) {
@@ -1308,8 +1792,13 @@ mod tests {
     fn unsupported_types_are_counted_and_paper_space_is_excluded() {
         let mut document = CadDocument::with_version(DxfVersion::AC1027);
         document
-            .add_entity(EntityType::Text(acadrust::entities::Text::new()))
-            .expect("add text");
+            .add_entity(EntityType::Solid(acadrust::entities::Solid::new(
+                acadrust::types::Vector3::new(0.0, 0.0, 0.0),
+                acadrust::types::Vector3::new(1.0, 0.0, 0.0),
+                acadrust::types::Vector3::new(0.0, 1.0, 0.0),
+                acadrust::types::Vector3::new(1.0, 1.0, 0.0),
+            )))
+            .expect("add solid");
         document
             .add_entity(EntityType::Point(Point::from_coords(1.0, 1.0, 0.0)))
             .expect("add point");
@@ -1324,7 +1813,7 @@ mod tests {
         assert_eq!(extraction.excluded_paper_space, 1);
         let skipped: Vec<_> = extraction.skipped.keys().collect();
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].0, "TEXT");
+        assert_eq!(skipped[0].0, "SOLID");
         let samples = extraction.skipped.values().next().expect("skip entry");
         assert_eq!(samples.count, 1);
         assert_eq!(samples.samples.len(), 1);
