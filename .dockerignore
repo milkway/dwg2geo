@@ -1,0 +1,14 @@
+.git/
+.agents/
+.codex/
+.claude/
+target/
+output/
+scratch/
+scratchpad/
+samples/*.dwg
+*.dxf
+*.geojson
+*.geojsonseq
+*.local.md
+*.report.json

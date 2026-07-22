@@ -1,0 +1,19 @@
+# cargo-about rejects a dependency graph that cannot be satisfied from this
+# allowlist. Keep MPL-2.0 explicit: acadrust uses it and its obligations need
+# review when distributing the native binary.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+]
+
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+private = { ignore = true }
