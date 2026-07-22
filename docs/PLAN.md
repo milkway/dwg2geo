@@ -62,7 +62,7 @@ Implement entities in this order:
 - [x] `ELLIPSE` tessellation. (Parametric evaluation in WCS; the circle step formula with the major radius bounds the chord error. Full ellipses close their ring and honor `--polygonize-closed`.)
 - [x] `SPLINE` evaluation/tessellation. (De Boor on homogeneous coordinates, rational weights supported; uniform parameter sampling at 8 segments/span within [16, 256] — chord tolerance is not applied to splines yet. Invalid NURBS data falls back to a polyline through fit points with a warning, or an explicit skip.)
 - [x] `TEXT` and `MTEXT` as point features with text properties. (Anchor point, value, height, rotation in degrees, style. TEXT anchors are lifted from OCS; MTEXT inline format codes are stripped into `text` with the raw value kept in `text_raw` when different.)
-- [ ] `3DFACE` projected to configured XY behavior.
+- [x] `3DFACE` projected to configured XY behavior. (WCS corners projected through INSERT placement to an always-Polygon CCW ring; z is dropped with a warning, duplicate triangle corners are collapsed, and degenerate faces are skipped.)
 - [ ] `HATCH` boundary extraction with holes and ring repair diagnostics.
 
 Cross-cutting tasks:

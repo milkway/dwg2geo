@@ -814,6 +814,7 @@ fn convert_entity(
     match entity {
         EntityType::Point(point) => convert_point(point, placement),
         EntityType::Line(line) => convert_line(line, placement),
+        EntityType::Face3D(face) => convert_face3d(face, placement),
         EntityType::LwPolyline(polyline) => convert_lwpolyline(polyline, options, placement),
         EntityType::Polyline2D(polyline) => convert_polyline2d(polyline, options, placement),
         EntityType::Polyline3D(polyline) => convert_polyline3d(polyline, options, placement),
@@ -870,6 +871,49 @@ fn convert_line(line: &acadrust::entities::Line, placement: &Placement) -> Entit
     EntityOutcome::Converted {
         geometry: GeometryValue::new_line_string(vec![start, end]),
         extra_properties: Vec::new(),
+        warnings,
+    }
+}
+
+fn convert_face3d(face: &acadrust::entities::Face3D, placement: &Placement) -> EntityOutcome {
+    let corners = [
+        face.first_corner,
+        face.second_corner,
+        face.third_corner,
+        face.fourth_corner,
+    ];
+    if corners.iter().any(|corner| !is_finite(corner)) {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+
+    let mut ring: Vec<(f64, f64)> = Vec::with_capacity(5);
+    let mut max_abs_z: f64 = 0.0;
+    for corner in corners {
+        let Some(position) = project(placement, corner, &mut max_abs_z) else {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        };
+        ring.push(position);
+    }
+    ring.dedup();
+
+    if count_distinct(&ring) < 3 {
+        return EntityOutcome::Skipped(
+            "degenerate 3DFACE: fewer than three distinct corners".to_string(),
+        );
+    }
+    if ring.first() != ring.last() {
+        ring.push(ring[0]);
+    }
+    if signed_area(&ring) < 0.0 {
+        ring.reverse();
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+
+    EntityOutcome::Converted {
+        geometry: GeometryValue::new_polygon(vec![ring]),
+        extra_properties: vec![("is_closed", JsonValue::from(true))],
         warnings,
     }
 }
@@ -2266,6 +2310,105 @@ mod tests {
     }
 
     #[test]
+    fn face3d_quad_becomes_closed_ccw_polygon_and_drops_z() {
+        use acadrust::entities::Face3D;
+        use acadrust::types::Vector3;
+
+        // Clockwise input verifies that the exterior ring is reoriented.
+        let face = EntityType::Face3D(Face3D::new(
+            Vector3::new(0.0, 0.0, 2.0),
+            Vector3::new(0.0, 10.0, 2.0),
+            Vector3::new(10.0, 10.0, 2.0),
+            Vector3::new(10.0, 0.0, 2.0),
+        ));
+        match convert_entity(&face, &opts(false)) {
+            EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                warnings,
+            } => {
+                let GeometryValue::Polygon { coordinates } = geometry else {
+                    panic!("expected Polygon, got {geometry:?}");
+                };
+                assert_eq!(coordinates.len(), 1);
+                let ring = &coordinates[0];
+                assert_eq!(ring.len(), 5);
+                assert_eq!(ring.first(), ring.last());
+                let tuples: Vec<(f64, f64)> = ring
+                    .iter()
+                    .map(|position| (position[0], position[1]))
+                    .collect();
+                assert!(signed_area(&tuples) > 0.0, "ring must be CCW");
+                assert_eq!(
+                    extra_properties
+                        .iter()
+                        .find(|(key, _)| *key == "is_closed")
+                        .map(|(_, value)| value),
+                    Some(&serde_json::json!(true))
+                );
+                assert!(warnings.iter().any(|w| w.contains("z coordinates dropped")));
+            }
+            _ => panic!("3DFACE quad must convert"),
+        }
+    }
+
+    #[test]
+    fn face3d_triangle_collapses_duplicated_fourth_corner() {
+        use acadrust::entities::Face3D;
+        use acadrust::types::Vector3;
+
+        let face = EntityType::Face3D(Face3D::triangle(
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(5.0, 0.0, 0.0),
+            Vector3::new(0.0, 5.0, 0.0),
+        ));
+        match convert_entity(&face, &opts(false)) {
+            EntityOutcome::Converted { geometry, .. } => match geometry {
+                GeometryValue::Polygon { coordinates } => {
+                    assert_eq!(coordinates.len(), 1);
+                    assert_eq!(coordinates[0].len(), 4);
+                    assert_eq!(coordinates[0].first(), coordinates[0].last());
+                }
+                other => panic!("expected Polygon, got {other:?}"),
+            },
+            _ => panic!("triangular 3DFACE must convert"),
+        }
+    }
+
+    #[test]
+    fn degenerate_face3d_is_skipped() {
+        use acadrust::entities::Face3D;
+        use acadrust::types::Vector3;
+
+        let face = EntityType::Face3D(Face3D::new(
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::new(2.0, 2.0, 0.0),
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::new(2.0, 2.0, 0.0),
+        ));
+        match convert_entity(&face, &opts(false)) {
+            EntityOutcome::Skipped(reason) => assert!(reason.contains("degenerate")),
+            _ => panic!("degenerate 3DFACE must be skipped"),
+        }
+    }
+
+    #[test]
+    fn face3d_with_non_finite_corner_fails() {
+        use acadrust::entities::Face3D;
+        use acadrust::types::Vector3;
+
+        let face = EntityType::Face3D(Face3D::triangle(
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(f64::NAN, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        ));
+        match convert_entity(&face, &opts(false)) {
+            EntityOutcome::Failed(reason) => assert_eq!(reason, "non-finite coordinates"),
+            _ => panic!("non-finite 3DFACE must fail"),
+        }
+    }
+
+    #[test]
     fn unsupported_types_are_counted_and_paper_space_is_excluded() {
         let mut document = CadDocument::with_version(DxfVersion::AC1027);
         document
@@ -2393,6 +2536,54 @@ mod tests {
         assert!(
             id.contains('/'),
             "id must be prefixed by the insert chain: {id}"
+        );
+    }
+
+    #[test]
+    fn insert_translates_face3d_block_geometry() {
+        use acadrust::entities::{Face3D, Insert};
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "FACE",
+            Vector3::ZERO,
+            vec![EntityType::Face3D(Face3D::new(
+                Vector3::new(0.0, 0.0, 0.0),
+                Vector3::new(2.0, 0.0, 0.0),
+                Vector3::new(2.0, 1.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ))],
+        );
+        document
+            .add_entity(EntityType::Insert(Insert::new(
+                "FACE",
+                Vector3::new(10.0, 20.0, 0.0),
+            )))
+            .expect("add insert");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.features.len(), 1);
+        assert_eq!(extraction.converted.get("3DFACE"), Some(&1));
+        let geometry = extraction.features[0].geometry.as_ref().expect("geometry");
+        let GeometryValue::Polygon { coordinates } = &geometry.value else {
+            panic!("expected Polygon, got {:?}", geometry.value);
+        };
+        let ring: Vec<(f64, f64)> = coordinates[0]
+            .iter()
+            .map(|position| (position[0], position[1]))
+            .collect();
+        assert_eq!(
+            ring,
+            vec![
+                (10.0, 20.0),
+                (12.0, 20.0),
+                (12.0, 21.0),
+                (10.0, 21.0),
+                (10.0, 20.0),
+            ]
         );
     }
 
