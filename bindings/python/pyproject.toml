@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "dwg2geo"
+description = "Convert engineering DWG drawings to auditable GeoJSON (pure-Rust, no CAD software needed)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["dwg", "geojson", "cad", "gis", "autocad", "converter"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/milkway/dwg2geo"
+Homepage = "https://github.com/milkway/dwg2geo"
+
+[tool.maturin]
+# The crate lives inside the dwg2geo workspace two levels up.
+manifest-path = "Cargo.toml"
+strip = true

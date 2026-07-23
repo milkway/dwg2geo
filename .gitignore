@@ -27,3 +27,6 @@
 /prompts/
 # Internal documentation — kept local, not published
 /docs/
+
+# Binding build artifacts
+bindings/js/pkg/

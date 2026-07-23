@@ -1,0 +1,19 @@
+[package]
+name = "dwg2geo-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Convert engineering DWG drawings to GeoJSON — Python bindings for dwg2geo"
+license = "MIT"
+repository = "https://github.com/milkway/dwg2geo"
+homepage = "https://github.com/milkway/dwg2geo"
+publish = false # PyPI package; not a crates.io crate
+
+[lib]
+name = "dwg2geo"
+crate-type = ["cdylib"]
+
+[dependencies]
+dwg2geo = { path = "../..", version = "0.1.0", default-features = false, features = ["native-backend"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
+pythonize = "0.29"

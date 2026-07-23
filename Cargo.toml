@@ -4,13 +4,26 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Convert engineering DWG drawings to auditable GeoJSON"
-publish = false
 license = "MIT"
 repository = "https://github.com/milkway/dwg2geo"
 homepage = "https://github.com/milkway/dwg2geo"
 readme = "README.md"
 keywords = ["dwg", "geojson", "cad", "gis", "conversion"]
 categories = ["command-line-utilities", "science::geo"]
+exclude = ["site/", ".github/", "Dockerfile", ".dockerignore"]
+
+# The language bindings live in the same repo; plain `cargo build`/`test` at
+# the root only touches the core crate (default-members), so CI and the
+# published crate are unaffected by the pyo3/wasm toolchains.
+[workspace]
+members = [".", "bindings/js", "bindings/python"]
+default-members = ["."]
+
+# Shared by the CLI and the wasm/python bindings (member profiles are ignored
+# in a workspace): fat LTO keeps the wasm and wheels small.
+[profile.release]
+lto = true
+codegen-units = 1
 
 [features]
 default = ["external-backend"]
