@@ -18,7 +18,7 @@ use std::{
 use acadrust::{
     CadDocument,
     entities::EntityType,
-    types::{Color, Matrix3, Vector3},
+    types::{Color, LineWeight, Matrix3, Vector3},
 };
 use anyhow::{Context, Result, bail};
 use geojson::{Feature, FeatureCollection, GeometryValue, JsonObject, JsonValue};
@@ -264,9 +264,28 @@ fn resolve_linetype(
     }
 }
 
-/// Style properties for a feature: resolved color (ACI index and/or RGB) and
-/// linetype. Unresolvable policies are emitted verbatim ("ByLayer" or
-/// "ByBlock") instead of being dropped.
+/// Resolve an entity's line weight to millimetres, following ByLayer to the
+/// layer table. ByBlock, Default, and unset weights return None so the renderer
+/// falls back to its own default width. Values are stored in 1/100 mm.
+fn resolve_lineweight_mm(
+    document: &CadDocument,
+    line_weight: LineWeight,
+    layer: &str,
+) -> Option<f64> {
+    let raw = match line_weight {
+        LineWeight::Value(v) => v,
+        LineWeight::ByLayer => match document.layers.get(layer).map(|entry| entry.line_weight) {
+            Some(LineWeight::Value(v)) => v,
+            _ => return None,
+        },
+        LineWeight::ByBlock | LineWeight::Default => return None,
+    };
+    (raw >= 0).then(|| f64::from(raw) / 100.0)
+}
+
+/// Style properties for a feature: resolved color (ACI index and/or RGB),
+/// linetype, and line weight in mm. Unresolvable policies are emitted verbatim
+/// ("ByLayer" or "ByBlock") instead of being dropped.
 fn style_properties(
     document: &CadDocument,
     common: &acadrust::entities::EntityCommon,
@@ -291,6 +310,9 @@ fn style_properties(
     match resolve_linetype(document, &common.linetype, layer, placement) {
         Some(name) => properties.push(("linetype", JsonValue::from(name))),
         None => properties.push(("linetype", JsonValue::from("ByBlock"))),
+    }
+    if let Some(mm) = resolve_lineweight_mm(document, common.line_weight, layer) {
+        properties.push(("lineweight_mm", JsonValue::from(mm)));
     }
     properties
 }
@@ -4748,13 +4770,14 @@ mod tests {
     #[test]
     fn bylayer_styles_resolve_from_the_layer_table() {
         use acadrust::Layer;
-        use acadrust::types::Color;
+        use acadrust::types::{Color, LineWeight};
         use geojson::JsonValue;
 
         let mut document = CadDocument::with_version(DxfVersion::AC1027);
         let mut layer = Layer::new("PIPES");
         layer.color = Color::GREEN;
         layer.line_type = "CENTER".to_string();
+        layer.line_weight = LineWeight::Value(50); // 0.50 mm
         document.layers.add(layer).expect("add layer");
 
         let mut point = EntityType::Point(Point::from_coords(1.0, 1.0, 0.0));
@@ -4770,6 +4793,11 @@ mod tests {
             Some(&JsonValue::from("#00FF00"))
         );
         assert_eq!(properties.get("linetype"), Some(&JsonValue::from("CENTER")));
+        assert_eq!(
+            properties.get("lineweight_mm"),
+            Some(&JsonValue::from(0.5)),
+            "ByLayer line weight should resolve from the layer table"
+        );
         assert!(properties.get("color").is_none());
     }
 
