@@ -6,6 +6,7 @@
 
 pub mod calibrate;
 pub mod convert;
+pub use convert::{EmbedResult, convert_bytes};
 pub mod model;
 #[cfg(feature = "native-reproject")]
 pub mod reproject;
@@ -236,6 +237,38 @@ pub(crate) fn read_document(path: &Path) -> Result<(CadDocument, ReadMode, Vec<S
                 Err(failsafe_error) => Err(anyhow!(
                     "native backend cannot parse {}: strict error: {strict_error}; failsafe error: {failsafe_error}",
                     path.display()
+                )),
+            }
+        }
+    }
+}
+
+/// Read a DWG from an in-memory byte buffer (the embedding/WASM path), with
+/// the same strict-then-failsafe policy as [`read_document`].
+pub(crate) fn read_stream(bytes: &[u8]) -> Result<(CadDocument, ReadMode, Vec<String>)> {
+    use std::io::Cursor;
+
+    let mut reader = DwgReader::from_stream(Cursor::new(bytes.to_vec()));
+    match reader.read() {
+        Ok(document) => Ok((document, ReadMode::Strict, Vec::new())),
+        Err(strict_error) => {
+            let mut failsafe_reader = DwgReader::from_stream_with_options(
+                Cursor::new(bytes.to_vec()),
+                DwgReadOptions::failsafe(),
+            );
+            match failsafe_reader.read() {
+                Ok(document) if document.entity_count() > 0 || document.layers.len() > 1 => Ok((
+                    document,
+                    ReadMode::FailsafeRecovery,
+                    vec![format!(
+                        "strict parse failed ({strict_error}); results come from a failsafe re-read and may be incomplete"
+                    )],
+                )),
+                Ok(_) => Err(anyhow!(
+                    "native backend cannot parse the drawing: strict error: {strict_error}; a failsafe re-read recovered no drawing content"
+                )),
+                Err(failsafe_error) => Err(anyhow!(
+                    "native backend cannot parse the drawing: strict error: {strict_error}; failsafe error: {failsafe_error}"
                 )),
             }
         }

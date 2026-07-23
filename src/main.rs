@@ -1,12 +1,7 @@
-mod backend;
-mod cli;
-mod commands;
-mod dwg;
-mod report;
-
 use anyhow::Result;
 use clap::Parser;
-use cli::Cli;
+use dwg2geo::cli::Cli;
+use dwg2geo::commands;
 
 fn main() {
     if let Err(error) = run() {

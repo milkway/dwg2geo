@@ -3549,6 +3549,119 @@ fn signed_area(ring: &[(f64, f64)]) -> f64 {
     -sum / 2.0
 }
 
+/// Result of the in-memory embedding conversion ([`convert_bytes`]).
+#[derive(Debug, serde::Serialize)]
+pub struct EmbedResult {
+    /// GeoJSON FeatureCollection (local drawing coordinates) as a string.
+    pub geojson: String,
+    pub feature_count: usize,
+    pub model_space_entities: usize,
+    pub converted: Vec<report::ConvertedCount>,
+    pub skipped: Vec<report::OutcomeCount>,
+    pub failed: Vec<report::OutcomeCount>,
+    pub warnings: Vec<String>,
+    /// Drawing-coordinate bounding box [min_x, min_y, max_x, max_y].
+    pub bbox: Option<[f64; 4]>,
+    /// SHA-256 of the input bytes.
+    pub source_sha256: String,
+}
+
+/// Embedding / WebAssembly entry point: convert model-space geometry from an
+/// in-memory DWG to a GeoJSON FeatureCollection in raw drawing coordinates —
+/// no CRS handling, no file I/O. Reprojection is the embedder's concern (the
+/// browser app reprojects with proj4js). Reuses the same audited extraction
+/// and writer as the CLI native backend.
+pub fn convert_bytes(
+    bytes: &[u8],
+    polygonize_closed: bool,
+    curve_tolerance: Option<f64>,
+) -> Result<EmbedResult> {
+    use sha2::{Digest, Sha256};
+
+    let (document, _read_mode, mut warnings) = super::read_stream(bytes)?;
+
+    let options = GeometryOptions {
+        polygonize_closed,
+        curve_tolerance: curve_tolerance.unwrap_or(DEFAULT_CURVE_TOLERANCE),
+        preserve_inserts: false,
+        include_layers: Vec::new(),
+        exclude_layers: Vec::new(),
+    };
+
+    let mut features: Vec<Feature> = Vec::new();
+    let mut bbox: Option<[f64; 4]> = None;
+    let extraction = extract_with_sink(&document, &options, &mut |feature| {
+        accumulate_bbox(&mut bbox, &feature);
+        features.push(writer::to_geojson(&feature));
+        Ok(())
+    })?;
+
+    let source_sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+
+    let mut members = JsonObject::new();
+    members.insert(
+        "dwg2geo".to_string(),
+        serde_json::json!({
+            "coordinate_status": "local-unreferenced",
+            "note": "coordinates are raw drawing units; no geographic CRS was established",
+            "source_sha256": source_sha256,
+        }),
+    );
+    let collection = FeatureCollection {
+        bbox: None,
+        features,
+        foreign_members: Some(members),
+    };
+    let geojson = serde_json::to_string(&collection)
+        .context("cannot serialize GeoJSON feature collection")?;
+
+    if extraction.model_space_entities != extraction.top_level_accounted {
+        warnings.push(format!(
+            "{} model-space entities were not accounted",
+            extraction
+                .model_space_entities
+                .saturating_sub(extraction.top_level_accounted)
+        ));
+    }
+
+    let feature_count = collection_len(&geojson);
+    Ok(EmbedResult {
+        feature_count,
+        model_space_entities: extraction.model_space_entities,
+        converted: extraction
+            .converted
+            .into_iter()
+            .map(|(entity_type, count)| report::ConvertedCount { entity_type, count })
+            .collect(),
+        skipped: outcome_counts(extraction.skipped),
+        failed: outcome_counts(extraction.failed),
+        warnings,
+        bbox,
+        source_sha256,
+        geojson,
+    })
+}
+
+/// Count the Feature objects in a serialized collection without reparsing the
+/// geometry (the string was just produced from a known-shaped collection).
+fn collection_len(geojson: &str) -> usize {
+    serde_json::from_str::<serde_json::Value>(geojson)
+        .ok()
+        .and_then(|v| {
+            v.get("features")
+                .and_then(|f| f.as_array().map(|a| a.len()))
+        })
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::CadGeometry;
