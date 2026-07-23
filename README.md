@@ -16,14 +16,14 @@ An open-source CLI that converts engineering DWG drawings to GeoJSON with explic
 
 ## Download
 
-**Latest release: [v0.2.0](https://github.com/milkway/dwg2geo/releases/latest)** — self-contained `native-backend` binaries, no LibreDWG/GDAL/PROJ required. Each archive bundles the binary plus shell completions and man pages; verify it against its `.sha256` (or the aggregated [`SHA256SUMS`](https://github.com/milkway/dwg2geo/releases/download/v0.2.0/SHA256SUMS)).
+**Latest release: [v0.2.1](https://github.com/milkway/dwg2geo/releases/latest)** — self-contained `native-backend` binaries, no LibreDWG/GDAL/PROJ required. Each archive bundles the binary plus shell completions and man pages; verify it against its `.sha256` (or the aggregated [`SHA256SUMS`](https://github.com/milkway/dwg2geo/releases/download/v0.2.1/SHA256SUMS)).
 
 | Platform | Download |
 |---|---|
-| Linux (x86_64) | [`dwg2geo-v0.2.0-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.2.0/dwg2geo-v0.2.0-x86_64-unknown-linux-gnu.tar.gz) |
-| macOS (Apple Silicon) | [`dwg2geo-v0.2.0-aarch64-apple-darwin.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.2.0/dwg2geo-v0.2.0-aarch64-apple-darwin.tar.gz) |
-| macOS (Intel) | [`dwg2geo-v0.2.0-x86_64-apple-darwin.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.2.0/dwg2geo-v0.2.0-x86_64-apple-darwin.tar.gz) |
-| Windows (x86_64) | [`dwg2geo-v0.2.0-x86_64-pc-windows-msvc.zip`](https://github.com/milkway/dwg2geo/releases/download/v0.2.0/dwg2geo-v0.2.0-x86_64-pc-windows-msvc.zip) |
+| Linux (x86_64) | [`dwg2geo-v0.2.1-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.2.1/dwg2geo-v0.2.1-x86_64-unknown-linux-gnu.tar.gz) |
+| macOS (Apple Silicon) | [`dwg2geo-v0.2.1-aarch64-apple-darwin.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.2.1/dwg2geo-v0.2.1-aarch64-apple-darwin.tar.gz) |
+| macOS (Intel) | [`dwg2geo-v0.2.1-x86_64-apple-darwin.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.2.1/dwg2geo-v0.2.1-x86_64-apple-darwin.tar.gz) |
+| Windows (x86_64) | [`dwg2geo-v0.2.1-x86_64-pc-windows-msvc.zip`](https://github.com/milkway/dwg2geo/releases/download/v0.2.1/dwg2geo-v0.2.1-x86_64-pc-windows-msvc.zip) |
 
 Prefer to build it yourself? See [Start](#start). Reprojection with `--source-crs` needs the `native-reproject` feature and system PROJ ≥ 9.6, so it is not shipped in the prebuilt binaries.
 

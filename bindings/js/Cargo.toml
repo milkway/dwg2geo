@@ -1,6 +1,6 @@
 [package]
 name = "dwg2geo-wasm"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Convert engineering DWG drawings to GeoJSON in the browser or Node (WebAssembly)"
@@ -13,7 +13,7 @@ publish = false # npm package; not a crates.io crate
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-dwg2geo = { path = "../..", version = "0.2.0", default-features = false, features = ["native-backend"] }
+dwg2geo = { path = "../..", version = "0.2.1", default-features = false, features = ["native-backend"] }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1"
