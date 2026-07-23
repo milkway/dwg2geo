@@ -36,6 +36,7 @@ The converter is also published as a library for three ecosystems:
 | Rust | [crates.io/crates/dwg2geo](https://crates.io/crates/dwg2geo) | `cargo add dwg2geo --features native-backend` (or `cargo install dwg2geo` for the CLI) | `dwg2geo::backend::native::convert_bytes(...)` |
 | JavaScript / WASM | [npmjs.com/package/dwg2geo](https://www.npmjs.com/package/dwg2geo) | `npm install dwg2geo` | `import init, { convert } from 'dwg2geo'` — runs in the browser, no native deps ([source](bindings/js/)) |
 | Python | [pypi.org/project/dwg2geo](https://pypi.org/project/dwg2geo/) | `pip install dwg2geo` | `dwg2geo.convert_file("drawing.dwg")` → result dict ([source](bindings/python/)) |
+| R | [github.com/milkway/dwg2geo-r](https://github.com/milkway/dwg2geo-r) | `pak::pak("milkway/dwg2geo-r")` (CRAN submission in progress) | `dwg_convert("drawing.dwg")` → result + tibbles ([docs](https://milkway.github.io/dwg2geo-r/)) |
 
 All three wrap the same native conversion core, are deterministic (the same bytes always produce byte-identical GeoJSON on a given platform), and never guess a CRS — reprojection stays explicit and in your hands. Across platforms (e.g. native vs WebAssembly) a handful of floating-point values may differ in the last digit (observed max 1e-9, from libm rounding); feature sets and geometry are otherwise identical.
 
