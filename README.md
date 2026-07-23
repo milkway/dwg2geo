@@ -11,6 +11,19 @@ An open-source CLI that converts engineering DWG drawings to GeoJSON with explic
 
 **Website & docs:** <https://milkway.github.io/dwg2geo/>
 
+## Download
+
+**Latest release: [v0.1.0](https://github.com/milkway/dwg2geo/releases/latest)** — self-contained `native-backend` binaries, no LibreDWG/GDAL/PROJ required. Each archive bundles the binary plus shell completions and man pages; verify it against its `.sha256` (or the aggregated [`SHA256SUMS`](https://github.com/milkway/dwg2geo/releases/download/v0.1.0/SHA256SUMS)).
+
+| Platform | Download |
+|---|---|
+| Linux (x86_64) | [`dwg2geo-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.1.0/dwg2geo-v0.1.0-x86_64-unknown-linux-gnu.tar.gz) |
+| macOS (Apple Silicon) | [`dwg2geo-v0.1.0-aarch64-apple-darwin.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.1.0/dwg2geo-v0.1.0-aarch64-apple-darwin.tar.gz) |
+| macOS (Intel) | [`dwg2geo-v0.1.0-x86_64-apple-darwin.tar.gz`](https://github.com/milkway/dwg2geo/releases/download/v0.1.0/dwg2geo-v0.1.0-x86_64-apple-darwin.tar.gz) |
+| Windows (x86_64) | [`dwg2geo-v0.1.0-x86_64-pc-windows-msvc.zip`](https://github.com/milkway/dwg2geo/releases/download/v0.1.0/dwg2geo-v0.1.0-x86_64-pc-windows-msvc.zip) |
+
+Prefer to build it yourself? See [Start](#start). Reprojection with `--source-crs` needs the `native-reproject` feature and system PROJ ≥ 9.6, so it is not shipped in the prebuilt binaries.
+
 ## Current scope
 
 The CLI ships a conservative external-tool MVP in the default build and an in-process native backend behind optional Cargo features:
