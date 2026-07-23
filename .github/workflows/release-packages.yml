@@ -1,0 +1,171 @@
+name: release-packages
+
+# Publishes the three registry packages when a release tag (v*) is pushed:
+#   - crates.io  (Rust crate)         via crates.io Trusted Publishing (OIDC)
+#   - npm        (dwg2geo, wasm)      via npm Trusted Publishing (OIDC)
+#   - PyPI       (dwg2geo, pyo3)      via PyPI Trusted Publishing (OIDC)
+# No long-lived tokens: each registry mints a short-lived credential from the
+# GitHub OIDC id-token. One-time setup required on each registry — see the
+# "Trusted publisher" settings pointing at this repo + this workflow file +
+# the `release` environment.
+#
+# workflow_dispatch runs everything except the actual uploads (dry runs),
+# so the pipeline can be tested without cutting a release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Opt every bundled JS action into the Node.js 24 runtime.
+env:
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+permissions: {}
+
+jobs:
+  # Guard: the tag must match every package version before anything uploads.
+  versions:
+    name: check versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches all package versions
+        run: |
+          core=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          js=$(grep -m1 '^version' bindings/js/Cargo.toml | cut -d'"' -f2)
+          py=$(grep -m1 '^version' bindings/python/Cargo.toml | cut -d'"' -f2)
+          echo "core=$core js=$js py=$py ref=$GITHUB_REF_NAME"
+          [ "$core" = "$js" ] && [ "$core" = "$py" ] || { echo "::error::package versions diverge"; exit 1; }
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            [ "v$core" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != v$core"; exit 1; }
+          fi
+
+  crate:
+    name: publish crates.io
+    needs: versions
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # OIDC for crates.io Trusted Publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Dry run (workflow_dispatch)
+        if: github.ref_type != 'tag'
+        run: cargo publish --dry-run
+      - name: Mint crates.io token
+        if: github.ref_type == 'tag'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish
+        if: github.ref_type == 'tag'
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  npm:
+    name: publish npm (wasm)
+    needs: versions
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm Trusted Publishing (also signs provenance)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: npm >= 11.5.1 (required for OIDC publishing)
+        run: npm install -g npm@latest && npm --version
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+      - name: Build package
+        run: ./bindings/js/build.sh
+      - name: Publish (dry run on workflow_dispatch)
+        working-directory: bindings/js/pkg
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            npm publish --access public
+          else
+            npm publish --access public --dry-run
+          fi
+
+  pypi-build:
+    name: wheel ${{ matrix.platform }}
+    needs: versions
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - platform: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: macos-universal2
+            os: macos-latest
+            target: universal2-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --release --manifest-path bindings/python/Cargo.toml --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+
+  pypi-sdist:
+    name: sdist
+    needs: versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --manifest-path bindings/python/Cargo.toml --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  pypi:
+    name: publish PyPI
+    if: github.ref_type == 'tag'
+    needs: [pypi-build, pypi-sdist]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # OIDC for PyPI Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

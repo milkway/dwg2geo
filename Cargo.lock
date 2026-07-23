@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "dwg2geo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "acadrust",
  "anyhow",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "dwg2geo-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dwg2geo",
  "pyo3",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "dwg2geo-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
  "dwg2geo",
