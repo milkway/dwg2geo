@@ -195,6 +195,9 @@ struct Placement {
     /// Resolved linetype of the enclosing insert, substituted for ByBlock
     /// entity linetypes; None outside block content or when unresolvable.
     inherited_linetype: Option<String>,
+    /// Resolved line weight (mm) of the enclosing insert, substituted for
+    /// ByBlock entity weights; None outside block content or when unresolvable.
+    inherited_lineweight: Option<f64>,
     /// Largest accumulated |scale| factor, for tessellation-error warnings.
     max_scale: f64,
 }
@@ -208,6 +211,7 @@ impl Placement {
             inherited_layer: None,
             inherited_color: None,
             inherited_linetype: None,
+            inherited_lineweight: None,
             max_scale: 1.0,
         }
     }
@@ -265,12 +269,14 @@ fn resolve_linetype(
 }
 
 /// Resolve an entity's line weight to millimetres, following ByLayer to the
-/// layer table. ByBlock, Default, and unset weights return None so the renderer
-/// falls back to its own default width. Values are stored in 1/100 mm.
+/// layer table and ByBlock to the enclosing insert (like color/linetype).
+/// Default and unresolvable weights return None so the renderer falls back to
+/// its own default width. Values are stored in 1/100 mm.
 fn resolve_lineweight_mm(
     document: &CadDocument,
     line_weight: LineWeight,
     layer: &str,
+    placement: &Placement,
 ) -> Option<f64> {
     let raw = match line_weight {
         LineWeight::Value(v) => v,
@@ -278,7 +284,8 @@ fn resolve_lineweight_mm(
             Some(LineWeight::Value(v)) => v,
             _ => return None,
         },
-        LineWeight::ByBlock | LineWeight::Default => return None,
+        LineWeight::ByBlock => return placement.inherited_lineweight,
+        LineWeight::Default => return None,
     };
     (raw >= 0).then(|| f64::from(raw) / 100.0)
 }
@@ -311,7 +318,7 @@ fn style_properties(
         Some(name) => properties.push(("linetype", JsonValue::from(name))),
         None => properties.push(("linetype", JsonValue::from("ByBlock"))),
     }
-    if let Some(mm) = resolve_lineweight_mm(document, common.line_weight, layer) {
+    if let Some(mm) = resolve_lineweight_mm(document, common.line_weight, layer, placement) {
         properties.push(("lineweight_mm", JsonValue::from(mm)));
     }
     properties
@@ -1502,6 +1509,12 @@ fn process_insert(
         &insert_layer,
         placement,
     );
+    let insert_lineweight = resolve_lineweight_mm(
+        document,
+        entity.common().line_weight,
+        &insert_layer,
+        placement,
+    );
 
     let attributes: BTreeMap<String, String> = insert
         .attributes
@@ -1588,6 +1601,7 @@ fn process_insert(
                 inherited_layer: Some(insert_layer.clone()),
                 inherited_color: insert_color,
                 inherited_linetype: insert_linetype.clone(),
+                inherited_lineweight: insert_lineweight,
                 max_scale: placement.max_scale * instance_scale,
             };
 
@@ -4804,18 +4818,20 @@ mod tests {
     #[test]
     fn byblock_styles_resolve_through_the_insert_chain() {
         use acadrust::entities::Insert;
-        use acadrust::types::{Color, Vector3};
+        use acadrust::types::{Color, LineWeight, Vector3};
         use geojson::JsonValue;
 
         let mut document = CadDocument::with_version(DxfVersion::AC1027);
         let mut block_point = EntityType::Point(Point::from_coords(0.0, 0.0, 0.0));
         block_point.common_mut().color = Color::ByBlock;
         block_point.common_mut().linetype = "BYBLOCK".to_string();
+        block_point.common_mut().line_weight = LineWeight::ByBlock;
         add_block(&mut document, "SYM", Vector3::ZERO, vec![block_point]);
 
         let mut insert = EntityType::Insert(Insert::new("SYM", Vector3::ZERO));
         insert.common_mut().color = Color::RED;
         insert.common_mut().linetype = "DASHED".to_string();
+        insert.common_mut().line_weight = LineWeight::Value(50); // 0.50 mm
         document.add_entity(insert).expect("add insert");
 
         // A second ByBlock point directly in model space stays unresolved.
@@ -4836,6 +4852,11 @@ mod tests {
             block_properties.get("linetype"),
             Some(&JsonValue::from("DASHED"))
         );
+        assert_eq!(
+            block_properties.get("lineweight_mm"),
+            Some(&JsonValue::from(0.5)),
+            "ByBlock line weight should inherit the INSERT's weight"
+        );
         let loose_properties = props(&extraction.features[1]);
         assert_eq!(
             loose_properties.get("color"),
@@ -4844,6 +4865,10 @@ mod tests {
         assert_eq!(
             loose_properties.get("linetype"),
             Some(&JsonValue::from("ByBlock"))
+        );
+        assert!(
+            loose_properties.get("lineweight_mm").is_none(),
+            "ByBlock outside a block stays unresolved"
         );
     }
 
