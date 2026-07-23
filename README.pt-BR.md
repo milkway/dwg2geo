@@ -1,49 +1,42 @@
-# dwg2geo — início rápido
+# dwg2geo (português)
 
-Este pacote contém um plano técnico, prompts para Codex CLI e Claude Code e um esqueleto Rust para uma CLI de conversão DWG -> GeoJSON.
+> Versão resumida — a documentação completa e sempre atual está no [README em inglês](README.md).
 
-## O que já está desenhado
+CLI e biblioteca de código aberto que convertem desenhos DWG de engenharia em **GeoJSON auditável**, com tratamento explícito de sistema de referência de coordenadas (CRS), diagnósticos e relatórios rastreáveis.
 
-- `inspect`: identifica a assinatura DWG, geração do AutoCAD, tamanho e SHA-256 sem depender de bibliotecas CAD.
-- `doctor`: verifica `dwgread` e `ogr2ogr`, com versões; `--json` emite um relatório legível por máquina.
-- `convert`: usa LibreDWG + GDAL e exige o CRS de origem, salvo quando coordenadas locais são aceitas explicitamente. Cada conversão bem-sucedida grava um relatório em `<saída>.report.json` com opções, ferramentas, hash da origem, tempos e avisos.
-- backend nativo futuro com `acadrust`, isolado por feature do Cargo.
-- plano por marcos, arquitetura, mapeamento de entidades, riscos e decisões.
+**Site e documentação:** <https://milkway.github.io/dwg2geo/>
 
-O desenho `_Corredor Sul.dwg` e todos os dados derivados dele são mantidos fora deste repositório — o diretório `samples/` inteiro é ignorado pelo git.
+## Instalação
 
-## Como começar
+Binários prontos (Linux, macOS, Windows) na [página de releases](https://github.com/milkway/dwg2geo/releases/latest), ou pelos registros de pacotes:
 
-```bash
-unzip dwg2geo-starter-pack.zip
-cd dwg2geo-starter
-cargo fmt --check
-cargo check
-cargo test
-```
+| Ecossistema | Instalação | Uso |
+|---|---|---|
+| Rust ([crates.io](https://crates.io/crates/dwg2geo)) | `cargo add dwg2geo --features native-backend` (CLI: `cargo install dwg2geo`) | `dwg2geo::backend::native::convert_bytes(...)` |
+| JavaScript/WASM ([npm](https://www.npmjs.com/package/dwg2geo)) | `npm install dwg2geo` | `import init, { convert } from 'dwg2geo'` — roda no navegador |
+| Python ([PyPI](https://pypi.org/project/dwg2geo/)) | `pip install dwg2geo` | `dwg2geo.convert_file("desenho.dwg")` → dict com GeoJSON e relatório |
 
-Copie o DWG localmente:
+Experimente no navegador, sem instalar nada: **<https://milkway.github.io/dwg2geo-app/>** (o arquivo nunca sai da sua máquina).
+
+## Uso básico
 
 ```bash
-cp "/caminho/_Corredor Sul.dwg" samples/
+# inspecionar um DWG (assinatura, versão, entidades, layers)
+dwg2geo inspect desenho.dwg --json
+
+# converter com CRS de origem conhecido (reprojetado para WGS 84)
+dwg2geo convert desenho.dwg --backend native \
+  --source-crs EPSG:31983 --source-units m -o saida.geojson
+
+# ou exportar coordenadas locais explicitamente
+dwg2geo convert desenho.dwg --backend native \
+  --allow-local-coordinates -o saida-local.geojson
 ```
 
-Inspecione:
+Cada conversão grava um relatório auditável em `<saída>.report.json` (opções, versões, hash SHA-256 da origem, contagens por tipo de entidade com motivos de descarte, avisos). A conversão **nunca adivinha o CRS**: sem `--source-crs`, só prossegue com `--allow-local-coordinates` explícito.
 
-```bash
-cargo run -- inspect "samples/_Corredor Sul.dwg" --json
-```
+O desenho de referência e todos os dados derivados dele ficam fora deste repositório — o diretório `samples/` inteiro é ignorado pelo git.
 
-Inicie o agente:
+## Licença
 
-```bash
-codex "$(cat prompts/START_CODEX.md)"
-```
-
-ou:
-
-```bash
-claude "$(cat prompts/START_CLAUDE.md)"
-```
-
-O arquivo `AGENTS.md` contém as regras canônicas do projeto. O `PROMPT.md` é uma versão única que funciona como ponto de partida para qualquer agente de terminal.
+MIT (`LICENSE-MIT`). Detalhes de arquitetura, backends, calibração por pontos de controle e limitações: [README em inglês](README.md).

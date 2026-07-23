@@ -56,14 +56,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Dry run (workflow_dispatch)
-        if: github.ref_type != 'tag'
+        if: github.event_name != 'push'
         run: cargo publish --dry-run
       - name: Mint crates.io token
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
       - name: Publish
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
@@ -94,7 +94,7 @@ jobs:
       - name: Publish (dry run on workflow_dispatch)
         working-directory: bindings/js/pkg
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             npm publish --access public
           else
             npm publish --access public --dry-run
@@ -154,7 +154,7 @@ jobs:
 
   pypi:
     name: publish PyPI
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [pypi-build, pypi-sdist]
     runs-on: ubuntu-latest
     environment: release

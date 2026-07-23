@@ -39,6 +39,6 @@ transformer = Transformer.from_crs("EPSG:31983", "EPSG:4326", always_xy=True)
 lon, lat = transformer.transform(x, y)
 ```
 
-Deterministic: the same bytes always produce byte-identical GeoJSON.
+Deterministic: the same bytes always produce byte-identical GeoJSON on a given platform (across platforms — native vs WebAssembly — a few floating-point values may differ in the last digit).
 
 License: MIT.
