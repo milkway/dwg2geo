@@ -45,6 +45,9 @@ pub struct NativeConversionSummary {
     pub approximated_features: usize,
     /// INSERT references expanded into block geometry.
     pub inserts_expanded: usize,
+    /// DIMENSION entities expanded into their dimension-block geometry
+    /// (DXF DIMENSION group 2).
+    pub dimension_blocks_expanded: usize,
     pub converted: Vec<ConvertedCount>,
     pub skipped: Vec<OutcomeCount>,
     pub failed: Vec<OutcomeCount>,

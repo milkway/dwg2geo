@@ -23,7 +23,7 @@ enum Policy {
 /// Every acadrust 0.4.1 `EntityType` variant and its disposition. acadrust has
 /// no enum iterator, so this list must be updated when the dependency changes.
 const POLICY: [(&str, Policy); 44] = [
-    // Converted (16)
+    // Converted (17)
     ("Point", Policy::Converted),
     ("Line", Policy::Converted),
     ("LwPolyline", Policy::Converted),
@@ -40,6 +40,10 @@ const POLICY: [(&str, Policy); 44] = [
     ("MText", Policy::Converted),
     ("Insert", Policy::Converted),
     ("Solid", Policy::Converted),
+    // A DIMENSION is converted through the block that holds its picture
+    // (DXF DIMENSION group 2), not by re-deriving the picture from the
+    // definition points and the dimension style.
+    ("Dimension", Policy::Converted),
     // Deliberately unsupported with policy (11)
     ("Ray", Policy::DeliberatelyUnsupported),
     ("XLine", Policy::DeliberatelyUnsupported),
@@ -52,9 +56,8 @@ const POLICY: [(&str, Policy); 44] = [
     ("Seqend", Policy::DeliberatelyUnsupported),
     ("AttributeDefinition", Policy::DeliberatelyUnsupported),
     ("Unknown", Policy::DeliberatelyUnsupported),
-    // Not yet converted (17)
+    // Not yet converted (16)
     ("Helix", Policy::NotYetConverted),
-    ("Dimension", Policy::NotYetConverted),
     ("Viewport", Policy::NotYetConverted),
     ("AttributeEntity", Policy::NotYetConverted),
     ("Leader", Policy::NotYetConverted),
@@ -96,12 +99,12 @@ fn every_acadrust_entity_type_has_exactly_one_documented_policy() {
         .filter(|(_, p)| *p == Policy::NotYetConverted)
         .count();
 
-    assert_eq!(converted, 16, "converted variant count changed");
+    assert_eq!(converted, 17, "converted variant count changed");
     assert_eq!(
         unsupported, 11,
         "deliberately-unsupported variant count changed"
     );
-    assert_eq!(not_yet, 17, "not-yet-converted variant count changed");
+    assert_eq!(not_yet, 16, "not-yet-converted variant count changed");
     assert_eq!(
         converted + unsupported + not_yet,
         44,

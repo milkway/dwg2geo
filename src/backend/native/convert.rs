@@ -714,6 +714,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             features_written,
             approximated_features: extraction.approximated_features,
             inserts_expanded: extraction.inserts_expanded,
+            dimension_blocks_expanded: extraction.dimension_blocks_expanded,
             converted: extraction
                 .converted
                 .into_iter()
@@ -1262,6 +1263,8 @@ struct Extraction {
     feature_warnings: usize,
     approximated_features: usize,
     inserts_expanded: usize,
+    /// DIMENSION entities expanded into their dimension-block geometry.
+    dimension_blocks_expanded: usize,
     /// Top-level model-space entities dropped by --include/--exclude-layers.
     excluded_by_layer_filter: usize,
     /// Top-level model-space entities encountered.
@@ -1406,8 +1409,13 @@ fn process_entity(
             document, entity, insert, index, options, extraction, sink, placement, depth,
         );
     }
+    if let EntityType::Dimension(dimension) = entity {
+        return process_dimension(
+            document, entity, dimension, index, options, extraction, sink, placement, depth,
+        );
+    }
 
-    // Every non-INSERT entity reaches exactly one outcome below.
+    // Every other entity reaches exactly one outcome below.
     if placement.block_path.is_empty() {
         extraction.top_level_accounted += 1;
     }
@@ -1655,6 +1663,157 @@ fn process_insert(
             placement,
         )?;
     }
+    Ok(())
+}
+
+/// Expand a DIMENSION into the geometry of its dimension block.
+///
+/// DXF DIMENSION group 2 names "the block that contains the entities that
+/// make up the dimension picture" — extension lines, the dimension line,
+/// arrowheads, and the measurement text, all already evaluated by the
+/// producing application in the drawing's units and rotation. Group 12 is
+/// the block's insertion point in OCS (zero unless the dimension was cloned
+/// by BASELINE/CONTINUE), so the block is placed at that point with unit
+/// scale and no rotation, lifted through the extrusion normal. Re-deriving
+/// the picture from the definition points instead would mean reimplementing
+/// the whole dimension style (arrow size, text placement, DIMTAD, tolerance
+/// stacking) and inventing the parts the style does not pin down.
+///
+/// The block content stays attributed to the DIMENSION: its handle prefixes
+/// the child ids and layer-0 content inherits the dimension's layer, exactly
+/// as for an INSERT.
+#[allow(clippy::too_many_arguments)]
+fn process_dimension(
+    document: &CadDocument,
+    entity: &EntityType,
+    dimension: &acadrust::entities::Dimension,
+    index: usize,
+    options: &GeometryOptions,
+    extraction: &mut Extraction,
+    sink: &mut dyn FnMut(CadFeature) -> Result<()>,
+    placement: &Placement,
+    depth: usize,
+) -> Result<()> {
+    let id = feature_id(entity, index, placement);
+    let entity_type = entity.as_entity().entity_type().to_string();
+    if placement.block_path.is_empty() {
+        extraction.top_level_accounted += 1;
+    }
+
+    let base = dimension.base();
+    if !valid_normal(&base.normal) {
+        record_outcome(
+            &mut extraction.failed,
+            entity_type,
+            "zero or non-finite extrusion normal".to_string(),
+            &id,
+        );
+        return Ok(());
+    }
+    if !is_finite(&base.insertion_point) {
+        record_outcome(
+            &mut extraction.failed,
+            entity_type,
+            "non-finite coordinates".to_string(),
+            &id,
+        );
+        return Ok(());
+    }
+
+    let Some(record) = document.block_records.get(&base.block_name) else {
+        record_outcome(
+            &mut extraction.skipped,
+            entity_type,
+            format!(
+                "dimension block {:?} is not in the drawing; the dimension picture lives only there",
+                base.block_name
+            ),
+            &id,
+        );
+        return Ok(());
+    };
+    if placement
+        .block_path
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&base.block_name))
+    {
+        record_outcome(
+            &mut extraction.failed,
+            entity_type,
+            format!("recursive reference to block {:?}", base.block_name),
+            &id,
+        );
+        return Ok(());
+    }
+    if depth >= MAX_BLOCK_DEPTH {
+        record_outcome(
+            &mut extraction.failed,
+            entity_type,
+            format!("block nesting deeper than {MAX_BLOCK_DEPTH} levels"),
+            &id,
+        );
+        return Ok(());
+    }
+
+    let dimension_layer = effective_layer(&entity.common().layer, placement);
+    let dimension_color =
+        resolve_color(document, entity.common().color, &dimension_layer, placement);
+    let dimension_linetype = resolve_linetype(
+        document,
+        &entity.common().linetype,
+        &dimension_layer,
+        placement,
+    );
+    let dimension_lineweight = resolve_lineweight_mm(
+        document,
+        entity.common().line_weight,
+        &dimension_layer,
+        placement,
+    );
+
+    let ocs_to_wcs = Matrix3::arbitrary_axis(base.normal);
+    let block_matrix = Affine::from_translation(ocs_to_wcs.transform_point(base.insertion_point))
+        .compose(&Affine::from_linear(ocs_to_wcs.m))
+        .compose(&Affine::from_translation(record.base_point * -1.0));
+    let mut block_path = placement.block_path.clone();
+    block_path.push(base.block_name.clone());
+    let child_placement = Placement {
+        matrix: placement.matrix.compose(&block_matrix),
+        block_path,
+        id_prefix: format!("{id}/"),
+        inherited_layer: Some(dimension_layer),
+        inherited_color: dimension_color,
+        inherited_linetype: dimension_linetype,
+        inherited_lineweight: dimension_lineweight,
+        max_scale: placement.max_scale,
+    };
+
+    for (child_index, handle) in record.entity_handles.iter().enumerate() {
+        let Some(child) = document.get_entity(*handle) else {
+            record_outcome(
+                &mut extraction.failed,
+                "UNRESOLVED".to_string(),
+                "entity handle does not resolve to an entity".to_string(),
+                &format!("{}{}", child_placement.id_prefix, handle),
+            );
+            continue;
+        };
+        if matches!(child, EntityType::Block(_) | EntityType::BlockEnd(_)) {
+            continue;
+        }
+        process_entity(
+            document,
+            child,
+            child_index,
+            options,
+            extraction,
+            sink,
+            &child_placement,
+            depth + 1,
+        )?;
+    }
+
+    extraction.dimension_blocks_expanded += 1;
     Ok(())
 }
 
@@ -4896,6 +5055,116 @@ mod tests {
         assert!(
             id.contains('/'),
             "id must be prefixed by the insert chain: {id}"
+        );
+    }
+
+    /// Linear DIMENSION whose picture lives in block `*D0`, the way DXF
+    /// group 2 defines it.
+    fn dimension_with_block(
+        block_name: &str,
+        insertion_point: acadrust::types::Vector3,
+    ) -> EntityType {
+        use acadrust::entities::{Dimension, DimensionLinear};
+        use acadrust::types::Vector3;
+
+        let mut linear =
+            DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(30.0, 0.0, 0.0));
+        linear.base.block_name = block_name.to_string();
+        linear.base.insertion_point = insertion_point;
+        linear.base.common.layer = "DIMS".to_string();
+        EntityType::Dimension(Dimension::Linear(linear))
+    }
+
+    #[test]
+    fn dimension_expands_the_block_that_holds_its_picture() {
+        use acadrust::types::Vector3;
+        use geojson::JsonValue;
+
+        // DXF DIMENSION group 2 names the block with the dimension picture;
+        // group 12 is its insertion point, zero for a dimension that was not
+        // cloned by BASELINE/CONTINUE.
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "*D0",
+            Vector3::ZERO,
+            vec![
+                EntityType::Line(Line::from_coords(0.0, 5.0, 0.0, 30.0, 5.0, 0.0)),
+                EntityType::Line(Line::from_coords(0.0, 0.0, 0.0, 0.0, 6.0, 0.0)),
+            ],
+        );
+        document
+            .add_entity(dimension_with_block("*D0", Vector3::ZERO))
+            .expect("add dimension");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.dimension_blocks_expanded, 1);
+        assert_eq!(extraction.inserts_expanded, 0);
+        assert_eq!(extraction.features.len(), 2);
+        assert_eq!(extraction.converted.get("LINE"), Some(&2));
+        assert!(extraction.skipped.is_empty());
+        // The picture is stored evaluated, so the identity placement keeps it.
+        let CadGeometry::Line(coordinates) = &extraction.features[0].geometry else {
+            panic!("expected a LineString");
+        };
+        assert_eq!(coordinates, &vec![(0.0, 5.0), (30.0, 5.0)]);
+        // Block content on layer 0 takes the dimension's layer, and the
+        // dimension's handle prefixes the child ids, as for an INSERT.
+        let properties = props(&extraction.features[0]);
+        assert_eq!(properties.get("layer"), Some(&JsonValue::from("DIMS")));
+        assert_eq!(properties.get("block_path"), Some(&JsonValue::from("*D0")));
+        assert!(string_id(&extraction.features[0]).contains('/'));
+    }
+
+    #[test]
+    fn dimension_block_insertion_point_shifts_the_picture() {
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "*D1",
+            Vector3::ZERO,
+            vec![EntityType::Line(Line::from_coords(
+                0.0, 0.0, 0.0, 10.0, 0.0, 0.0,
+            ))],
+        );
+        document
+            .add_entity(dimension_with_block("*D1", Vector3::new(4.0, 7.0, 0.0)))
+            .expect("add dimension");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+        let CadGeometry::Line(coordinates) = &extraction.features[0].geometry else {
+            panic!("expected a LineString");
+        };
+        assert_eq!(coordinates, &vec![(4.0, 7.0), (14.0, 7.0)]);
+    }
+
+    #[test]
+    fn dimension_without_its_block_is_skipped_not_guessed() {
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        document
+            .add_entity(dimension_with_block("*D9", Vector3::ZERO))
+            .expect("add dimension");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+        assert_eq!(extraction.dimension_blocks_expanded, 0);
+        assert!(extraction.features.is_empty());
+        let ((entity_type, reason), samples) = extraction
+            .skipped
+            .iter()
+            .next()
+            .expect("the dimension must be reported as skipped");
+        assert_eq!(entity_type, "DIMENSION_LINEAR");
+        assert!(reason.contains("*D9"), "reason: {reason}");
+        assert_eq!(samples.count, 1);
+        // The accounting still balances.
+        assert_eq!(
+            extraction.top_level_accounted,
+            extraction.model_space_entities
         );
     }
 
