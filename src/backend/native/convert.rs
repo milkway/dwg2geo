@@ -3042,6 +3042,12 @@ fn curve_fit_drawing_order(
     if fitted.is_empty() {
         return Ok(frame);
     }
+    // A reader that does preserve the polyline's owned-handle order hands
+    // the arc chain over already continuous; take it verbatim rather than
+    // re-deriving (and possibly rejecting) an order that is already right.
+    if curve_fit_list_order_is_continuous(vertices, closed) {
+        return Ok((0..vertices.len()).collect());
+    }
     if !closed && vertices[*frame.last().expect("length checked above")].bulge != 0.0 {
         return Err(
             "curve-fit polyline is inconsistent: its last frame vertex still starts a segment"
@@ -3114,6 +3120,41 @@ fn curve_fit_drawing_order(
         order.push(*frame.last().expect("length checked above"));
     }
     Ok(order)
+}
+
+/// Tangent residual under which the vertex list is taken to be in drawing
+/// order already: the biarc joints of a curve fit are continuous to
+/// round-off, so anything above this is a scrambled list, not noise.
+const CURVE_FIT_CONTINUOUS_RESIDUAL: f64 = 1e-6;
+
+/// Whether the vertex list is already the drawn arc chain: every interior
+/// joint tangent continuous, and (for an open polyline) no bulge on the last
+/// vertex, which starts no segment.
+fn curve_fit_list_order_is_continuous(
+    vertices: &[acadrust::entities::Vertex2D],
+    closed: bool,
+) -> bool {
+    if !closed && vertices.last().is_some_and(|vertex| vertex.bulge != 0.0) {
+        return false;
+    }
+    let count = vertices.len();
+    let position = |index: usize| {
+        (
+            vertices[index % count].location.x,
+            vertices[index % count].location.y,
+        )
+    };
+    let joints = if closed { count } else { count - 1 };
+    (1..joints).all(|joint| {
+        let previous = joint - 1;
+        biarc_tangent_residual(
+            position(previous),
+            vertices[previous % count].bulge,
+            position(joint),
+            vertices[joint % count].bulge,
+            position(joint + 1),
+        ) <= CURVE_FIT_CONTINUOUS_RESIDUAL
+    })
 }
 
 /// Position of `point` along the chord `start` -> `end`, as the fraction of
@@ -5058,6 +5099,42 @@ mod tests {
             // degrees, so four segments per arc): 16 segments, 17 points.
             assert_eq!(coordinates.len(), 17);
         }
+    }
+
+    #[test]
+    fn curve_fit_polyline_already_in_drawing_order_is_taken_verbatim() {
+        use acadrust::entities::{Polyline2D, PolylineFlags, Vertex2D, VertexFlags};
+        use acadrust::types::Vector3;
+
+        // A reader that keeps the polyline's owned-handle order hands over a
+        // continuous arc chain; it must be used as it stands.
+        let bulge = (std::f64::consts::PI / 16.0).tan();
+        let at = |degrees: f64, bulge: f64, fitted: bool| {
+            let radians: f64 = degrees.to_radians();
+            let mut vertex = Vertex2D::new(Vector3::new(
+                10.0 * radians.cos(),
+                10.0 * radians.sin(),
+                0.0,
+            ));
+            vertex.bulge = bulge;
+            if fitted {
+                vertex.flags = VertexFlags::from_bits(VertexFlags::EXTRA_VERTEX.bits());
+            }
+            vertex
+        };
+        let mut polyline = Polyline2D::new();
+        polyline.flags = PolylineFlags::from_bits(PolylineFlags::CURVE_FIT.bits());
+        polyline.vertices = vec![
+            at(0.0, bulge, false),
+            at(45.0, bulge, true),
+            at(90.0, bulge, false),
+            at(135.0, bulge, true),
+            at(180.0, 0.0, false),
+        ];
+
+        let order = super::curve_fit_drawing_order(&polyline.vertices, false)
+            .expect("a continuous list order must be accepted");
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
