@@ -714,6 +714,7 @@ pub fn convert(request: &ConvertRequest<'_>) -> Result<()> {
             features_written,
             approximated_features: extraction.approximated_features,
             inserts_expanded: extraction.inserts_expanded,
+            dimension_blocks_expanded: extraction.dimension_blocks_expanded,
             converted: extraction
                 .converted
                 .into_iter()
@@ -1262,6 +1263,8 @@ struct Extraction {
     feature_warnings: usize,
     approximated_features: usize,
     inserts_expanded: usize,
+    /// DIMENSION entities expanded into their dimension-block geometry.
+    dimension_blocks_expanded: usize,
     /// Top-level model-space entities dropped by --include/--exclude-layers.
     excluded_by_layer_filter: usize,
     /// Top-level model-space entities encountered.
@@ -1406,8 +1409,13 @@ fn process_entity(
             document, entity, insert, index, options, extraction, sink, placement, depth,
         );
     }
+    if let EntityType::Dimension(dimension) = entity {
+        return process_dimension(
+            document, entity, dimension, index, options, extraction, sink, placement, depth,
+        );
+    }
 
-    // Every non-INSERT entity reaches exactly one outcome below.
+    // Every other entity reaches exactly one outcome below.
     if placement.block_path.is_empty() {
         extraction.top_level_accounted += 1;
     }
@@ -1658,6 +1666,157 @@ fn process_insert(
     Ok(())
 }
 
+/// Expand a DIMENSION into the geometry of its dimension block.
+///
+/// DXF DIMENSION group 2 names "the block that contains the entities that
+/// make up the dimension picture" — extension lines, the dimension line,
+/// arrowheads, and the measurement text, all already evaluated by the
+/// producing application in the drawing's units and rotation. Group 12 is
+/// the block's insertion point in OCS (zero unless the dimension was cloned
+/// by BASELINE/CONTINUE), so the block is placed at that point with unit
+/// scale and no rotation, lifted through the extrusion normal. Re-deriving
+/// the picture from the definition points instead would mean reimplementing
+/// the whole dimension style (arrow size, text placement, DIMTAD, tolerance
+/// stacking) and inventing the parts the style does not pin down.
+///
+/// The block content stays attributed to the DIMENSION: its handle prefixes
+/// the child ids and layer-0 content inherits the dimension's layer, exactly
+/// as for an INSERT.
+#[allow(clippy::too_many_arguments)]
+fn process_dimension(
+    document: &CadDocument,
+    entity: &EntityType,
+    dimension: &acadrust::entities::Dimension,
+    index: usize,
+    options: &GeometryOptions,
+    extraction: &mut Extraction,
+    sink: &mut dyn FnMut(CadFeature) -> Result<()>,
+    placement: &Placement,
+    depth: usize,
+) -> Result<()> {
+    let id = feature_id(entity, index, placement);
+    let entity_type = entity.as_entity().entity_type().to_string();
+    if placement.block_path.is_empty() {
+        extraction.top_level_accounted += 1;
+    }
+
+    let base = dimension.base();
+    if !valid_normal(&base.normal) {
+        record_outcome(
+            &mut extraction.failed,
+            entity_type,
+            "zero or non-finite extrusion normal".to_string(),
+            &id,
+        );
+        return Ok(());
+    }
+    if !is_finite(&base.insertion_point) {
+        record_outcome(
+            &mut extraction.failed,
+            entity_type,
+            "non-finite coordinates".to_string(),
+            &id,
+        );
+        return Ok(());
+    }
+
+    let Some(record) = document.block_records.get(&base.block_name) else {
+        record_outcome(
+            &mut extraction.skipped,
+            entity_type,
+            format!(
+                "dimension block {:?} is not in the drawing; the dimension picture lives only there",
+                base.block_name
+            ),
+            &id,
+        );
+        return Ok(());
+    };
+    if placement
+        .block_path
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&base.block_name))
+    {
+        record_outcome(
+            &mut extraction.failed,
+            entity_type,
+            format!("recursive reference to block {:?}", base.block_name),
+            &id,
+        );
+        return Ok(());
+    }
+    if depth >= MAX_BLOCK_DEPTH {
+        record_outcome(
+            &mut extraction.failed,
+            entity_type,
+            format!("block nesting deeper than {MAX_BLOCK_DEPTH} levels"),
+            &id,
+        );
+        return Ok(());
+    }
+
+    let dimension_layer = effective_layer(&entity.common().layer, placement);
+    let dimension_color =
+        resolve_color(document, entity.common().color, &dimension_layer, placement);
+    let dimension_linetype = resolve_linetype(
+        document,
+        &entity.common().linetype,
+        &dimension_layer,
+        placement,
+    );
+    let dimension_lineweight = resolve_lineweight_mm(
+        document,
+        entity.common().line_weight,
+        &dimension_layer,
+        placement,
+    );
+
+    let ocs_to_wcs = Matrix3::arbitrary_axis(base.normal);
+    let block_matrix = Affine::from_translation(ocs_to_wcs.transform_point(base.insertion_point))
+        .compose(&Affine::from_linear(ocs_to_wcs.m))
+        .compose(&Affine::from_translation(record.base_point * -1.0));
+    let mut block_path = placement.block_path.clone();
+    block_path.push(base.block_name.clone());
+    let child_placement = Placement {
+        matrix: placement.matrix.compose(&block_matrix),
+        block_path,
+        id_prefix: format!("{id}/"),
+        inherited_layer: Some(dimension_layer),
+        inherited_color: dimension_color,
+        inherited_linetype: dimension_linetype,
+        inherited_lineweight: dimension_lineweight,
+        max_scale: placement.max_scale,
+    };
+
+    for (child_index, handle) in record.entity_handles.iter().enumerate() {
+        let Some(child) = document.get_entity(*handle) else {
+            record_outcome(
+                &mut extraction.failed,
+                "UNRESOLVED".to_string(),
+                "entity handle does not resolve to an entity".to_string(),
+                &format!("{}{}", child_placement.id_prefix, handle),
+            );
+            continue;
+        };
+        if matches!(child, EntityType::Block(_) | EntityType::BlockEnd(_)) {
+            continue;
+        }
+        process_entity(
+            document,
+            child,
+            child_index,
+            options,
+            extraction,
+            sink,
+            &child_placement,
+            depth + 1,
+        )?;
+    }
+
+    extraction.dimension_blocks_expanded += 1;
+    Ok(())
+}
+
 /// Point feature at the (transformed) insertion point carrying the block
 /// name and attribute values.
 #[allow(clippy::too_many_arguments)]
@@ -1787,6 +1946,27 @@ fn convert_entity(
         EntityType::Text(text) => convert_text(text, placement),
         EntityType::MText(mtext) => convert_mtext(mtext, placement),
         EntityType::Hatch(hatch) => convert_hatch(hatch, options, placement),
+        EntityType::PolyfaceMesh(mesh) => convert_polyface_mesh(mesh, placement),
+        EntityType::MLine(mline) => convert_mline(mline, placement),
+        EntityType::MultiLeader(multileader) => convert_multileader(multileader, placement),
+        EntityType::AttributeDefinition(attdef) => convert_attribute_definition(attdef, placement),
+        // Unbounded by definition: a RAY runs from its start point to
+        // infinity, an XLINE both ways (DXF RAY/XLINE groups 10 and 11 are a
+        // point and a direction, never an extent). Clipping them to the
+        // drawing extents would put an endpoint in the output that the
+        // drawing does not have.
+        EntityType::Ray(_) | EntityType::XLine(_) => EntityOutcome::Skipped(
+            "construction line has no finite extent; a RAY or XLINE is unbounded".to_string(),
+        ),
+        // ACIS entities carry their geometry as an encrypted SAT/SAB modeller
+        // stream, not as DXF geometry; there is nothing to read without an
+        // ACIS kernel.
+        EntityType::Solid3D(_)
+        | EntityType::Region(_)
+        | EntityType::Body(_)
+        | EntityType::Surface(_) => EntityOutcome::Skipped(
+            "ACIS modeller geometry (SAT/SAB stream) is not evaluated".to_string(),
+        ),
         _ => EntityOutcome::Skipped(
             "entity type is not converted by the native backend yet".to_string(),
         ),
@@ -1876,6 +2056,272 @@ fn convert_face3d(face: &acadrust::entities::Face3D, placement: &Placement) -> E
     EntityOutcome::Converted {
         geometry: CadGeometry::Polygon(vec![ring]),
         extra_properties: vec![("is_closed", JsonValue::from(true))],
+        warnings,
+    }
+}
+
+/// An MLINE draws one parallel line per element of its MLINESTYLE. DXF
+/// stores, per vertex (group 11, WCS) and per element, the miter direction
+/// (group 13) and the element parameters (group 41): "the distance along the
+/// miter vector from the vertex to the point where the element's line
+/// intersects it". The first parameter is that intersection, so element `e`
+/// passes through `position + miter * parameters[0]` at every vertex. The
+/// offsets are therefore read from the entity, not recomputed from the style
+/// scale and justification — the entity already has them mitred.
+///
+/// Later parameters describe where the element line is interrupted inside
+/// the segment (breaks and caps); they are not evaluated, and an MLINE that
+/// carries them says so in a warning rather than pretending the line is
+/// continuous without comment.
+fn convert_mline(mline: &acadrust::entities::MLine, placement: &Placement) -> EntityOutcome {
+    use acadrust::entities::MLineFlags;
+
+    if !valid_normal(&mline.normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
+    }
+    if mline.vertices.len() < 2 {
+        return EntityOutcome::Skipped("multiline has fewer than two vertices".to_string());
+    }
+    let element_count = mline
+        .vertices
+        .iter()
+        .map(|vertex| vertex.segments.len())
+        .min()
+        .unwrap_or(0);
+    if element_count == 0 {
+        return EntityOutcome::Skipped(
+            "multiline carries no element offsets; the style's elements are not in the drawing"
+                .to_string(),
+        );
+    }
+
+    let closed = mline.flags.contains(MLineFlags::CLOSED);
+    let mut max_abs_z: f64 = 0.0;
+    let mut breaks = false;
+    let mut lines: Vec<Vec<(f64, f64)>> = Vec::with_capacity(element_count);
+    for element in 0..element_count {
+        let mut line: Vec<(f64, f64)> = Vec::with_capacity(mline.vertices.len() + 1);
+        for vertex in &mline.vertices {
+            let segment = &vertex.segments[element];
+            let offset = match segment.parameters.first() {
+                Some(offset) => *offset,
+                None => 0.0,
+            };
+            breaks |= segment.parameters.len() > 2;
+            if !offset.is_finite() || !is_finite(&vertex.position) || !is_finite(&vertex.miter) {
+                return EntityOutcome::Failed("non-finite coordinates".to_string());
+            }
+            let point = vertex.position + vertex.miter * offset;
+            let Some(position) = project(placement, point, &mut max_abs_z) else {
+                return EntityOutcome::Failed("non-finite coordinates".to_string());
+            };
+            line.push(position);
+        }
+        if closed && line.first() != line.last() {
+            line.push(line[0]);
+        }
+        if count_distinct(&line) >= 2 {
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        return EntityOutcome::Skipped(
+            "multiline elements all collapse to a single XY point".to_string(),
+        );
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+    if breaks {
+        warnings.push(
+            "multiline element breaks and caps are not evaluated; the elements are drawn whole"
+                .to_string(),
+        );
+    }
+    let element_count = lines.len();
+    EntityOutcome::Converted {
+        geometry: CadGeometry::MultiLine(lines),
+        extra_properties: vec![
+            ("is_closed", JsonValue::from(closed)),
+            ("mline_style", JsonValue::from(mline.style_name.clone())),
+            ("mline_elements", JsonValue::from(element_count)),
+        ],
+        warnings,
+    }
+}
+
+/// A MULTILEADER draws one polyline per leader line, ending in the landing
+/// that carries the content. DXF keeps them in the annotation context: each
+/// leader root has a connection point (group 10 of the LEADER context) and a
+/// landing distance (group 40), and each of its leader lines a list of
+/// points (group 10 of the LEADER_LINE context) running from the arrowhead
+/// towards the root. The drawn leader is those points, then the connection
+/// point, then — when the dogleg is on — the landing segment of
+/// `landing_distance` along the root direction.
+///
+/// Only the leader geometry is converted. The content (MTEXT or a block) is
+/// laid out by the multileader style, which this converter does not
+/// evaluate; the text string travels as a property so nothing is lost
+/// silently.
+fn convert_multileader(
+    multileader: &acadrust::entities::MultiLeader,
+    placement: &Placement,
+) -> EntityOutcome {
+    let context = &multileader.context;
+    let mut max_abs_z: f64 = 0.0;
+    let mut lines: Vec<Vec<(f64, f64)>> = Vec::new();
+
+    for root in &context.leader_roots {
+        if !is_finite(&root.connection_point) || !is_finite(&root.direction) {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        }
+        let mut tail: Vec<Vector3> = vec![root.connection_point];
+        if multileader.enable_dogleg && root.landing_distance.is_finite() {
+            tail.push(root.connection_point + root.direction * root.landing_distance);
+        }
+
+        for leader_line in &root.lines {
+            let mut line: Vec<(f64, f64)> = Vec::with_capacity(leader_line.points.len() + 2);
+            for point in leader_line.points.iter().chain(tail.iter()) {
+                if !is_finite(point) {
+                    return EntityOutcome::Failed("non-finite coordinates".to_string());
+                }
+                let Some(position) = project(placement, *point, &mut max_abs_z) else {
+                    return EntityOutcome::Failed("non-finite coordinates".to_string());
+                };
+                line.push(position);
+            }
+            line.dedup();
+            if count_distinct(&line) >= 2 {
+                lines.push(line);
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        return EntityOutcome::Skipped(
+            "multileader has no leader line with two distinct XY points".to_string(),
+        );
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+    warnings.push(
+        "multileader converted from its leader lines only; the content block or text is not laid out"
+            .to_string(),
+    );
+
+    let mut extra_properties = vec![
+        ("is_closed", JsonValue::from(false)),
+        ("leader_lines", JsonValue::from(lines.len())),
+    ];
+    if context.has_text_contents && !context.text_string.is_empty() {
+        extra_properties.push((
+            "text",
+            JsonValue::from(strip_mtext_codes(&context.text_string)),
+        ));
+        extra_properties.push(("text_raw", JsonValue::from(context.text_string.clone())));
+    }
+
+    EntityOutcome::Converted {
+        geometry: CadGeometry::MultiLine(lines),
+        extra_properties,
+        warnings,
+    }
+}
+
+/// A POLYFACE mesh (POLYLINE with group 70 bit 64) is a vertex list plus
+/// face records that index it. Each face record (DXF VERTEX groups 71-74)
+/// names three or four vertices, 1-based; a zero index means the corner is
+/// unused (a triangle leaves group 74 at zero) and a negative index marks
+/// the edge into that corner as invisible, which changes nothing about the
+/// face outline. Every face becomes one polygon ring, so the mesh maps to a
+/// MultiPolygon, the same way a single 3DFACE maps to a Polygon: z is
+/// dropped and rings are wound counter-clockwise for RFC 7946.
+fn convert_polyface_mesh(
+    mesh: &acadrust::entities::PolyfaceMesh,
+    placement: &Placement,
+) -> EntityOutcome {
+    if mesh.faces.is_empty() {
+        return EntityOutcome::Skipped("polyface mesh has no face records".to_string());
+    }
+    if mesh
+        .vertices
+        .iter()
+        .any(|vertex| !is_finite(&vertex.location))
+    {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+
+    let mut max_abs_z: f64 = 0.0;
+    let mut polygons: Vec<Vec<Vec<(f64, f64)>>> = Vec::with_capacity(mesh.faces.len());
+    let mut degenerate = 0usize;
+    let mut out_of_range = 0usize;
+    for face in &mesh.faces {
+        let mut ring: Vec<(f64, f64)> = Vec::with_capacity(5);
+        let mut broken = false;
+        for index in [face.index1, face.index2, face.index3, face.index4] {
+            if index == 0 {
+                continue;
+            }
+            // Negative indices only hide the edge; the corner still counts.
+            let Some(vertex) = index
+                .unsigned_abs()
+                .checked_sub(1)
+                .and_then(|zero_based| mesh.vertices.get(zero_based as usize))
+            else {
+                broken = true;
+                break;
+            };
+            let Some(position) = project(placement, vertex.location, &mut max_abs_z) else {
+                return EntityOutcome::Failed("non-finite coordinates".to_string());
+            };
+            ring.push(position);
+        }
+        if broken {
+            out_of_range += 1;
+            continue;
+        }
+        ring.dedup();
+        if count_distinct(&ring) < 3 {
+            degenerate += 1;
+            continue;
+        }
+        if ring.first() != ring.last() {
+            ring.push(ring[0]);
+        }
+        if signed_area(&ring) < 0.0 {
+            ring.reverse();
+        }
+        polygons.push(vec![ring]);
+    }
+
+    if polygons.is_empty() {
+        return EntityOutcome::Skipped(format!(
+            "polyface mesh has no face with three distinct XY corners ({degenerate} degenerate, {out_of_range} out of range)"
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+    if degenerate > 0 {
+        warnings.push(format!(
+            "{degenerate} mesh faces collapsed to fewer than three distinct XY corners and were dropped"
+        ));
+    }
+    if out_of_range > 0 {
+        warnings.push(format!(
+            "{out_of_range} mesh faces reference vertices outside the vertex list and were dropped"
+        ));
+    }
+
+    let face_count = polygons.len();
+    EntityOutcome::Converted {
+        geometry: CadGeometry::MultiPolygon(polygons),
+        extra_properties: vec![
+            ("is_closed", JsonValue::from(true)),
+            ("face_count", JsonValue::from(face_count)),
+        ],
         warnings,
     }
 }
@@ -2471,9 +2917,9 @@ fn convert_polyline2d(
     use acadrust::entities::PolylineFlags;
 
     let flags = polyline.flags.bits();
-    if flags & (PolylineFlags::CURVE_FIT.bits() | PolylineFlags::SPLINE_FIT.bits()) != 0 {
+    if flags & PolylineFlags::SPLINE_FIT.bits() != 0 {
         return EntityOutcome::Skipped(
-            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+            "spline-fit polyline smoothing is not evaluated yet".to_string(),
         );
     }
 
@@ -2488,23 +2934,276 @@ fn convert_polyline2d(
             .map(|vertex| vertex.location.z)
             .unwrap_or(0.0)
     };
-    let vertices: Vec<OcsVertex> = polyline
-        .vertices
+
+    // A curve-fitted polyline carries its fitted arc vertices in the same
+    // VERTEX list as the frame vertices; the drawing order has to be
+    // recovered first (see [`curve_fit_drawing_order`]).
+    let curve_fit = flags & PolylineFlags::CURVE_FIT.bits() != 0;
+    let order = if curve_fit {
+        match curve_fit_drawing_order(&polyline.vertices, polyline.is_closed()) {
+            Ok(order) => order,
+            Err(reason) => return EntityOutcome::Skipped(reason),
+        }
+    } else {
+        (0..polyline.vertices.len()).collect()
+    };
+
+    let vertices: Vec<OcsVertex> = order
         .iter()
-        .map(|vertex| OcsVertex {
-            x: vertex.location.x,
-            y: vertex.location.y,
-            bulge: vertex.bulge,
+        .map(|&index| {
+            let vertex = &polyline.vertices[index];
+            OcsVertex {
+                x: vertex.location.x,
+                y: vertex.location.y,
+                bulge: vertex.bulge,
+            }
         })
         .collect();
-    finish_ocs_path(
+    let mut outcome = finish_ocs_path(
         &vertices,
         polyline.is_closed(),
         elevation,
         polyline.normal,
         options,
         placement,
-    )
+    );
+    if curve_fit
+        && let EntityOutcome::Converted {
+            extra_properties,
+            warnings,
+            ..
+        } = &mut outcome
+    {
+        let fitted = polyline
+            .vertices
+            .iter()
+            .filter(|vertex| is_curve_fit_vertex(vertex))
+            .count();
+        extra_properties.push(("curve_fit", JsonValue::Bool(true)));
+        warnings.push(format!(
+            "curve-fit polyline: {fitted} fitted vertices ordered by biarc tangent continuity"
+        ));
+    }
+    outcome
+}
+
+/// Largest tangent discontinuity, in radians, that a reconstructed biarc
+/// joint may show before the whole polyline is rejected.
+const CURVE_FIT_MAX_RESIDUAL: f64 = 1.0;
+/// A fitted vertex is only placed in a frame segment when its tangent
+/// residual there is at most this fraction of the residual in every other
+/// segment; otherwise the drawing order is ambiguous and nothing is emitted.
+const CURVE_FIT_AMBIGUITY_RATIO: f64 = 0.1;
+
+/// True for a vertex the curve fit added (DXF VERTEX group 70, bit 1,
+/// "extra vertex created by curve fitting"); false for a frame vertex.
+fn is_curve_fit_vertex(vertex: &acadrust::entities::Vertex2D) -> bool {
+    use acadrust::entities::VertexFlags;
+    vertex.flags.bits() & VertexFlags::EXTRA_VERTEX.bits() != 0
+}
+
+/// Drawing order of a curve-fitted 2D POLYLINE, as indices into `vertices`.
+///
+/// DXF (POLYLINE group 70 bit 2, "curve-fit vertices have been added")
+/// stores a fitted polyline as its frame vertices plus, for every frame
+/// segment the fit turned into arcs, extra vertices flagged with VERTEX
+/// group 70 bit 1; the drawn curve is the bulge-arc chain through all of
+/// them, and every joint is tangent continuous because the fit is a biarc
+/// per frame segment. The reader hands the vertices back grouped by kind
+/// rather than in drawing order (the frame keeps its relative order, the
+/// fitted vertices do not), so each fitted vertex is placed back into the
+/// frame segment whose biarc it completes, using that tangent continuity.
+///
+/// The result is only returned when the placement is unambiguous: every
+/// fitted vertex must fit one segment with a residual at most
+/// [`CURVE_FIT_AMBIGUITY_RATIO`] of its residual in every other segment and
+/// below [`CURVE_FIT_MAX_RESIDUAL`], must lie strictly between that
+/// segment's frame vertices, and an open polyline's last frame vertex must
+/// carry no bulge (it starts no segment). Anything else is an
+/// `Err(reason)` that the caller reports as a skip — a guessed order would
+/// produce a zig-zag through the right points, which is worse than nothing.
+fn curve_fit_drawing_order(
+    vertices: &[acadrust::entities::Vertex2D],
+    closed: bool,
+) -> Result<Vec<usize>, String> {
+    let frame: Vec<usize> = (0..vertices.len())
+        .filter(|&index| !is_curve_fit_vertex(&vertices[index]))
+        .collect();
+    let fitted: Vec<usize> = (0..vertices.len())
+        .filter(|&index| is_curve_fit_vertex(&vertices[index]))
+        .collect();
+
+    if frame.len() < 2 {
+        return Err(format!(
+            "curve-fit polyline has {} frame vertices; at least two are needed",
+            frame.len()
+        ));
+    }
+    if fitted.is_empty() {
+        return Ok(frame);
+    }
+    // A reader that does preserve the polyline's owned-handle order hands
+    // the arc chain over already continuous; take it verbatim rather than
+    // re-deriving (and possibly rejecting) an order that is already right.
+    if curve_fit_list_order_is_continuous(vertices, closed) {
+        return Ok((0..vertices.len()).collect());
+    }
+    if !closed && vertices[*frame.last().expect("length checked above")].bulge != 0.0 {
+        return Err(
+            "curve-fit polyline is inconsistent: its last frame vertex still starts a segment"
+                .to_string(),
+        );
+    }
+
+    let segment_count = if closed { frame.len() } else { frame.len() - 1 };
+    let position = |index: usize| (vertices[index].location.x, vertices[index].location.y);
+
+    // Fitted vertex -> (frame segment, position along that segment's chord).
+    let mut placed: Vec<Vec<(f64, usize)>> = vec![Vec::new(); segment_count];
+    for &index in &fitted {
+        let mut residual = f64::INFINITY;
+        let mut segment = 0usize;
+        let mut runner_up = f64::INFINITY;
+        for candidate in 0..segment_count {
+            let start = frame[candidate];
+            let end = frame[(candidate + 1) % frame.len()];
+            let candidate_residual = biarc_tangent_residual(
+                position(start),
+                vertices[start].bulge,
+                position(index),
+                vertices[index].bulge,
+                position(end),
+            );
+            // Strictly-less keeps the lowest segment index on ties, and a tie
+            // then leaves `runner_up == residual`, which the gate rejects.
+            if candidate_residual < residual {
+                runner_up = residual;
+                residual = candidate_residual;
+                segment = candidate;
+            } else if candidate_residual < runner_up {
+                runner_up = candidate_residual;
+            }
+        }
+        // NaN residuals must fail the gate, so both bounds are written as a
+        // pass condition and negated as a whole.
+        let placeable =
+            residual <= CURVE_FIT_MAX_RESIDUAL && residual <= CURVE_FIT_AMBIGUITY_RATIO * runner_up;
+        if !placeable {
+            return Err(
+                "curve-fit polyline: the fitted vertices do not map unambiguously onto the frame"
+                    .to_string(),
+            );
+        }
+        let along = chord_parameter(
+            position(frame[segment]),
+            position(frame[(segment + 1) % frame.len()]),
+            position(index),
+        );
+        let inside = along > 0.0 && along < 1.0;
+        if !inside {
+            return Err(
+                "curve-fit polyline: a fitted vertex falls outside its frame segment".to_string(),
+            );
+        }
+        placed[segment].push((along, index));
+    }
+
+    let mut order = Vec::with_capacity(vertices.len());
+    for segment in 0..segment_count {
+        order.push(frame[segment]);
+        // Deterministic: the chord parameters of distinct fitted vertices on
+        // one segment are distinct, and equal keys keep list order.
+        placed[segment].sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        order.extend(placed[segment].iter().map(|&(_, index)| index));
+    }
+    if !closed {
+        order.push(*frame.last().expect("length checked above"));
+    }
+    Ok(order)
+}
+
+/// Tangent residual under which the vertex list is taken to be in drawing
+/// order already: the biarc joints of a curve fit are continuous to
+/// round-off, so anything above this is a scrambled list, not noise.
+const CURVE_FIT_CONTINUOUS_RESIDUAL: f64 = 1e-6;
+
+/// Whether the vertex list is already the drawn arc chain: every interior
+/// joint tangent continuous, and (for an open polyline) no bulge on the last
+/// vertex, which starts no segment.
+fn curve_fit_list_order_is_continuous(
+    vertices: &[acadrust::entities::Vertex2D],
+    closed: bool,
+) -> bool {
+    if !closed && vertices.last().is_some_and(|vertex| vertex.bulge != 0.0) {
+        return false;
+    }
+    let count = vertices.len();
+    let position = |index: usize| {
+        (
+            vertices[index % count].location.x,
+            vertices[index % count].location.y,
+        )
+    };
+    let joints = if closed { count } else { count - 1 };
+    (1..joints).all(|joint| {
+        let previous = joint - 1;
+        biarc_tangent_residual(
+            position(previous),
+            vertices[previous % count].bulge,
+            position(joint),
+            vertices[joint % count].bulge,
+            position(joint + 1),
+        ) <= CURVE_FIT_CONTINUOUS_RESIDUAL
+    })
+}
+
+/// Position of `point` along the chord `start` -> `end`, as the fraction of
+/// the chord length its projection reaches. `f64::INFINITY` for a zero-length
+/// chord.
+fn chord_parameter(start: (f64, f64), end: (f64, f64), point: (f64, f64)) -> f64 {
+    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= 0.0 {
+        return f64::INFINITY;
+    }
+    ((point.0 - start.0) * dx + (point.1 - start.1) * dy) / length_squared
+}
+
+/// Tangent discontinuity, in radians, of the two-arc chain
+/// `start` -> `mid` -> `end` whose arcs carry `start_bulge` and `mid_bulge`.
+///
+/// A DXF bulge is tan(theta / 4) for the signed CCW included angle theta, so
+/// an arc's tangent leaves its start rotated -theta/2 from the chord and
+/// arrives at its end rotated +theta/2 from it. A curve fit produces a
+/// tangent-continuous chain, so the residual is (near) zero exactly for the
+/// pairing the fit produced. `PI` (the maximum) for degenerate chords.
+fn biarc_tangent_residual(
+    start: (f64, f64),
+    start_bulge: f64,
+    mid: (f64, f64),
+    mid_bulge: f64,
+    end: (f64, f64),
+) -> f64 {
+    let Some(incoming) = chord_direction(start, mid) else {
+        return std::f64::consts::PI;
+    };
+    let Some(outgoing) = chord_direction(mid, end) else {
+        return std::f64::consts::PI;
+    };
+    let arriving = incoming + 2.0 * start_bulge.atan();
+    let leaving = outgoing - 2.0 * mid_bulge.atan();
+    let difference = (arriving - leaving).rem_euclid(std::f64::consts::TAU);
+    difference.min(std::f64::consts::TAU - difference)
+}
+
+/// Direction of the chord `start` -> `end`, or `None` when the two points
+/// coincide.
+fn chord_direction(start: (f64, f64), end: (f64, f64)) -> Option<f64> {
+    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+    if dx == 0.0 && dy == 0.0 {
+        return None;
+    }
+    Some(dy.atan2(dx))
 }
 
 fn convert_polyline3d(
@@ -2514,7 +3213,7 @@ fn convert_polyline3d(
 ) -> EntityOutcome {
     if polyline.flags.spline_fit {
         return EntityOutcome::Skipped(
-            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+            "spline-fit polyline smoothing is not evaluated yet".to_string(),
         );
     }
     if polyline.flags.is_3d_mesh || polyline.flags.is_polyface_mesh {
@@ -2539,9 +3238,11 @@ fn convert_polyline_generic(
     use acadrust::entities::PolylineFlags;
 
     let flags = polyline.flags.bits();
+    // 3D polylines carry no bulges, so a fitted 3D polyline is drawn from its
+    // spline-fitted vertices alone; those are not evaluated yet.
     if flags & (PolylineFlags::CURVE_FIT.bits() | PolylineFlags::SPLINE_FIT.bits()) != 0 {
         return EntityOutcome::Skipped(
-            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+            "spline-fit polyline smoothing is not evaluated yet".to_string(),
         );
     }
     if flags & (PolylineFlags::POLYGON_MESH.bits() | PolylineFlags::POLYFACE_MESH.bits()) != 0 {
@@ -3281,6 +3982,136 @@ fn convert_text(text: &acadrust::entities::Text, placement: &Placement) -> Entit
         geometry: CadGeometry::Point(position),
         extra_properties,
         warnings,
+    }
+}
+
+/// An ATTDEF sitting directly in model space is a drawn entity, not a
+/// template: DXF ATTDEF carries the same anchor, height, rotation and
+/// alignment fields as TEXT, and the application draws the tag (group 2) at
+/// that anchor. Inside a block definition the same entity *is* a template
+/// and is reported as such by [`process_insert`], which never reaches here.
+///
+/// The anchor follows the TEXT rule (DXF TEXT groups 10 and 11): the
+/// insertion point for the default left/baseline alignment, the second
+/// alignment point otherwise.
+fn convert_attribute_definition(
+    attdef: &acadrust::entities::AttributeDefinition,
+    placement: &Placement,
+) -> EntityOutcome {
+    use acadrust::entities::{HorizontalAlignment, VerticalAlignment};
+
+    let default_alignment = matches!(attdef.horizontal_alignment, HorizontalAlignment::Left)
+        && matches!(attdef.vertical_alignment, VerticalAlignment::Baseline);
+    let (anchor, anchor_name) = if default_alignment {
+        (attdef.insertion_point, "insertion")
+    } else {
+        (attdef.alignment_point, "alignment")
+    };
+    if !is_finite(&anchor) {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    if !valid_normal(&attdef.normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
+    }
+    let ocs_to_wcs = Matrix3::arbitrary_axis(attdef.normal);
+    let mut max_abs_z: f64 = 0.0;
+    let Some(position) = project(
+        placement,
+        ocs_to_wcs.transform_point(anchor),
+        &mut max_abs_z,
+    ) else {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    };
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+
+    let mut extra_properties = vec![
+        ("text", JsonValue::from(attdef.tag.clone())),
+        ("attribute_tag", JsonValue::from(attdef.tag.clone())),
+        (
+            "attribute_default",
+            JsonValue::from(attdef.default_value.clone()),
+        ),
+        ("text_height", JsonValue::from(attdef.height)),
+        (
+            "text_rotation_deg",
+            JsonValue::from(effective_rotation_degrees(
+                attdef.rotation,
+                Some(&ocs_to_wcs),
+                placement,
+            )),
+        ),
+        ("text_style", JsonValue::from(attdef.text_style.clone())),
+    ];
+    if !attdef.prompt.is_empty() {
+        extra_properties.push(("attribute_prompt", JsonValue::from(attdef.prompt.clone())));
+    }
+    if !matches!(attdef.horizontal_alignment, HorizontalAlignment::Left) {
+        extra_properties.push((
+            "text_h_align",
+            JsonValue::from(attdef_horizontal_alignment_name(
+                attdef.horizontal_alignment,
+            )),
+        ));
+    }
+    if !matches!(attdef.vertical_alignment, VerticalAlignment::Baseline) {
+        extra_properties.push((
+            "text_v_align",
+            JsonValue::from(attdef_vertical_alignment_name(attdef.vertical_alignment)),
+        ));
+    }
+    if !default_alignment {
+        extra_properties.push(("text_anchor", JsonValue::from(anchor_name)));
+    }
+    if attdef.width_factor != 1.0 {
+        extra_properties.push(("text_width_factor", JsonValue::from(attdef.width_factor)));
+    }
+    if attdef.oblique_angle != 0.0 {
+        extra_properties.push((
+            "text_oblique_deg",
+            JsonValue::from(attdef.oblique_angle.to_degrees()),
+        ));
+    }
+    if attdef.flags.invisible {
+        extra_properties.push(("attribute_invisible", JsonValue::from(true)));
+    }
+    if attdef.flags.constant {
+        extra_properties.push(("attribute_constant", JsonValue::from(true)));
+    }
+
+    EntityOutcome::Converted {
+        geometry: CadGeometry::Point(position),
+        extra_properties,
+        warnings,
+    }
+}
+
+fn attdef_horizontal_alignment_name(
+    alignment: acadrust::entities::HorizontalAlignment,
+) -> &'static str {
+    use acadrust::entities::HorizontalAlignment;
+
+    match alignment {
+        HorizontalAlignment::Left => "left",
+        HorizontalAlignment::Center => "center",
+        HorizontalAlignment::Right => "right",
+        HorizontalAlignment::Aligned => "aligned",
+        HorizontalAlignment::Middle => "middle",
+        HorizontalAlignment::Fit => "fit",
+    }
+}
+
+fn attdef_vertical_alignment_name(
+    alignment: acadrust::entities::VerticalAlignment,
+) -> &'static str {
+    use acadrust::entities::VerticalAlignment;
+
+    match alignment {
+        VerticalAlignment::Baseline => "baseline",
+        VerticalAlignment::Bottom => "bottom",
+        VerticalAlignment::Middle => "middle",
+        VerticalAlignment::Top => "top",
     }
 }
 
@@ -4177,6 +5008,192 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("capped")));
     }
 
+    /// A curve-fit POLYLINE laid out the way the reader hands it back: the
+    /// frame vertices in drawing order, then the fitted vertices in an
+    /// unrelated order. Here the whole curve is a half circle of radius 10
+    /// centred on the origin, cut into four 45-degree arcs, so every bulge is
+    /// tan(45/4 degrees) and every point of the tessellation must land on
+    /// that circle with a monotone angle.
+    fn half_circle_curve_fit(scrambled_fitted: bool) -> acadrust::entities::Polyline2D {
+        use acadrust::entities::{Polyline2D, PolylineFlags, Vertex2D, VertexFlags};
+        use acadrust::types::Vector3;
+
+        let radius = 10.0_f64;
+        let bulge = (std::f64::consts::PI / 16.0).tan();
+        let at = |degrees: f64, bulge: f64, fitted: bool| {
+            let radians = degrees.to_radians();
+            let mut vertex = Vertex2D::new(Vector3::new(
+                radius * radians.cos(),
+                radius * radians.sin(),
+                0.0,
+            ));
+            vertex.bulge = bulge;
+            if fitted {
+                vertex.flags = VertexFlags::from_bits(VertexFlags::EXTRA_VERTEX.bits());
+            }
+            vertex
+        };
+
+        let frame = [
+            at(0.0, bulge, false),
+            at(90.0, bulge, false),
+            at(180.0, 0.0, false),
+        ];
+        let fitted = [at(45.0, bulge, true), at(135.0, bulge, true)];
+        let mut polyline = Polyline2D::new();
+        polyline.flags = PolylineFlags::from_bits(PolylineFlags::CURVE_FIT.bits());
+        polyline.vertices.extend(frame);
+        if scrambled_fitted {
+            polyline.vertices.extend(fitted.iter().rev().cloned());
+        } else {
+            polyline.vertices.extend(fitted);
+        }
+        polyline
+    }
+
+    #[test]
+    fn curve_fit_polyline_recovers_the_interleaved_drawing_order() {
+        // DXF POLYLINE group 70 bit 2 with VERTEX group 70 bit 1: the drawn
+        // curve threads the fitted vertices between the frame vertices, so
+        // the arcs stay on the circle and the polar angle only grows.
+        for scrambled in [false, true] {
+            let polyline = half_circle_curve_fit(scrambled);
+            let EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                warnings,
+            } = convert_entity(&EntityType::Polyline2D(polyline), &opts(false))
+            else {
+                panic!("a curve-fit polyline with unambiguous fitted vertices must convert");
+            };
+            let CadGeometry::Line(coordinates) = geometry else {
+                panic!("expected a LineString");
+            };
+
+            assert!(
+                extra_properties
+                    .iter()
+                    .any(|(key, value)| *key == "curve_fit"
+                        && *value == super::JsonValue::Bool(true))
+            );
+            assert!(warnings.iter().any(|w| w.contains("2 fitted vertices")));
+
+            let mut previous = -1.0_f64;
+            for (x, y) in &coordinates {
+                assert!(
+                    (x.hypot(*y) - 10.0).abs() < 1e-9,
+                    "({x}, {y}) is off the fitted circle"
+                );
+                let angle = y.atan2(*x).to_degrees();
+                assert!(
+                    angle > previous,
+                    "angles must increase: {angle} after {previous}"
+                );
+                previous = angle;
+            }
+            assert!((coordinates[0].0 - 10.0).abs() < 1e-9 && coordinates[0].1.abs() < 1e-9);
+            let last = coordinates.last().expect("non-empty");
+            assert!((last.0 + 10.0).abs() < 1e-9 && last.1.abs() < 1e-9);
+            // Four 45-degree arcs, each tessellated to meet the 0.05 chord
+            // tolerance on radius 10 (step 2*acos(1 - 0.005) ~= 11.46
+            // degrees, so four segments per arc): 16 segments, 17 points.
+            assert_eq!(coordinates.len(), 17);
+        }
+    }
+
+    #[test]
+    fn curve_fit_polyline_already_in_drawing_order_is_taken_verbatim() {
+        use acadrust::entities::{Polyline2D, PolylineFlags, Vertex2D, VertexFlags};
+        use acadrust::types::Vector3;
+
+        // A reader that keeps the polyline's owned-handle order hands over a
+        // continuous arc chain; it must be used as it stands.
+        let bulge = (std::f64::consts::PI / 16.0).tan();
+        let at = |degrees: f64, bulge: f64, fitted: bool| {
+            let radians: f64 = degrees.to_radians();
+            let mut vertex = Vertex2D::new(Vector3::new(
+                10.0 * radians.cos(),
+                10.0 * radians.sin(),
+                0.0,
+            ));
+            vertex.bulge = bulge;
+            if fitted {
+                vertex.flags = VertexFlags::from_bits(VertexFlags::EXTRA_VERTEX.bits());
+            }
+            vertex
+        };
+        let mut polyline = Polyline2D::new();
+        polyline.flags = PolylineFlags::from_bits(PolylineFlags::CURVE_FIT.bits());
+        polyline.vertices = vec![
+            at(0.0, bulge, false),
+            at(45.0, bulge, true),
+            at(90.0, bulge, false),
+            at(135.0, bulge, true),
+            at(180.0, 0.0, false),
+        ];
+
+        let order = super::curve_fit_drawing_order(&polyline.vertices, false)
+            .expect("a continuous list order must be accepted");
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn curve_fit_polyline_with_an_unplaceable_fitted_vertex_is_skipped() {
+        use acadrust::entities::{Vertex2D, VertexFlags};
+        use acadrust::types::Vector3;
+
+        // Move one fitted vertex off the curve: it no longer completes any
+        // frame segment's biarc, so the order cannot be recovered and the
+        // polyline must stay skipped rather than zig-zag through the points.
+        let mut polyline = half_circle_curve_fit(false);
+        let mut stray = Vertex2D::new(Vector3::new(3.0, -40.0, 0.0));
+        stray.flags = VertexFlags::from_bits(VertexFlags::EXTRA_VERTEX.bits());
+        stray.bulge = 0.4;
+        polyline.vertices.push(stray);
+        match convert_entity(&EntityType::Polyline2D(polyline), &opts(false)) {
+            EntityOutcome::Skipped(reason) => assert!(
+                reason.contains("unambiguously") || reason.contains("outside its frame segment"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn curve_fit_polyline_missing_a_frame_vertex_is_skipped() {
+        // An open polyline's last frame vertex starts no segment, so a
+        // non-zero bulge there means the vertex set is incomplete.
+        let mut polyline = half_circle_curve_fit(false);
+        polyline.vertices[2].bulge = 0.25;
+        match convert_entity(&EntityType::Polyline2D(polyline), &opts(false)) {
+            EntityOutcome::Skipped(reason) => {
+                assert!(reason.contains("last frame vertex"), "reason: {reason}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn biarc_tangent_residual_is_zero_along_a_circle_and_grows_with_a_kink() {
+        // Two 45-degree arcs of the same circle: tangent continuous, so the
+        // residual is zero. Flipping the second bulge's sign reverses that
+        // arc's turn, so the tangent at the joint jumps by twice the arc's
+        // half-angle, 45 degrees.
+        let bulge = (std::f64::consts::PI / 16.0).tan();
+        let at = |degrees: f64| {
+            let radians: f64 = degrees.to_radians();
+            (10.0 * radians.cos(), 10.0 * radians.sin())
+        };
+        let smooth = super::biarc_tangent_residual(at(0.0), bulge, at(45.0), bulge, at(90.0));
+        assert!(smooth < 1e-12, "residual on a circle must vanish: {smooth}");
+
+        let cusp = super::biarc_tangent_residual(at(0.0), bulge, at(45.0), -bulge, at(90.0));
+        assert!(
+            (cusp - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
+            "expected a 45-degree tangent jump, got {cusp}"
+        );
+    }
+
     #[test]
     fn classic_2d_polyline_converts_and_smoothing_is_skipped() {
         use acadrust::entities::{Polyline2D, PolylineFlags, Vertex2D};
@@ -4210,6 +5227,244 @@ mod tests {
             EntityOutcome::Skipped(reason) => assert!(reason.contains("smoothing")),
             _ => panic!("spline-fit polyline must be skipped"),
         }
+    }
+
+    #[test]
+    fn polyface_mesh_becomes_one_ring_per_face() {
+        use acadrust::entities::{PolyfaceFace, PolyfaceMesh, PolyfaceVertex};
+        use acadrust::types::Vector3;
+
+        // DXF polyface face records index the vertex list 1-based; a zero
+        // fourth index means a triangle and a negative index only hides that
+        // edge, so the face outline is unchanged.
+        let mut mesh = PolyfaceMesh::new();
+        for (x, y) in [(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0)] {
+            mesh.vertices
+                .push(PolyfaceVertex::new(Vector3::new(x, y, 1.0)));
+        }
+        // The quad is clockwise in XY, so the ring has to come back
+        // counter-clockwise; the triangle hides one edge with a negative
+        // index, which must not change its outline.
+        mesh.faces = vec![
+            PolyfaceFace::quad(1, 4, 3, 2),
+            PolyfaceFace::triangle(1, 2, -3),
+        ];
+
+        let EntityOutcome::Converted {
+            geometry,
+            extra_properties,
+            warnings,
+        } = convert_entity(&EntityType::PolyfaceMesh(mesh), &opts(false))
+        else {
+            panic!("a polyface mesh with usable faces must convert");
+        };
+        let CadGeometry::MultiPolygon(polygons) = geometry else {
+            panic!("expected a MultiPolygon");
+        };
+        assert_eq!(polygons.len(), 2);
+        assert_eq!(
+            polygons[0][0],
+            vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0), (0.0, 0.0)]
+        );
+        assert_eq!(
+            polygons[1][0],
+            vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 0.0)]
+        );
+        assert!(super::signed_area(&polygons[0][0]) > 0.0);
+        assert!(super::signed_area(&polygons[1][0]) > 0.0);
+        assert!(extra_properties.iter().any(|(key, _)| *key == "face_count"));
+        assert!(warnings.iter().any(|w| w.contains("z coordinates")));
+    }
+
+    #[test]
+    fn polyface_faces_that_collapse_in_xy_are_dropped_with_a_warning() {
+        use acadrust::entities::{PolyfaceFace, PolyfaceMesh, PolyfaceVertex};
+        use acadrust::types::Vector3;
+
+        // A vertical face projects to a line in XY; it cannot be a ring.
+        let mut mesh = PolyfaceMesh::new();
+        for (x, y, z) in [(0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (4.0, 0.0, 2.0)] {
+            mesh.vertices
+                .push(PolyfaceVertex::new(Vector3::new(x, y, z)));
+        }
+        mesh.faces = vec![PolyfaceFace::triangle(1, 2, 3)];
+
+        match convert_entity(&EntityType::PolyfaceMesh(mesh), &opts(false)) {
+            EntityOutcome::Skipped(reason) => {
+                assert!(reason.contains("three distinct XY corners"), "{reason}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mline_draws_one_line_per_element_at_the_stored_miter_offsets() {
+        use acadrust::entities::{MLine, MLineSegment, MLineVertex};
+        use acadrust::types::Vector3;
+
+        // Straight run along +x: the miter is the perpendicular, so DXF
+        // group 41 offsets of +1 and -1 put the two elements two units
+        // apart, exactly as the style says without recomputing it.
+        let mut mline = MLine::new();
+        mline.style_name = "STANDARD".to_string();
+        for x in [0.0, 10.0] {
+            let mut vertex = MLineVertex::new(Vector3::new(x, 0.0, 0.0));
+            vertex.direction = Vector3::new(1.0, 0.0, 0.0);
+            vertex.miter = Vector3::new(0.0, 1.0, 0.0);
+            for offset in [1.0, -1.0] {
+                let mut segment = MLineSegment::new();
+                segment.parameters = vec![offset, 0.0];
+                vertex.segments.push(segment);
+            }
+            mline.vertices.push(vertex);
+        }
+
+        let EntityOutcome::Converted {
+            geometry,
+            extra_properties,
+            ..
+        } = convert_entity(&EntityType::MLine(mline), &opts(false))
+        else {
+            panic!("a multiline with element offsets must convert");
+        };
+        let CadGeometry::MultiLine(lines) = geometry else {
+            panic!("expected a MultiLineString");
+        };
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], vec![(0.0, 1.0), (10.0, 1.0)]);
+        assert_eq!(lines[1], vec![(0.0, -1.0), (10.0, -1.0)]);
+        assert!(
+            extra_properties
+                .iter()
+                .any(|(key, value)| *key == "mline_elements" && value.as_u64() == Some(2))
+        );
+    }
+
+    #[test]
+    fn mline_without_element_offsets_is_skipped() {
+        use acadrust::entities::{MLine, MLineVertex};
+        use acadrust::types::Vector3;
+
+        let mut mline = MLine::new();
+        mline.vertices = vec![
+            MLineVertex::new(Vector3::new(0.0, 0.0, 0.0)),
+            MLineVertex::new(Vector3::new(10.0, 0.0, 0.0)),
+        ];
+        match convert_entity(&EntityType::MLine(mline), &opts(false)) {
+            EntityOutcome::Skipped(reason) => {
+                assert!(reason.contains("element offsets"), "{reason}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multileader_draws_the_leader_line_through_its_landing() {
+        use acadrust::entities::{LeaderLine, LeaderRoot, MultiLeader};
+        use acadrust::types::Vector3;
+
+        let mut multileader = MultiLeader::new();
+        multileader.enable_dogleg = true;
+        let mut root = LeaderRoot::new(0);
+        root.connection_point = Vector3::new(10.0, 10.0, 0.0);
+        root.direction = Vector3::new(1.0, 0.0, 0.0);
+        root.landing_distance = 2.0;
+        root.lines = vec![LeaderLine::from_points(
+            0,
+            vec![Vector3::new(0.0, 0.0, 0.0), Vector3::new(4.0, 6.0, 0.0)],
+        )];
+        multileader.context.leader_roots = vec![root];
+        multileader.context.has_text_contents = true;
+        multileader.context.text_string = "NOTE\\Pline".to_string();
+
+        let EntityOutcome::Converted {
+            geometry,
+            extra_properties,
+            ..
+        } = convert_entity(&EntityType::MultiLeader(multileader), &opts(false))
+        else {
+            panic!("a multileader with a leader line must convert");
+        };
+        let CadGeometry::MultiLine(lines) = geometry else {
+            panic!("expected a MultiLineString");
+        };
+        // Arrowhead points, then the connection point, then the landing.
+        assert_eq!(
+            lines,
+            vec![vec![(0.0, 0.0), (4.0, 6.0), (10.0, 10.0), (12.0, 10.0),]]
+        );
+        assert!(
+            extra_properties
+                .iter()
+                .any(|(key, value)| *key == "text" && value.as_str() == Some("NOTE\nline"))
+        );
+    }
+
+    #[test]
+    fn multileader_without_a_dogleg_stops_at_the_connection_point() {
+        use acadrust::entities::{LeaderLine, LeaderRoot, MultiLeader};
+        use acadrust::types::Vector3;
+
+        let mut multileader = MultiLeader::new();
+        multileader.enable_dogleg = false;
+        let mut root = LeaderRoot::new(0);
+        root.connection_point = Vector3::new(10.0, 10.0, 0.0);
+        root.direction = Vector3::new(1.0, 0.0, 0.0);
+        root.landing_distance = 2.0;
+        root.lines = vec![LeaderLine::from_points(0, vec![Vector3::ZERO])];
+        multileader.context.leader_roots = vec![root];
+
+        let EntityOutcome::Converted { geometry, .. } =
+            convert_entity(&EntityType::MultiLeader(multileader), &opts(false))
+        else {
+            panic!("a multileader with a leader line must convert");
+        };
+        let CadGeometry::MultiLine(lines) = geometry else {
+            panic!("expected a MultiLineString");
+        };
+        assert_eq!(lines, vec![vec![(0.0, 0.0), (10.0, 10.0)]]);
+    }
+
+    #[test]
+    fn model_space_attdef_becomes_its_tag_at_the_text_anchor() {
+        use acadrust::entities::AttributeDefinition;
+        use acadrust::types::Vector3;
+
+        // An ATTDEF outside a block definition is drawn; the one inside is a
+        // template and is reported by the INSERT path instead.
+        let mut attdef = AttributeDefinition::new(
+            "TAG".to_string(),
+            "prompt".to_string(),
+            "default".to_string(),
+        );
+        attdef.insertion_point = Vector3::new(3.0, 4.0, 0.0);
+        attdef.height = 2.5;
+
+        let EntityOutcome::Converted {
+            geometry,
+            extra_properties,
+            ..
+        } = convert_entity(&EntityType::AttributeDefinition(attdef), &opts(false))
+        else {
+            panic!("a model-space ATTDEF must convert");
+        };
+        assert_eq!(geometry, CadGeometry::Point((3.0, 4.0)));
+        let value = |key: &str| {
+            extra_properties
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(value("text"), Some(super::JsonValue::from("TAG")));
+        assert_eq!(value("attribute_tag"), Some(super::JsonValue::from("TAG")));
+        assert_eq!(
+            value("attribute_default"),
+            Some(super::JsonValue::from("default"))
+        );
+        assert_eq!(
+            value("attribute_prompt"),
+            Some(super::JsonValue::from("prompt"))
+        );
     }
 
     #[test]
@@ -4368,6 +5623,13 @@ mod tests {
         let skipped: Vec<_> = extraction.skipped.keys().collect();
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].0, "RAY");
+        // The reason has to say the type is unbounded, not that support is
+        // pending: a RAY is never going to become a finite line string.
+        assert!(
+            skipped[0].1.contains("unbounded"),
+            "reason: {}",
+            skipped[0].1
+        );
         let samples = extraction.skipped.values().next().expect("skip entry");
         assert_eq!(samples.count, 1);
         assert_eq!(samples.samples.len(), 1);
@@ -4532,6 +5794,116 @@ mod tests {
         assert!(
             id.contains('/'),
             "id must be prefixed by the insert chain: {id}"
+        );
+    }
+
+    /// Linear DIMENSION whose picture lives in block `*D0`, the way DXF
+    /// group 2 defines it.
+    fn dimension_with_block(
+        block_name: &str,
+        insertion_point: acadrust::types::Vector3,
+    ) -> EntityType {
+        use acadrust::entities::{Dimension, DimensionLinear};
+        use acadrust::types::Vector3;
+
+        let mut linear =
+            DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(30.0, 0.0, 0.0));
+        linear.base.block_name = block_name.to_string();
+        linear.base.insertion_point = insertion_point;
+        linear.base.common.layer = "DIMS".to_string();
+        EntityType::Dimension(Dimension::Linear(linear))
+    }
+
+    #[test]
+    fn dimension_expands_the_block_that_holds_its_picture() {
+        use acadrust::types::Vector3;
+        use geojson::JsonValue;
+
+        // DXF DIMENSION group 2 names the block with the dimension picture;
+        // group 12 is its insertion point, zero for a dimension that was not
+        // cloned by BASELINE/CONTINUE.
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "*D0",
+            Vector3::ZERO,
+            vec![
+                EntityType::Line(Line::from_coords(0.0, 5.0, 0.0, 30.0, 5.0, 0.0)),
+                EntityType::Line(Line::from_coords(0.0, 0.0, 0.0, 0.0, 6.0, 0.0)),
+            ],
+        );
+        document
+            .add_entity(dimension_with_block("*D0", Vector3::ZERO))
+            .expect("add dimension");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+
+        assert_eq!(extraction.dimension_blocks_expanded, 1);
+        assert_eq!(extraction.inserts_expanded, 0);
+        assert_eq!(extraction.features.len(), 2);
+        assert_eq!(extraction.converted.get("LINE"), Some(&2));
+        assert!(extraction.skipped.is_empty());
+        // The picture is stored evaluated, so the identity placement keeps it.
+        let CadGeometry::Line(coordinates) = &extraction.features[0].geometry else {
+            panic!("expected a LineString");
+        };
+        assert_eq!(coordinates, &vec![(0.0, 5.0), (30.0, 5.0)]);
+        // Block content on layer 0 takes the dimension's layer, and the
+        // dimension's handle prefixes the child ids, as for an INSERT.
+        let properties = props(&extraction.features[0]);
+        assert_eq!(properties.get("layer"), Some(&JsonValue::from("DIMS")));
+        assert_eq!(properties.get("block_path"), Some(&JsonValue::from("*D0")));
+        assert!(string_id(&extraction.features[0]).contains('/'));
+    }
+
+    #[test]
+    fn dimension_block_insertion_point_shifts_the_picture() {
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        add_block(
+            &mut document,
+            "*D1",
+            Vector3::ZERO,
+            vec![EntityType::Line(Line::from_coords(
+                0.0, 0.0, 0.0, 10.0, 0.0, 0.0,
+            ))],
+        );
+        document
+            .add_entity(dimension_with_block("*D1", Vector3::new(4.0, 7.0, 0.0)))
+            .expect("add dimension");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+        let CadGeometry::Line(coordinates) = &extraction.features[0].geometry else {
+            panic!("expected a LineString");
+        };
+        assert_eq!(coordinates, &vec![(4.0, 7.0), (14.0, 7.0)]);
+    }
+
+    #[test]
+    fn dimension_without_its_block_is_skipped_not_guessed() {
+        use acadrust::types::Vector3;
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        document
+            .add_entity(dimension_with_block("*D9", Vector3::ZERO))
+            .expect("add dimension");
+
+        let extraction = extract(&document, &opts(false)).expect("extract");
+        assert_eq!(extraction.dimension_blocks_expanded, 0);
+        assert!(extraction.features.is_empty());
+        let ((entity_type, reason), samples) = extraction
+            .skipped
+            .iter()
+            .next()
+            .expect("the dimension must be reported as skipped");
+        assert_eq!(entity_type, "DIMENSION_LINEAR");
+        assert!(reason.contains("*D9"), "reason: {reason}");
+        assert_eq!(samples.count, 1);
+        // The accounting still balances.
+        assert_eq!(
+            extraction.top_level_accounted,
+            extraction.model_space_entities
         );
     }
 

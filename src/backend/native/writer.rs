@@ -54,6 +54,7 @@ fn geometry_to_geojson(geometry: &CadGeometry) -> GeometryValue {
     match geometry {
         CadGeometry::Point(position) => GeometryValue::new_point(*position),
         CadGeometry::Line(line) => GeometryValue::new_line_string(line.clone()),
+        CadGeometry::MultiLine(lines) => GeometryValue::new_multi_line_string(lines.clone()),
         CadGeometry::Polygon(rings) => GeometryValue::new_polygon(rings.clone()),
         CadGeometry::MultiPolygon(polygons) => GeometryValue::new_multi_polygon(polygons.clone()),
     }

@@ -23,7 +23,7 @@ enum Policy {
 /// Every acadrust 0.4.1 `EntityType` variant and its disposition. acadrust has
 /// no enum iterator, so this list must be updated when the dependency changes.
 const POLICY: [(&str, Policy); 44] = [
-    // Converted (16)
+    // Converted (21)
     ("Point", Policy::Converted),
     ("Line", Policy::Converted),
     ("LwPolyline", Policy::Converted),
@@ -40,7 +40,20 @@ const POLICY: [(&str, Policy); 44] = [
     ("MText", Policy::Converted),
     ("Insert", Policy::Converted),
     ("Solid", Policy::Converted),
-    // Deliberately unsupported with policy (11)
+    // A DIMENSION is converted through the block that holds its picture
+    // (DXF DIMENSION group 2), not by re-deriving the picture from the
+    // definition points and the dimension style.
+    ("Dimension", Policy::Converted),
+    // An MLINE's parallel elements come from the offsets the entity stores
+    // per vertex (DXF group 41), and a MULTILEADER's leader lines from its
+    // annotation context; both are geometry the drawing already evaluated.
+    ("MLine", Policy::Converted),
+    ("MultiLeader", Policy::Converted),
+    ("PolyfaceMesh", Policy::Converted),
+    // Only inside a block definition is an ATTDEF a template; one sitting in
+    // model space is drawn, and is converted like the TEXT it mirrors.
+    ("AttributeDefinition", Policy::Converted),
+    // Deliberately unsupported with policy (10)
     ("Ray", Policy::DeliberatelyUnsupported),
     ("XLine", Policy::DeliberatelyUnsupported),
     ("Solid3D", Policy::DeliberatelyUnsupported),
@@ -50,21 +63,16 @@ const POLICY: [(&str, Policy); 44] = [
     ("Block", Policy::DeliberatelyUnsupported),
     ("BlockEnd", Policy::DeliberatelyUnsupported),
     ("Seqend", Policy::DeliberatelyUnsupported),
-    ("AttributeDefinition", Policy::DeliberatelyUnsupported),
     ("Unknown", Policy::DeliberatelyUnsupported),
-    // Not yet converted (17)
+    // Not yet converted (13)
     ("Helix", Policy::NotYetConverted),
-    ("Dimension", Policy::NotYetConverted),
     ("Viewport", Policy::NotYetConverted),
     ("AttributeEntity", Policy::NotYetConverted),
     ("Leader", Policy::NotYetConverted),
-    ("MultiLeader", Policy::NotYetConverted),
-    ("MLine", Policy::NotYetConverted),
     ("Mesh", Policy::NotYetConverted),
     ("RasterImage", Policy::NotYetConverted),
     ("Table", Policy::NotYetConverted),
     ("Tolerance", Policy::NotYetConverted),
-    ("PolyfaceMesh", Policy::NotYetConverted),
     ("Wipeout", Policy::NotYetConverted),
     ("Shape", Policy::NotYetConverted),
     ("Underlay", Policy::NotYetConverted),
@@ -96,12 +104,12 @@ fn every_acadrust_entity_type_has_exactly_one_documented_policy() {
         .filter(|(_, p)| *p == Policy::NotYetConverted)
         .count();
 
-    assert_eq!(converted, 16, "converted variant count changed");
+    assert_eq!(converted, 21, "converted variant count changed");
     assert_eq!(
-        unsupported, 11,
+        unsupported, 10,
         "deliberately-unsupported variant count changed"
     );
-    assert_eq!(not_yet, 17, "not-yet-converted variant count changed");
+    assert_eq!(not_yet, 13, "not-yet-converted variant count changed");
     assert_eq!(
         converted + unsupported + not_yet,
         44,

@@ -13,6 +13,9 @@ pub enum CadGeometry {
     Point((f64, f64)),
     /// An open or closed polyline path (closure is a property, not a type).
     Line(Vec<(f64, f64)>),
+    /// Several disjoint paths belonging to one entity, e.g. the parallel
+    /// elements of an MLINE or the leader lines of a MULTILEADER.
+    MultiLine(Vec<Vec<(f64, f64)>>),
     /// One shell ring followed by hole rings, shells CCW and holes CW.
     Polygon(Vec<Vec<(f64, f64)>>),
     MultiPolygon(Vec<Vec<Vec<(f64, f64)>>>),
@@ -26,6 +29,13 @@ impl CadGeometry {
             CadGeometry::Line(line) => {
                 for (x, y) in line {
                     visit(*x, *y);
+                }
+            }
+            CadGeometry::MultiLine(lines) => {
+                for line in lines {
+                    for (x, y) in line {
+                        visit(*x, *y);
+                    }
                 }
             }
             CadGeometry::Polygon(rings) => {
@@ -57,6 +67,11 @@ impl CadGeometry {
         match self {
             CadGeometry::Point(_) => {}
             CadGeometry::Line(line) => walk(line),
+            CadGeometry::MultiLine(lines) => {
+                for line in lines {
+                    walk(line);
+                }
+            }
             CadGeometry::Polygon(rings) => {
                 for ring in rings {
                     walk(ring);
@@ -88,6 +103,11 @@ impl CadGeometry {
                 *point = transform(point.0, point.1)?;
             }
             CadGeometry::Line(line) => apply_line(line)?,
+            CadGeometry::MultiLine(lines) => {
+                for line in lines {
+                    apply_line(line)?;
+                }
+            }
             CadGeometry::Polygon(rings) => {
                 for ring in rings {
                     apply_line(ring)?;
