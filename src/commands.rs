@@ -57,6 +57,26 @@ pub fn execute(command: Command) -> Result<()> {
                         for line in native.human_lines() {
                             println!("{line}");
                         }
+                        if let Some(geodata) = &native.geodata {
+                            println!(
+                                "GeoData: {} (code {}), definition format {}",
+                                geodata.coordinate_type_name,
+                                geodata.coordinate_type,
+                                geodata.definition_format
+                            );
+                            println!(
+                                "Declared CRS summary: {}",
+                                if geodata.definition_summary.is_empty() {
+                                    "(empty)"
+                                } else {
+                                    &geodata.definition_summary
+                                }
+                            );
+                        } else if native.map3d_metadata_detected {
+                            println!(
+                                "Map 3D georeferencing metadata detected; its CRS is stored in proxy objects that this reader does not decode."
+                            );
+                        }
                     }
                     if let Some(error) = &output.native_error {
                         println!("Native inspection failed: {error}");
