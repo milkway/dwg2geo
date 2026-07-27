@@ -804,7 +804,7 @@ impl DwgDocumentBuilder {
             // Wrap per-object processing in catch_unwind to survive
             // corrupt or misaligned records without crashing the entire read.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.process_pass2_record(handle, type_code, reader, document, &maps, &mut pending, &mut pending_attributes, &entity_class_numbers);
+                self.process_pass2_record(handle, raw_type_code, type_code, reader, document, &maps, &mut pending, &mut pending_attributes, &entity_class_numbers);
             }));
             if let Err(ref _e) = result {
                 skipped_pass2 += 1;
@@ -1177,6 +1177,7 @@ impl DwgDocumentBuilder {
     fn process_pass2_record(
         &self,
         handle: u64,
+        raw_type_code: i16,
         type_code: i16,
         mut reader: crate::io::dwg::dwg_stream_readers::merged_reader::DwgMergedReader,
         document: &mut CadDocument,
@@ -2882,7 +2883,7 @@ impl DwgDocumentBuilder {
                         .block_visibility_params
                         .insert(Handle::from(handle), param);
 
-                    let type_name = format!("DWG_OBJ_{}", type_code);
+                    let type_name = Self::unknown_object_type_name(document, raw_type_code);
                     let raw_handle_bits = reader.get_handle_bits();
                     let raw_data = reader.raw_merged_data();
                     document.objects.insert(
@@ -2904,7 +2905,7 @@ impl DwgDocumentBuilder {
                         .block_representations
                         .insert(Handle::from(handle), block);
 
-                    let type_name = format!("DWG_OBJ_{}", type_code);
+                    let type_name = Self::unknown_object_type_name(document, raw_type_code);
                     let raw_handle_bits = reader.get_handle_bits();
                     let raw_data = reader.raw_merged_data();
                     document.objects.insert(
@@ -2923,7 +2924,7 @@ impl DwgDocumentBuilder {
                 _ => {
                     // Preserve unrecognised non-entity objects verbatim so
                     // they survive roundtrip without losing their handles.
-                    let type_name = format!("DWG_OBJ_{}", type_code);
+                    let type_name = Self::unknown_object_type_name(document, raw_type_code);
                     let raw_handle_bits = reader.get_handle_bits();
                     let raw_data = reader.raw_merged_data();
                     document.objects.insert(
@@ -2971,6 +2972,16 @@ impl DwgDocumentBuilder {
         } else {
             raw
         }
+    }
+
+    // Upstream candidate: retain the CLASSES dxfname for unsupported objects.
+    fn unknown_object_type_name(document: &CadDocument, raw_type_code: i16) -> String {
+        document
+            .classes
+            .iter()
+            .find(|class| class.class_number == raw_type_code)
+            .map(|class| class.dxf_name.clone())
+            .unwrap_or_else(|| format!("DWG_OBJ_{}", raw_type_code))
     }
 }
 
