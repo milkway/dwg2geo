@@ -1946,6 +1946,10 @@ fn convert_entity(
         EntityType::Text(text) => convert_text(text, placement),
         EntityType::MText(mtext) => convert_mtext(mtext, placement),
         EntityType::Hatch(hatch) => convert_hatch(hatch, options, placement),
+        EntityType::PolyfaceMesh(mesh) => convert_polyface_mesh(mesh, placement),
+        EntityType::MLine(mline) => convert_mline(mline, placement),
+        EntityType::MultiLeader(multileader) => convert_multileader(multileader, placement),
+        EntityType::AttributeDefinition(attdef) => convert_attribute_definition(attdef, placement),
         _ => EntityOutcome::Skipped(
             "entity type is not converted by the native backend yet".to_string(),
         ),
@@ -2035,6 +2039,272 @@ fn convert_face3d(face: &acadrust::entities::Face3D, placement: &Placement) -> E
     EntityOutcome::Converted {
         geometry: CadGeometry::Polygon(vec![ring]),
         extra_properties: vec![("is_closed", JsonValue::from(true))],
+        warnings,
+    }
+}
+
+/// An MLINE draws one parallel line per element of its MLINESTYLE. DXF
+/// stores, per vertex (group 11, WCS) and per element, the miter direction
+/// (group 13) and the element parameters (group 41): "the distance along the
+/// miter vector from the vertex to the point where the element's line
+/// intersects it". The first parameter is that intersection, so element `e`
+/// passes through `position + miter * parameters[0]` at every vertex. The
+/// offsets are therefore read from the entity, not recomputed from the style
+/// scale and justification — the entity already has them mitred.
+///
+/// Later parameters describe where the element line is interrupted inside
+/// the segment (breaks and caps); they are not evaluated, and an MLINE that
+/// carries them says so in a warning rather than pretending the line is
+/// continuous without comment.
+fn convert_mline(mline: &acadrust::entities::MLine, placement: &Placement) -> EntityOutcome {
+    use acadrust::entities::MLineFlags;
+
+    if !valid_normal(&mline.normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
+    }
+    if mline.vertices.len() < 2 {
+        return EntityOutcome::Skipped("multiline has fewer than two vertices".to_string());
+    }
+    let element_count = mline
+        .vertices
+        .iter()
+        .map(|vertex| vertex.segments.len())
+        .min()
+        .unwrap_or(0);
+    if element_count == 0 {
+        return EntityOutcome::Skipped(
+            "multiline carries no element offsets; the style's elements are not in the drawing"
+                .to_string(),
+        );
+    }
+
+    let closed = mline.flags.contains(MLineFlags::CLOSED);
+    let mut max_abs_z: f64 = 0.0;
+    let mut breaks = false;
+    let mut lines: Vec<Vec<(f64, f64)>> = Vec::with_capacity(element_count);
+    for element in 0..element_count {
+        let mut line: Vec<(f64, f64)> = Vec::with_capacity(mline.vertices.len() + 1);
+        for vertex in &mline.vertices {
+            let segment = &vertex.segments[element];
+            let offset = match segment.parameters.first() {
+                Some(offset) => *offset,
+                None => 0.0,
+            };
+            breaks |= segment.parameters.len() > 2;
+            if !offset.is_finite() || !is_finite(&vertex.position) || !is_finite(&vertex.miter) {
+                return EntityOutcome::Failed("non-finite coordinates".to_string());
+            }
+            let point = vertex.position + vertex.miter * offset;
+            let Some(position) = project(placement, point, &mut max_abs_z) else {
+                return EntityOutcome::Failed("non-finite coordinates".to_string());
+            };
+            line.push(position);
+        }
+        if closed && line.first() != line.last() {
+            line.push(line[0]);
+        }
+        if count_distinct(&line) >= 2 {
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        return EntityOutcome::Skipped(
+            "multiline elements all collapse to a single XY point".to_string(),
+        );
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+    if breaks {
+        warnings.push(
+            "multiline element breaks and caps are not evaluated; the elements are drawn whole"
+                .to_string(),
+        );
+    }
+    let element_count = lines.len();
+    EntityOutcome::Converted {
+        geometry: CadGeometry::MultiLine(lines),
+        extra_properties: vec![
+            ("is_closed", JsonValue::from(closed)),
+            ("mline_style", JsonValue::from(mline.style_name.clone())),
+            ("mline_elements", JsonValue::from(element_count)),
+        ],
+        warnings,
+    }
+}
+
+/// A MULTILEADER draws one polyline per leader line, ending in the landing
+/// that carries the content. DXF keeps them in the annotation context: each
+/// leader root has a connection point (group 10 of the LEADER context) and a
+/// landing distance (group 40), and each of its leader lines a list of
+/// points (group 10 of the LEADER_LINE context) running from the arrowhead
+/// towards the root. The drawn leader is those points, then the connection
+/// point, then — when the dogleg is on — the landing segment of
+/// `landing_distance` along the root direction.
+///
+/// Only the leader geometry is converted. The content (MTEXT or a block) is
+/// laid out by the multileader style, which this converter does not
+/// evaluate; the text string travels as a property so nothing is lost
+/// silently.
+fn convert_multileader(
+    multileader: &acadrust::entities::MultiLeader,
+    placement: &Placement,
+) -> EntityOutcome {
+    let context = &multileader.context;
+    let mut max_abs_z: f64 = 0.0;
+    let mut lines: Vec<Vec<(f64, f64)>> = Vec::new();
+
+    for root in &context.leader_roots {
+        if !is_finite(&root.connection_point) || !is_finite(&root.direction) {
+            return EntityOutcome::Failed("non-finite coordinates".to_string());
+        }
+        let mut tail: Vec<Vector3> = vec![root.connection_point];
+        if multileader.enable_dogleg && root.landing_distance.is_finite() {
+            tail.push(root.connection_point + root.direction * root.landing_distance);
+        }
+
+        for leader_line in &root.lines {
+            let mut line: Vec<(f64, f64)> = Vec::with_capacity(leader_line.points.len() + 2);
+            for point in leader_line.points.iter().chain(tail.iter()) {
+                if !is_finite(point) {
+                    return EntityOutcome::Failed("non-finite coordinates".to_string());
+                }
+                let Some(position) = project(placement, *point, &mut max_abs_z) else {
+                    return EntityOutcome::Failed("non-finite coordinates".to_string());
+                };
+                line.push(position);
+            }
+            line.dedup();
+            if count_distinct(&line) >= 2 {
+                lines.push(line);
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        return EntityOutcome::Skipped(
+            "multileader has no leader line with two distinct XY points".to_string(),
+        );
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+    warnings.push(
+        "multileader converted from its leader lines only; the content block or text is not laid out"
+            .to_string(),
+    );
+
+    let mut extra_properties = vec![
+        ("is_closed", JsonValue::from(false)),
+        ("leader_lines", JsonValue::from(lines.len())),
+    ];
+    if context.has_text_contents && !context.text_string.is_empty() {
+        extra_properties.push((
+            "text",
+            JsonValue::from(strip_mtext_codes(&context.text_string)),
+        ));
+        extra_properties.push(("text_raw", JsonValue::from(context.text_string.clone())));
+    }
+
+    EntityOutcome::Converted {
+        geometry: CadGeometry::MultiLine(lines),
+        extra_properties,
+        warnings,
+    }
+}
+
+/// A POLYFACE mesh (POLYLINE with group 70 bit 64) is a vertex list plus
+/// face records that index it. Each face record (DXF VERTEX groups 71-74)
+/// names three or four vertices, 1-based; a zero index means the corner is
+/// unused (a triangle leaves group 74 at zero) and a negative index marks
+/// the edge into that corner as invisible, which changes nothing about the
+/// face outline. Every face becomes one polygon ring, so the mesh maps to a
+/// MultiPolygon, the same way a single 3DFACE maps to a Polygon: z is
+/// dropped and rings are wound counter-clockwise for RFC 7946.
+fn convert_polyface_mesh(
+    mesh: &acadrust::entities::PolyfaceMesh,
+    placement: &Placement,
+) -> EntityOutcome {
+    if mesh.faces.is_empty() {
+        return EntityOutcome::Skipped("polyface mesh has no face records".to_string());
+    }
+    if mesh
+        .vertices
+        .iter()
+        .any(|vertex| !is_finite(&vertex.location))
+    {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+
+    let mut max_abs_z: f64 = 0.0;
+    let mut polygons: Vec<Vec<Vec<(f64, f64)>>> = Vec::with_capacity(mesh.faces.len());
+    let mut degenerate = 0usize;
+    let mut out_of_range = 0usize;
+    for face in &mesh.faces {
+        let mut ring: Vec<(f64, f64)> = Vec::with_capacity(5);
+        let mut broken = false;
+        for index in [face.index1, face.index2, face.index3, face.index4] {
+            if index == 0 {
+                continue;
+            }
+            // Negative indices only hide the edge; the corner still counts.
+            let Some(vertex) = index
+                .unsigned_abs()
+                .checked_sub(1)
+                .and_then(|zero_based| mesh.vertices.get(zero_based as usize))
+            else {
+                broken = true;
+                break;
+            };
+            let Some(position) = project(placement, vertex.location, &mut max_abs_z) else {
+                return EntityOutcome::Failed("non-finite coordinates".to_string());
+            };
+            ring.push(position);
+        }
+        if broken {
+            out_of_range += 1;
+            continue;
+        }
+        ring.dedup();
+        if count_distinct(&ring) < 3 {
+            degenerate += 1;
+            continue;
+        }
+        if ring.first() != ring.last() {
+            ring.push(ring[0]);
+        }
+        if signed_area(&ring) < 0.0 {
+            ring.reverse();
+        }
+        polygons.push(vec![ring]);
+    }
+
+    if polygons.is_empty() {
+        return EntityOutcome::Skipped(format!(
+            "polyface mesh has no face with three distinct XY corners ({degenerate} degenerate, {out_of_range} out of range)"
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+    if degenerate > 0 {
+        warnings.push(format!(
+            "{degenerate} mesh faces collapsed to fewer than three distinct XY corners and were dropped"
+        ));
+    }
+    if out_of_range > 0 {
+        warnings.push(format!(
+            "{out_of_range} mesh faces reference vertices outside the vertex list and were dropped"
+        ));
+    }
+
+    let face_count = polygons.len();
+    EntityOutcome::Converted {
+        geometry: CadGeometry::MultiPolygon(polygons),
+        extra_properties: vec![
+            ("is_closed", JsonValue::from(true)),
+            ("face_count", JsonValue::from(face_count)),
+        ],
         warnings,
     }
 }
@@ -3657,6 +3927,136 @@ fn convert_text(text: &acadrust::entities::Text, placement: &Placement) -> Entit
     }
 }
 
+/// An ATTDEF sitting directly in model space is a drawn entity, not a
+/// template: DXF ATTDEF carries the same anchor, height, rotation and
+/// alignment fields as TEXT, and the application draws the tag (group 2) at
+/// that anchor. Inside a block definition the same entity *is* a template
+/// and is reported as such by [`process_insert`], which never reaches here.
+///
+/// The anchor follows the TEXT rule (DXF TEXT groups 10 and 11): the
+/// insertion point for the default left/baseline alignment, the second
+/// alignment point otherwise.
+fn convert_attribute_definition(
+    attdef: &acadrust::entities::AttributeDefinition,
+    placement: &Placement,
+) -> EntityOutcome {
+    use acadrust::entities::{HorizontalAlignment, VerticalAlignment};
+
+    let default_alignment = matches!(attdef.horizontal_alignment, HorizontalAlignment::Left)
+        && matches!(attdef.vertical_alignment, VerticalAlignment::Baseline);
+    let (anchor, anchor_name) = if default_alignment {
+        (attdef.insertion_point, "insertion")
+    } else {
+        (attdef.alignment_point, "alignment")
+    };
+    if !is_finite(&anchor) {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    }
+    if !valid_normal(&attdef.normal) {
+        return EntityOutcome::Failed("zero or non-finite extrusion normal".to_string());
+    }
+    let ocs_to_wcs = Matrix3::arbitrary_axis(attdef.normal);
+    let mut max_abs_z: f64 = 0.0;
+    let Some(position) = project(
+        placement,
+        ocs_to_wcs.transform_point(anchor),
+        &mut max_abs_z,
+    ) else {
+        return EntityOutcome::Failed("non-finite coordinates".to_string());
+    };
+
+    let mut warnings = Vec::new();
+    push_z_warning(&mut warnings, max_abs_z);
+
+    let mut extra_properties = vec![
+        ("text", JsonValue::from(attdef.tag.clone())),
+        ("attribute_tag", JsonValue::from(attdef.tag.clone())),
+        (
+            "attribute_default",
+            JsonValue::from(attdef.default_value.clone()),
+        ),
+        ("text_height", JsonValue::from(attdef.height)),
+        (
+            "text_rotation_deg",
+            JsonValue::from(effective_rotation_degrees(
+                attdef.rotation,
+                Some(&ocs_to_wcs),
+                placement,
+            )),
+        ),
+        ("text_style", JsonValue::from(attdef.text_style.clone())),
+    ];
+    if !attdef.prompt.is_empty() {
+        extra_properties.push(("attribute_prompt", JsonValue::from(attdef.prompt.clone())));
+    }
+    if !matches!(attdef.horizontal_alignment, HorizontalAlignment::Left) {
+        extra_properties.push((
+            "text_h_align",
+            JsonValue::from(attdef_horizontal_alignment_name(
+                attdef.horizontal_alignment,
+            )),
+        ));
+    }
+    if !matches!(attdef.vertical_alignment, VerticalAlignment::Baseline) {
+        extra_properties.push((
+            "text_v_align",
+            JsonValue::from(attdef_vertical_alignment_name(attdef.vertical_alignment)),
+        ));
+    }
+    if !default_alignment {
+        extra_properties.push(("text_anchor", JsonValue::from(anchor_name)));
+    }
+    if attdef.width_factor != 1.0 {
+        extra_properties.push(("text_width_factor", JsonValue::from(attdef.width_factor)));
+    }
+    if attdef.oblique_angle != 0.0 {
+        extra_properties.push((
+            "text_oblique_deg",
+            JsonValue::from(attdef.oblique_angle.to_degrees()),
+        ));
+    }
+    if attdef.flags.invisible {
+        extra_properties.push(("attribute_invisible", JsonValue::from(true)));
+    }
+    if attdef.flags.constant {
+        extra_properties.push(("attribute_constant", JsonValue::from(true)));
+    }
+
+    EntityOutcome::Converted {
+        geometry: CadGeometry::Point(position),
+        extra_properties,
+        warnings,
+    }
+}
+
+fn attdef_horizontal_alignment_name(
+    alignment: acadrust::entities::HorizontalAlignment,
+) -> &'static str {
+    use acadrust::entities::HorizontalAlignment;
+
+    match alignment {
+        HorizontalAlignment::Left => "left",
+        HorizontalAlignment::Center => "center",
+        HorizontalAlignment::Right => "right",
+        HorizontalAlignment::Aligned => "aligned",
+        HorizontalAlignment::Middle => "middle",
+        HorizontalAlignment::Fit => "fit",
+    }
+}
+
+fn attdef_vertical_alignment_name(
+    alignment: acadrust::entities::VerticalAlignment,
+) -> &'static str {
+    use acadrust::entities::VerticalAlignment;
+
+    match alignment {
+        VerticalAlignment::Baseline => "baseline",
+        VerticalAlignment::Bottom => "bottom",
+        VerticalAlignment::Middle => "middle",
+        VerticalAlignment::Top => "top",
+    }
+}
+
 fn text_horizontal_alignment_name(
     alignment: acadrust::entities::TextHorizontalAlignment,
 ) -> &'static str {
@@ -4733,6 +5133,244 @@ mod tests {
             EntityOutcome::Skipped(reason) => assert!(reason.contains("smoothing")),
             _ => panic!("spline-fit polyline must be skipped"),
         }
+    }
+
+    #[test]
+    fn polyface_mesh_becomes_one_ring_per_face() {
+        use acadrust::entities::{PolyfaceFace, PolyfaceMesh, PolyfaceVertex};
+        use acadrust::types::Vector3;
+
+        // DXF polyface face records index the vertex list 1-based; a zero
+        // fourth index means a triangle and a negative index only hides that
+        // edge, so the face outline is unchanged.
+        let mut mesh = PolyfaceMesh::new();
+        for (x, y) in [(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0)] {
+            mesh.vertices
+                .push(PolyfaceVertex::new(Vector3::new(x, y, 1.0)));
+        }
+        // The quad is clockwise in XY, so the ring has to come back
+        // counter-clockwise; the triangle hides one edge with a negative
+        // index, which must not change its outline.
+        mesh.faces = vec![
+            PolyfaceFace::quad(1, 4, 3, 2),
+            PolyfaceFace::triangle(1, 2, -3),
+        ];
+
+        let EntityOutcome::Converted {
+            geometry,
+            extra_properties,
+            warnings,
+        } = convert_entity(&EntityType::PolyfaceMesh(mesh), &opts(false))
+        else {
+            panic!("a polyface mesh with usable faces must convert");
+        };
+        let CadGeometry::MultiPolygon(polygons) = geometry else {
+            panic!("expected a MultiPolygon");
+        };
+        assert_eq!(polygons.len(), 2);
+        assert_eq!(
+            polygons[0][0],
+            vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0), (0.0, 0.0)]
+        );
+        assert_eq!(
+            polygons[1][0],
+            vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 0.0)]
+        );
+        assert!(super::signed_area(&polygons[0][0]) > 0.0);
+        assert!(super::signed_area(&polygons[1][0]) > 0.0);
+        assert!(extra_properties.iter().any(|(key, _)| *key == "face_count"));
+        assert!(warnings.iter().any(|w| w.contains("z coordinates")));
+    }
+
+    #[test]
+    fn polyface_faces_that_collapse_in_xy_are_dropped_with_a_warning() {
+        use acadrust::entities::{PolyfaceFace, PolyfaceMesh, PolyfaceVertex};
+        use acadrust::types::Vector3;
+
+        // A vertical face projects to a line in XY; it cannot be a ring.
+        let mut mesh = PolyfaceMesh::new();
+        for (x, y, z) in [(0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (4.0, 0.0, 2.0)] {
+            mesh.vertices
+                .push(PolyfaceVertex::new(Vector3::new(x, y, z)));
+        }
+        mesh.faces = vec![PolyfaceFace::triangle(1, 2, 3)];
+
+        match convert_entity(&EntityType::PolyfaceMesh(mesh), &opts(false)) {
+            EntityOutcome::Skipped(reason) => {
+                assert!(reason.contains("three distinct XY corners"), "{reason}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mline_draws_one_line_per_element_at_the_stored_miter_offsets() {
+        use acadrust::entities::{MLine, MLineSegment, MLineVertex};
+        use acadrust::types::Vector3;
+
+        // Straight run along +x: the miter is the perpendicular, so DXF
+        // group 41 offsets of +1 and -1 put the two elements two units
+        // apart, exactly as the style says without recomputing it.
+        let mut mline = MLine::new();
+        mline.style_name = "STANDARD".to_string();
+        for x in [0.0, 10.0] {
+            let mut vertex = MLineVertex::new(Vector3::new(x, 0.0, 0.0));
+            vertex.direction = Vector3::new(1.0, 0.0, 0.0);
+            vertex.miter = Vector3::new(0.0, 1.0, 0.0);
+            for offset in [1.0, -1.0] {
+                let mut segment = MLineSegment::new();
+                segment.parameters = vec![offset, 0.0];
+                vertex.segments.push(segment);
+            }
+            mline.vertices.push(vertex);
+        }
+
+        let EntityOutcome::Converted {
+            geometry,
+            extra_properties,
+            ..
+        } = convert_entity(&EntityType::MLine(mline), &opts(false))
+        else {
+            panic!("a multiline with element offsets must convert");
+        };
+        let CadGeometry::MultiLine(lines) = geometry else {
+            panic!("expected a MultiLineString");
+        };
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], vec![(0.0, 1.0), (10.0, 1.0)]);
+        assert_eq!(lines[1], vec![(0.0, -1.0), (10.0, -1.0)]);
+        assert!(
+            extra_properties
+                .iter()
+                .any(|(key, value)| *key == "mline_elements" && value.as_u64() == Some(2))
+        );
+    }
+
+    #[test]
+    fn mline_without_element_offsets_is_skipped() {
+        use acadrust::entities::{MLine, MLineVertex};
+        use acadrust::types::Vector3;
+
+        let mut mline = MLine::new();
+        mline.vertices = vec![
+            MLineVertex::new(Vector3::new(0.0, 0.0, 0.0)),
+            MLineVertex::new(Vector3::new(10.0, 0.0, 0.0)),
+        ];
+        match convert_entity(&EntityType::MLine(mline), &opts(false)) {
+            EntityOutcome::Skipped(reason) => {
+                assert!(reason.contains("element offsets"), "{reason}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multileader_draws_the_leader_line_through_its_landing() {
+        use acadrust::entities::{LeaderLine, LeaderRoot, MultiLeader};
+        use acadrust::types::Vector3;
+
+        let mut multileader = MultiLeader::new();
+        multileader.enable_dogleg = true;
+        let mut root = LeaderRoot::new(0);
+        root.connection_point = Vector3::new(10.0, 10.0, 0.0);
+        root.direction = Vector3::new(1.0, 0.0, 0.0);
+        root.landing_distance = 2.0;
+        root.lines = vec![LeaderLine::from_points(
+            0,
+            vec![Vector3::new(0.0, 0.0, 0.0), Vector3::new(4.0, 6.0, 0.0)],
+        )];
+        multileader.context.leader_roots = vec![root];
+        multileader.context.has_text_contents = true;
+        multileader.context.text_string = "NOTE\\Pline".to_string();
+
+        let EntityOutcome::Converted {
+            geometry,
+            extra_properties,
+            ..
+        } = convert_entity(&EntityType::MultiLeader(multileader), &opts(false))
+        else {
+            panic!("a multileader with a leader line must convert");
+        };
+        let CadGeometry::MultiLine(lines) = geometry else {
+            panic!("expected a MultiLineString");
+        };
+        // Arrowhead points, then the connection point, then the landing.
+        assert_eq!(
+            lines,
+            vec![vec![(0.0, 0.0), (4.0, 6.0), (10.0, 10.0), (12.0, 10.0),]]
+        );
+        assert!(
+            extra_properties
+                .iter()
+                .any(|(key, value)| *key == "text" && value.as_str() == Some("NOTE\nline"))
+        );
+    }
+
+    #[test]
+    fn multileader_without_a_dogleg_stops_at_the_connection_point() {
+        use acadrust::entities::{LeaderLine, LeaderRoot, MultiLeader};
+        use acadrust::types::Vector3;
+
+        let mut multileader = MultiLeader::new();
+        multileader.enable_dogleg = false;
+        let mut root = LeaderRoot::new(0);
+        root.connection_point = Vector3::new(10.0, 10.0, 0.0);
+        root.direction = Vector3::new(1.0, 0.0, 0.0);
+        root.landing_distance = 2.0;
+        root.lines = vec![LeaderLine::from_points(0, vec![Vector3::ZERO])];
+        multileader.context.leader_roots = vec![root];
+
+        let EntityOutcome::Converted { geometry, .. } =
+            convert_entity(&EntityType::MultiLeader(multileader), &opts(false))
+        else {
+            panic!("a multileader with a leader line must convert");
+        };
+        let CadGeometry::MultiLine(lines) = geometry else {
+            panic!("expected a MultiLineString");
+        };
+        assert_eq!(lines, vec![vec![(0.0, 0.0), (10.0, 10.0)]]);
+    }
+
+    #[test]
+    fn model_space_attdef_becomes_its_tag_at_the_text_anchor() {
+        use acadrust::entities::AttributeDefinition;
+        use acadrust::types::Vector3;
+
+        // An ATTDEF outside a block definition is drawn; the one inside is a
+        // template and is reported by the INSERT path instead.
+        let mut attdef = AttributeDefinition::new(
+            "TAG".to_string(),
+            "prompt".to_string(),
+            "default".to_string(),
+        );
+        attdef.insertion_point = Vector3::new(3.0, 4.0, 0.0);
+        attdef.height = 2.5;
+
+        let EntityOutcome::Converted {
+            geometry,
+            extra_properties,
+            ..
+        } = convert_entity(&EntityType::AttributeDefinition(attdef), &opts(false))
+        else {
+            panic!("a model-space ATTDEF must convert");
+        };
+        assert_eq!(geometry, CadGeometry::Point((3.0, 4.0)));
+        let value = |key: &str| {
+            extra_properties
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(value("text"), Some(super::JsonValue::from("TAG")));
+        assert_eq!(value("attribute_tag"), Some(super::JsonValue::from("TAG")));
+        assert_eq!(
+            value("attribute_default"),
+            Some(super::JsonValue::from("default"))
+        );
+        assert_eq!(
+            value("attribute_prompt"),
+            Some(super::JsonValue::from("prompt"))
+        );
     }
 
     #[test]
