@@ -1950,6 +1950,23 @@ fn convert_entity(
         EntityType::MLine(mline) => convert_mline(mline, placement),
         EntityType::MultiLeader(multileader) => convert_multileader(multileader, placement),
         EntityType::AttributeDefinition(attdef) => convert_attribute_definition(attdef, placement),
+        // Unbounded by definition: a RAY runs from its start point to
+        // infinity, an XLINE both ways (DXF RAY/XLINE groups 10 and 11 are a
+        // point and a direction, never an extent). Clipping them to the
+        // drawing extents would put an endpoint in the output that the
+        // drawing does not have.
+        EntityType::Ray(_) | EntityType::XLine(_) => EntityOutcome::Skipped(
+            "construction line has no finite extent; a RAY or XLINE is unbounded".to_string(),
+        ),
+        // ACIS entities carry their geometry as an encrypted SAT/SAB modeller
+        // stream, not as DXF geometry; there is nothing to read without an
+        // ACIS kernel.
+        EntityType::Solid3D(_)
+        | EntityType::Region(_)
+        | EntityType::Body(_)
+        | EntityType::Surface(_) => EntityOutcome::Skipped(
+            "ACIS modeller geometry (SAT/SAB stream) is not evaluated".to_string(),
+        ),
         _ => EntityOutcome::Skipped(
             "entity type is not converted by the native backend yet".to_string(),
         ),
@@ -5529,6 +5546,13 @@ mod tests {
         let skipped: Vec<_> = extraction.skipped.keys().collect();
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].0, "RAY");
+        // The reason has to say the type is unbounded, not that support is
+        // pending: a RAY is never going to become a finite line string.
+        assert!(
+            skipped[0].1.contains("unbounded"),
+            "reason: {}",
+            skipped[0].1
+        );
         let samples = extraction.skipped.values().next().expect("skip entry");
         assert_eq!(samples.count, 1);
         assert_eq!(samples.samples.len(), 1);
