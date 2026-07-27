@@ -26,6 +26,7 @@ use acadrust::{
     entities::EntityType,
     io::dwg::{DwgReadOptions, DwgReader},
     notification::NotificationType,
+    objects::{GeoData, ObjectType},
     tables::block_record::BlockRecord,
 };
 use anyhow::{Context, Result, anyhow};
@@ -54,6 +55,10 @@ pub(crate) fn is_paper_space(record: &BlockRecord) -> bool {
 /// of problem is hidden.
 const NOTIFICATION_SAMPLE_LIMIT: usize = 20;
 
+/// Keep the human report bounded for drawings with hundreds of proxy classes;
+/// JSON retains the complete histogram.
+const UNKNOWN_OBJECT_SAMPLE_LIMIT: usize = 20;
+
 /// AutoCAD stores "no extents" as +/-1e20 sentinels; treat anything in that
 /// magnitude range as unset.
 const EXTENTS_SENTINEL: f64 = 1e19;
@@ -72,6 +77,9 @@ pub struct NativeInspection {
     pub entity_histogram: Vec<HistogramEntry>,
     pub unknown_entity_count: usize,
     pub unresolved_entity_handles: usize,
+    pub unknown_object_histogram: Vec<TypeCount>,
+    pub geodata: Option<GeoDataSummary>,
+    pub map3d_metadata_detected: bool,
     pub read_mode: ReadMode,
     pub read_errors: Vec<String>,
     pub notifications: NotificationSummary,
@@ -100,6 +108,23 @@ pub struct HistogramEntry {
     pub block_definitions: usize,
     pub unowned: usize,
     pub total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GeoDataSummary {
+    pub handle: String,
+    pub version: i32,
+    pub coordinate_type: i16,
+    pub coordinate_type_name: &'static str,
+    pub design_point: [f64; 3],
+    pub reference_point: [f64; 3],
+    pub horizontal_units: i32,
+    pub vertical_units: i32,
+    pub horizontal_unit_scale: f64,
+    pub vertical_unit_scale: f64,
+    pub definition_format: &'static str,
+    pub definition_length: usize,
+    pub definition_summary: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -175,9 +200,103 @@ pub fn inspect(path: &Path) -> Result<NativeInspection> {
         entity_histogram: survey.histogram(),
         unknown_entity_count: survey.unknown_entities,
         unresolved_entity_handles: survey.unresolved_handles,
+        unknown_object_histogram: unknown_object_histogram(&document),
+        geodata: geodata_summary(&document),
+        map3d_metadata_detected: has_map3d_metadata(&document),
         read_mode,
         read_errors,
         notifications: summarize_notifications(&document),
+    })
+}
+
+fn unknown_object_histogram(document: &CadDocument) -> Vec<TypeCount> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for object in document.objects.values() {
+        if let ObjectType::Unknown { type_name, .. } = object {
+            *counts.entry(type_name.clone()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(entity_type, count)| TypeCount { entity_type, count })
+        .collect()
+}
+
+fn geodata_summary(document: &CadDocument) -> Option<GeoDataSummary> {
+    document
+        .objects
+        .iter()
+        .filter_map(|(handle, object)| match object {
+            ObjectType::GeoData(geodata) => Some((handle, geodata)),
+            _ => None,
+        })
+        .min_by_key(|(handle, _)| *handle)
+        .map(|(_, geodata)| summarize_geodata(geodata))
+}
+
+fn summarize_geodata(geodata: &GeoData) -> GeoDataSummary {
+    let definition = &geodata.coordinate_system_definition;
+    let trimmed = definition.trim();
+    let uppercase = trimmed.to_ascii_uppercase();
+    let definition_format = if trimmed.is_empty() {
+        "empty"
+    } else if trimmed.starts_with('<') {
+        "mapguide-xml"
+    } else if uppercase.contains("PROJCS") || uppercase.contains("GEOGCS") {
+        "wkt"
+    } else {
+        "unrecognized"
+    };
+    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    GeoDataSummary {
+        handle: geodata.handle.to_string(),
+        version: geodata.version,
+        coordinate_type: geodata.coordinate_type,
+        coordinate_type_name: coordinate_type_name(geodata.coordinate_type),
+        design_point: [
+            geodata.design_point.x,
+            geodata.design_point.y,
+            geodata.design_point.z,
+        ],
+        reference_point: [
+            geodata.reference_point.x,
+            geodata.reference_point.y,
+            geodata.reference_point.z,
+        ],
+        horizontal_units: geodata.horizontal_units,
+        vertical_units: geodata.vertical_units,
+        horizontal_unit_scale: geodata.horizontal_unit_scale,
+        vertical_unit_scale: geodata.vertical_unit_scale,
+        definition_format,
+        definition_length: definition.chars().count(),
+        definition_summary: collapsed.chars().take(240).collect(),
+    }
+}
+
+fn coordinate_type_name(coordinate_type: i16) -> &'static str {
+    match coordinate_type {
+        1 => "local grid",
+        2 => "projected grid",
+        3 => "geographic",
+        _ => "unknown",
+    }
+}
+
+fn has_map3d_metadata(document: &CadDocument) -> bool {
+    document.objects.values().any(|object| match object {
+        // Small heuristic for Map 3D/ADE proxy families retained by acadrust.
+        ObjectType::Unknown { type_name, .. } => {
+            let upper = type_name.to_ascii_uppercase();
+            upper.starts_with("IRD_") || upper.starts_with("DM")
+        }
+        ObjectType::Dictionary(dictionary) => dictionary.entries.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("Autodesk_MAP")
+                || name
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AcMap"))
+        }),
+        _ => false,
     })
 }
 
@@ -564,6 +683,24 @@ impl NativeInspection {
                 self.unresolved_entity_handles
             ));
         }
+        if !self.unknown_object_histogram.is_empty() {
+            lines.push("Unknown object histogram:".to_string());
+            let mut entries: Vec<&TypeCount> = self.unknown_object_histogram.iter().collect();
+            entries.sort_by(|a, b| {
+                b.count
+                    .cmp(&a.count)
+                    .then_with(|| a.entity_type.cmp(&b.entity_type))
+            });
+            for entry in entries.iter().take(UNKNOWN_OBJECT_SAMPLE_LIMIT) {
+                lines.push(format!("  {}: {}", entry.entity_type, entry.count));
+            }
+            if entries.len() > UNKNOWN_OBJECT_SAMPLE_LIMIT {
+                lines.push(format!(
+                    "  ... {} more object types (see --json for the complete histogram)",
+                    entries.len() - UNKNOWN_OBJECT_SAMPLE_LIMIT
+                ));
+            }
+        }
         if self.read_mode == ReadMode::FailsafeRecovery {
             lines.push("Read mode: failsafe recovery".to_string());
         }
@@ -652,11 +789,16 @@ mod tests {
         CadDocument, DxfVersion,
         entities::{Circle, EntityType, Line, Point},
         io::dwg::DwgWriter,
+        objects::{GeoData, ObjectType},
         tables::Layer,
+        types::{Handle, Vector3},
     };
     use tempfile::TempDir;
 
-    use super::{ReadMode, inspect, layers};
+    use super::{
+        ReadMode, coordinate_type_name, geodata_summary, has_map3d_metadata, inspect, layers,
+        unknown_object_histogram,
+    };
 
     fn fixture_document() -> CadDocument {
         let mut document = CadDocument::with_version(DxfVersion::AC1027);
@@ -695,6 +837,97 @@ mod tests {
         let path = dir.join("fixture peça.dwg");
         DwgWriter::write_to_file(&path, &fixture_document()).expect("write DWG fixture");
         path
+    }
+
+    #[test]
+    fn summarizes_wkt_geodata_from_document_objects() {
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        let mut geodata = GeoData::new();
+        geodata.handle = Handle::new(0xABC);
+        geodata.version = 1;
+        geodata.coordinate_type = 2;
+        geodata.design_point = Vector3::new(1.0, 2.0, 3.0);
+        geodata.reference_point = Vector3::new(4.0, 5.0, 6.0);
+        geodata.horizontal_units = 6;
+        geodata.vertical_units = 6;
+        geodata.horizontal_unit_scale = 0.5;
+        geodata.vertical_unit_scale = 2.0;
+        geodata.coordinate_system_definition = format!(
+            "  PROJCS[\"Example\",   GEOGCS[\"WGS 84\"]] {}",
+            "repeated definition text ".repeat(20)
+        );
+        let definition_length = geodata.coordinate_system_definition.chars().count();
+        document
+            .objects
+            .insert(geodata.handle, ObjectType::GeoData(geodata));
+
+        let summary = geodata_summary(&document).expect("GeoData summary");
+        assert_eq!(summary.handle, "0xABC");
+        assert_eq!(summary.version, 1);
+        assert_eq!(summary.coordinate_type, 2);
+        assert_eq!(summary.coordinate_type_name, "projected grid");
+        assert_eq!(summary.design_point, [1.0, 2.0, 3.0]);
+        assert_eq!(summary.reference_point, [4.0, 5.0, 6.0]);
+        assert_eq!(summary.horizontal_units, 6);
+        assert_eq!(summary.vertical_units, 6);
+        assert_eq!(summary.horizontal_unit_scale, 0.5);
+        assert_eq!(summary.vertical_unit_scale, 2.0);
+        assert_eq!(summary.definition_format, "wkt");
+        assert_eq!(summary.definition_length, definition_length);
+        assert_eq!(summary.definition_summary.chars().count(), 240);
+        assert!(!summary.definition_summary.contains("  "));
+    }
+
+    #[test]
+    fn summarizes_mapguide_xml_geodata_from_document_objects() {
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        let mut geodata = GeoData::new();
+        geodata.handle = Handle::new(0xDEF);
+        geodata.version = 3;
+        geodata.coordinate_type = 3;
+        geodata.coordinate_system_definition =
+            " \n <Dictionary>  <GeographicCoordinateSystem id=\"LL84\"/> </Dictionary> \t"
+                .to_string();
+        document
+            .objects
+            .insert(geodata.handle, ObjectType::GeoData(geodata));
+
+        let summary = geodata_summary(&document).expect("GeoData summary");
+        assert_eq!(summary.handle, "0xDEF");
+        assert_eq!(summary.version, 3);
+        assert_eq!(summary.coordinate_type_name, "geographic");
+        assert_eq!(summary.definition_format, "mapguide-xml");
+        assert_eq!(
+            summary.definition_summary,
+            "<Dictionary> <GeographicCoordinateSystem id=\"LL84\"/> </Dictionary>"
+        );
+        assert_eq!(coordinate_type_name(0), "unknown");
+        assert_eq!(coordinate_type_name(1), "local grid");
+    }
+
+    #[test]
+    fn detects_map3d_unknown_object_family() {
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        let handle = Handle::new(0x123);
+        document.objects.insert(
+            handle,
+            ObjectType::Unknown {
+                type_name: "IRD_OBJ_RECORD".to_string(),
+                handle,
+                owner: Handle::NULL,
+                raw_dxf_codes: None,
+                raw_dwg_data: None,
+                raw_dwg_handle_bits: 0,
+                raw_dwg_version: None,
+            },
+        );
+
+        assert!(has_map3d_metadata(&document));
+        assert!(geodata_summary(&document).is_none());
+        let histogram = unknown_object_histogram(&document);
+        assert_eq!(histogram.len(), 1);
+        assert_eq!(histogram[0].entity_type, "IRD_OBJ_RECORD");
+        assert_eq!(histogram[0].count, 1);
     }
 
     #[test]
