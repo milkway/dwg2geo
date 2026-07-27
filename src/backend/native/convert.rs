@@ -2471,9 +2471,9 @@ fn convert_polyline2d(
     use acadrust::entities::PolylineFlags;
 
     let flags = polyline.flags.bits();
-    if flags & (PolylineFlags::CURVE_FIT.bits() | PolylineFlags::SPLINE_FIT.bits()) != 0 {
+    if flags & PolylineFlags::SPLINE_FIT.bits() != 0 {
         return EntityOutcome::Skipped(
-            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+            "spline-fit polyline smoothing is not evaluated yet".to_string(),
         );
     }
 
@@ -2488,23 +2488,235 @@ fn convert_polyline2d(
             .map(|vertex| vertex.location.z)
             .unwrap_or(0.0)
     };
-    let vertices: Vec<OcsVertex> = polyline
-        .vertices
+
+    // A curve-fitted polyline carries its fitted arc vertices in the same
+    // VERTEX list as the frame vertices; the drawing order has to be
+    // recovered first (see [`curve_fit_drawing_order`]).
+    let curve_fit = flags & PolylineFlags::CURVE_FIT.bits() != 0;
+    let order = if curve_fit {
+        match curve_fit_drawing_order(&polyline.vertices, polyline.is_closed()) {
+            Ok(order) => order,
+            Err(reason) => return EntityOutcome::Skipped(reason),
+        }
+    } else {
+        (0..polyline.vertices.len()).collect()
+    };
+
+    let vertices: Vec<OcsVertex> = order
         .iter()
-        .map(|vertex| OcsVertex {
-            x: vertex.location.x,
-            y: vertex.location.y,
-            bulge: vertex.bulge,
+        .map(|&index| {
+            let vertex = &polyline.vertices[index];
+            OcsVertex {
+                x: vertex.location.x,
+                y: vertex.location.y,
+                bulge: vertex.bulge,
+            }
         })
         .collect();
-    finish_ocs_path(
+    let mut outcome = finish_ocs_path(
         &vertices,
         polyline.is_closed(),
         elevation,
         polyline.normal,
         options,
         placement,
-    )
+    );
+    if curve_fit
+        && let EntityOutcome::Converted {
+            extra_properties,
+            warnings,
+            ..
+        } = &mut outcome
+    {
+        let fitted = polyline
+            .vertices
+            .iter()
+            .filter(|vertex| is_curve_fit_vertex(vertex))
+            .count();
+        extra_properties.push(("curve_fit", JsonValue::Bool(true)));
+        warnings.push(format!(
+            "curve-fit polyline: {fitted} fitted vertices ordered by biarc tangent continuity"
+        ));
+    }
+    outcome
+}
+
+/// Largest tangent discontinuity, in radians, that a reconstructed biarc
+/// joint may show before the whole polyline is rejected.
+const CURVE_FIT_MAX_RESIDUAL: f64 = 1.0;
+/// A fitted vertex is only placed in a frame segment when its tangent
+/// residual there is at most this fraction of the residual in every other
+/// segment; otherwise the drawing order is ambiguous and nothing is emitted.
+const CURVE_FIT_AMBIGUITY_RATIO: f64 = 0.1;
+
+/// True for a vertex the curve fit added (DXF VERTEX group 70, bit 1,
+/// "extra vertex created by curve fitting"); false for a frame vertex.
+fn is_curve_fit_vertex(vertex: &acadrust::entities::Vertex2D) -> bool {
+    use acadrust::entities::VertexFlags;
+    vertex.flags.bits() & VertexFlags::EXTRA_VERTEX.bits() != 0
+}
+
+/// Drawing order of a curve-fitted 2D POLYLINE, as indices into `vertices`.
+///
+/// DXF (POLYLINE group 70 bit 2, "curve-fit vertices have been added")
+/// stores a fitted polyline as its frame vertices plus, for every frame
+/// segment the fit turned into arcs, extra vertices flagged with VERTEX
+/// group 70 bit 1; the drawn curve is the bulge-arc chain through all of
+/// them, and every joint is tangent continuous because the fit is a biarc
+/// per frame segment. The reader hands the vertices back grouped by kind
+/// rather than in drawing order (the frame keeps its relative order, the
+/// fitted vertices do not), so each fitted vertex is placed back into the
+/// frame segment whose biarc it completes, using that tangent continuity.
+///
+/// The result is only returned when the placement is unambiguous: every
+/// fitted vertex must fit one segment with a residual at most
+/// [`CURVE_FIT_AMBIGUITY_RATIO`] of its residual in every other segment and
+/// below [`CURVE_FIT_MAX_RESIDUAL`], must lie strictly between that
+/// segment's frame vertices, and an open polyline's last frame vertex must
+/// carry no bulge (it starts no segment). Anything else is an
+/// `Err(reason)` that the caller reports as a skip — a guessed order would
+/// produce a zig-zag through the right points, which is worse than nothing.
+fn curve_fit_drawing_order(
+    vertices: &[acadrust::entities::Vertex2D],
+    closed: bool,
+) -> Result<Vec<usize>, String> {
+    let frame: Vec<usize> = (0..vertices.len())
+        .filter(|&index| !is_curve_fit_vertex(&vertices[index]))
+        .collect();
+    let fitted: Vec<usize> = (0..vertices.len())
+        .filter(|&index| is_curve_fit_vertex(&vertices[index]))
+        .collect();
+
+    if frame.len() < 2 {
+        return Err(format!(
+            "curve-fit polyline has {} frame vertices; at least two are needed",
+            frame.len()
+        ));
+    }
+    if fitted.is_empty() {
+        return Ok(frame);
+    }
+    if !closed && vertices[*frame.last().expect("length checked above")].bulge != 0.0 {
+        return Err(
+            "curve-fit polyline is inconsistent: its last frame vertex still starts a segment"
+                .to_string(),
+        );
+    }
+
+    let segment_count = if closed { frame.len() } else { frame.len() - 1 };
+    let position = |index: usize| (vertices[index].location.x, vertices[index].location.y);
+
+    // Fitted vertex -> (frame segment, position along that segment's chord).
+    let mut placed: Vec<Vec<(f64, usize)>> = vec![Vec::new(); segment_count];
+    for &index in &fitted {
+        let mut residual = f64::INFINITY;
+        let mut segment = 0usize;
+        let mut runner_up = f64::INFINITY;
+        for candidate in 0..segment_count {
+            let start = frame[candidate];
+            let end = frame[(candidate + 1) % frame.len()];
+            let candidate_residual = biarc_tangent_residual(
+                position(start),
+                vertices[start].bulge,
+                position(index),
+                vertices[index].bulge,
+                position(end),
+            );
+            // Strictly-less keeps the lowest segment index on ties, and a tie
+            // then leaves `runner_up == residual`, which the gate rejects.
+            if candidate_residual < residual {
+                runner_up = residual;
+                residual = candidate_residual;
+                segment = candidate;
+            } else if candidate_residual < runner_up {
+                runner_up = candidate_residual;
+            }
+        }
+        // NaN residuals must fail the gate, so both bounds are written as a
+        // pass condition and negated as a whole.
+        let placeable =
+            residual <= CURVE_FIT_MAX_RESIDUAL && residual <= CURVE_FIT_AMBIGUITY_RATIO * runner_up;
+        if !placeable {
+            return Err(
+                "curve-fit polyline: the fitted vertices do not map unambiguously onto the frame"
+                    .to_string(),
+            );
+        }
+        let along = chord_parameter(
+            position(frame[segment]),
+            position(frame[(segment + 1) % frame.len()]),
+            position(index),
+        );
+        let inside = along > 0.0 && along < 1.0;
+        if !inside {
+            return Err(
+                "curve-fit polyline: a fitted vertex falls outside its frame segment".to_string(),
+            );
+        }
+        placed[segment].push((along, index));
+    }
+
+    let mut order = Vec::with_capacity(vertices.len());
+    for segment in 0..segment_count {
+        order.push(frame[segment]);
+        // Deterministic: the chord parameters of distinct fitted vertices on
+        // one segment are distinct, and equal keys keep list order.
+        placed[segment].sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        order.extend(placed[segment].iter().map(|&(_, index)| index));
+    }
+    if !closed {
+        order.push(*frame.last().expect("length checked above"));
+    }
+    Ok(order)
+}
+
+/// Position of `point` along the chord `start` -> `end`, as the fraction of
+/// the chord length its projection reaches. `f64::INFINITY` for a zero-length
+/// chord.
+fn chord_parameter(start: (f64, f64), end: (f64, f64), point: (f64, f64)) -> f64 {
+    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= 0.0 {
+        return f64::INFINITY;
+    }
+    ((point.0 - start.0) * dx + (point.1 - start.1) * dy) / length_squared
+}
+
+/// Tangent discontinuity, in radians, of the two-arc chain
+/// `start` -> `mid` -> `end` whose arcs carry `start_bulge` and `mid_bulge`.
+///
+/// A DXF bulge is tan(theta / 4) for the signed CCW included angle theta, so
+/// an arc's tangent leaves its start rotated -theta/2 from the chord and
+/// arrives at its end rotated +theta/2 from it. A curve fit produces a
+/// tangent-continuous chain, so the residual is (near) zero exactly for the
+/// pairing the fit produced. `PI` (the maximum) for degenerate chords.
+fn biarc_tangent_residual(
+    start: (f64, f64),
+    start_bulge: f64,
+    mid: (f64, f64),
+    mid_bulge: f64,
+    end: (f64, f64),
+) -> f64 {
+    let Some(incoming) = chord_direction(start, mid) else {
+        return std::f64::consts::PI;
+    };
+    let Some(outgoing) = chord_direction(mid, end) else {
+        return std::f64::consts::PI;
+    };
+    let arriving = incoming + 2.0 * start_bulge.atan();
+    let leaving = outgoing - 2.0 * mid_bulge.atan();
+    let difference = (arriving - leaving).rem_euclid(std::f64::consts::TAU);
+    difference.min(std::f64::consts::TAU - difference)
+}
+
+/// Direction of the chord `start` -> `end`, or `None` when the two points
+/// coincide.
+fn chord_direction(start: (f64, f64), end: (f64, f64)) -> Option<f64> {
+    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+    if dx == 0.0 && dy == 0.0 {
+        return None;
+    }
+    Some(dy.atan2(dx))
 }
 
 fn convert_polyline3d(
@@ -2514,7 +2726,7 @@ fn convert_polyline3d(
 ) -> EntityOutcome {
     if polyline.flags.spline_fit {
         return EntityOutcome::Skipped(
-            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+            "spline-fit polyline smoothing is not evaluated yet".to_string(),
         );
     }
     if polyline.flags.is_3d_mesh || polyline.flags.is_polyface_mesh {
@@ -2539,9 +2751,11 @@ fn convert_polyline_generic(
     use acadrust::entities::PolylineFlags;
 
     let flags = polyline.flags.bits();
+    // 3D polylines carry no bulges, so a fitted 3D polyline is drawn from its
+    // spline-fitted vertices alone; those are not evaluated yet.
     if flags & (PolylineFlags::CURVE_FIT.bits() | PolylineFlags::SPLINE_FIT.bits()) != 0 {
         return EntityOutcome::Skipped(
-            "curve-fit/spline-fit polyline smoothing is not evaluated yet".to_string(),
+            "spline-fit polyline smoothing is not evaluated yet".to_string(),
         );
     }
     if flags & (PolylineFlags::POLYGON_MESH.bits() | PolylineFlags::POLYFACE_MESH.bits()) != 0 {
@@ -4175,6 +4389,156 @@ mod tests {
         let interior = tessellate_bulge((0.0, 0.0), (10.0, 0.0), 1.0, 1e-7, &mut warnings);
         assert_eq!(interior.len(), super::MAX_ARC_SEGMENTS - 1);
         assert!(warnings.iter().any(|w| w.contains("capped")));
+    }
+
+    /// A curve-fit POLYLINE laid out the way the reader hands it back: the
+    /// frame vertices in drawing order, then the fitted vertices in an
+    /// unrelated order. Here the whole curve is a half circle of radius 10
+    /// centred on the origin, cut into four 45-degree arcs, so every bulge is
+    /// tan(45/4 degrees) and every point of the tessellation must land on
+    /// that circle with a monotone angle.
+    fn half_circle_curve_fit(scrambled_fitted: bool) -> acadrust::entities::Polyline2D {
+        use acadrust::entities::{Polyline2D, PolylineFlags, Vertex2D, VertexFlags};
+        use acadrust::types::Vector3;
+
+        let radius = 10.0_f64;
+        let bulge = (std::f64::consts::PI / 16.0).tan();
+        let at = |degrees: f64, bulge: f64, fitted: bool| {
+            let radians = degrees.to_radians();
+            let mut vertex = Vertex2D::new(Vector3::new(
+                radius * radians.cos(),
+                radius * radians.sin(),
+                0.0,
+            ));
+            vertex.bulge = bulge;
+            if fitted {
+                vertex.flags = VertexFlags::from_bits(VertexFlags::EXTRA_VERTEX.bits());
+            }
+            vertex
+        };
+
+        let frame = [
+            at(0.0, bulge, false),
+            at(90.0, bulge, false),
+            at(180.0, 0.0, false),
+        ];
+        let fitted = [at(45.0, bulge, true), at(135.0, bulge, true)];
+        let mut polyline = Polyline2D::new();
+        polyline.flags = PolylineFlags::from_bits(PolylineFlags::CURVE_FIT.bits());
+        polyline.vertices.extend(frame);
+        if scrambled_fitted {
+            polyline.vertices.extend(fitted.iter().rev().cloned());
+        } else {
+            polyline.vertices.extend(fitted);
+        }
+        polyline
+    }
+
+    #[test]
+    fn curve_fit_polyline_recovers_the_interleaved_drawing_order() {
+        // DXF POLYLINE group 70 bit 2 with VERTEX group 70 bit 1: the drawn
+        // curve threads the fitted vertices between the frame vertices, so
+        // the arcs stay on the circle and the polar angle only grows.
+        for scrambled in [false, true] {
+            let polyline = half_circle_curve_fit(scrambled);
+            let EntityOutcome::Converted {
+                geometry,
+                extra_properties,
+                warnings,
+            } = convert_entity(&EntityType::Polyline2D(polyline), &opts(false))
+            else {
+                panic!("a curve-fit polyline with unambiguous fitted vertices must convert");
+            };
+            let CadGeometry::Line(coordinates) = geometry else {
+                panic!("expected a LineString");
+            };
+
+            assert!(
+                extra_properties
+                    .iter()
+                    .any(|(key, value)| *key == "curve_fit"
+                        && *value == super::JsonValue::Bool(true))
+            );
+            assert!(warnings.iter().any(|w| w.contains("2 fitted vertices")));
+
+            let mut previous = -1.0_f64;
+            for (x, y) in &coordinates {
+                assert!(
+                    (x.hypot(*y) - 10.0).abs() < 1e-9,
+                    "({x}, {y}) is off the fitted circle"
+                );
+                let angle = y.atan2(*x).to_degrees();
+                assert!(
+                    angle > previous,
+                    "angles must increase: {angle} after {previous}"
+                );
+                previous = angle;
+            }
+            assert!((coordinates[0].0 - 10.0).abs() < 1e-9 && coordinates[0].1.abs() < 1e-9);
+            let last = coordinates.last().expect("non-empty");
+            assert!((last.0 + 10.0).abs() < 1e-9 && last.1.abs() < 1e-9);
+            // Four 45-degree arcs, each tessellated to meet the 0.05 chord
+            // tolerance on radius 10 (step 2*acos(1 - 0.005) ~= 11.46
+            // degrees, so four segments per arc): 16 segments, 17 points.
+            assert_eq!(coordinates.len(), 17);
+        }
+    }
+
+    #[test]
+    fn curve_fit_polyline_with_an_unplaceable_fitted_vertex_is_skipped() {
+        use acadrust::entities::{Vertex2D, VertexFlags};
+        use acadrust::types::Vector3;
+
+        // Move one fitted vertex off the curve: it no longer completes any
+        // frame segment's biarc, so the order cannot be recovered and the
+        // polyline must stay skipped rather than zig-zag through the points.
+        let mut polyline = half_circle_curve_fit(false);
+        let mut stray = Vertex2D::new(Vector3::new(3.0, -40.0, 0.0));
+        stray.flags = VertexFlags::from_bits(VertexFlags::EXTRA_VERTEX.bits());
+        stray.bulge = 0.4;
+        polyline.vertices.push(stray);
+        match convert_entity(&EntityType::Polyline2D(polyline), &opts(false)) {
+            EntityOutcome::Skipped(reason) => assert!(
+                reason.contains("unambiguously") || reason.contains("outside its frame segment"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn curve_fit_polyline_missing_a_frame_vertex_is_skipped() {
+        // An open polyline's last frame vertex starts no segment, so a
+        // non-zero bulge there means the vertex set is incomplete.
+        let mut polyline = half_circle_curve_fit(false);
+        polyline.vertices[2].bulge = 0.25;
+        match convert_entity(&EntityType::Polyline2D(polyline), &opts(false)) {
+            EntityOutcome::Skipped(reason) => {
+                assert!(reason.contains("last frame vertex"), "reason: {reason}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn biarc_tangent_residual_is_zero_along_a_circle_and_grows_with_a_kink() {
+        // Two 45-degree arcs of the same circle: tangent continuous, so the
+        // residual is zero. Flipping the second bulge's sign reverses that
+        // arc's turn, so the tangent at the joint jumps by twice the arc's
+        // half-angle, 45 degrees.
+        let bulge = (std::f64::consts::PI / 16.0).tan();
+        let at = |degrees: f64| {
+            let radians: f64 = degrees.to_radians();
+            (10.0 * radians.cos(), 10.0 * radians.sin())
+        };
+        let smooth = super::biarc_tangent_residual(at(0.0), bulge, at(45.0), bulge, at(90.0));
+        assert!(smooth < 1e-12, "residual on a circle must vanish: {smooth}");
+
+        let cusp = super::biarc_tangent_residual(at(0.0), bulge, at(45.0), -bulge, at(90.0));
+        assert!(
+            (cusp - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
+            "expected a 45-degree tangent jump, got {cusp}"
+        );
     }
 
     #[test]
