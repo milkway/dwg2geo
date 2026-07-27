@@ -5,8 +5,6 @@ version = 4
 [[package]]
 name = "acadrust"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d96c49ac7520273f8fb65865995efca78f5d75fdaf11d3ba3c87114f6496b941"
 dependencies = [
  "ahash",
  "anyhow",
