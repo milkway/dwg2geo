@@ -1,0 +1,51 @@
+{
+  "title": "dwg2geo: fail-closed, provenance-tracking conversion of DWG engineering drawings to GeoJSON",
+  "description": "<p>dwg2geo converts AutoCAD DWG engineering drawings to GeoJSON with two design commitments. It fails closed: georeferenced output is produced only when the source coordinate reference system is stated explicitly, and local-coordinate output only on explicit opt-in. And it is auditable: output is byte-deterministic for a given input and option set, and every conversion emits a machine-readable provenance record capturing the input digest, dependency versions, options and warnings. One Rust core is exposed as a command-line tool, a WebAssembly module, a Python extension and an R package (maintained in the companion repository <a href=\"https://github.com/milkway/dwg2geo-r\">milkway/dwg2geo-r</a>). Documentation: <a href=\"https://milkway.github.io/dwg2geo/\">milkway.github.io/dwg2geo</a>.</p>",
+  "upload_type": "software",
+  "license": "MIT",
+  "creators": [
+    {
+      "name": "Leite, André",
+      "affiliation": "Universidade Federal de Pernambuco",
+      "orcid": "0000-0002-4718-9766"
+    },
+    {
+      "name": "Ospina, Raydonal",
+      "affiliation": "Universidade Federal de Pernambuco",
+      "orcid": "0000-0002-9884-9090"
+    },
+    {
+      "name": "Vasconcelos, Hugo",
+      "affiliation": "Secretaria de Planejamento e Gestão, Governo de Pernambuco",
+      "orcid": "0000-0001-6249-0920"
+    },
+    {
+      "name": "Bezerra, Diogo",
+      "affiliation": "Universidade Federal de Pernambuco",
+      "orcid": "0000-0002-1216-8674"
+    }
+  ],
+  "keywords": [
+    "DWG",
+    "CAD",
+    "GIS",
+    "GeoJSON",
+    "coordinate reference systems",
+    "data provenance",
+    "reproducibility",
+    "Rust",
+    "WebAssembly"
+  ],
+  "related_identifiers": [
+    {
+      "relation": "isSupplementTo",
+      "identifier": "https://github.com/milkway/dwg2geo",
+      "resource_type": "software"
+    },
+    {
+      "relation": "isDocumentedBy",
+      "identifier": "https://milkway.github.io/dwg2geo/",
+      "resource_type": "publication-softwaredocumentation"
+    }
+  ]
+}

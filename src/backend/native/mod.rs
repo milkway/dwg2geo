@@ -26,9 +26,28 @@ use acadrust::{
     entities::EntityType,
     io::dwg::{DwgReadOptions, DwgReader},
     notification::NotificationType,
+    tables::block_record::BlockRecord,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
+
+/// Space-block names are matched case-insensitively: modern AutoCAD writes
+/// "*Model_Space", but R13/R14 and files shaped by other producers (the CCSF
+/// basemap sheets, via Autodesk Map, among them) store "*MODEL_SPACE".
+/// acadrust 0.4.1's `is_model_space()` compares exactly and misses those, so
+/// every entity lands in the block-definition bucket and conversion refuses
+/// with "no model-space block record".
+pub(crate) fn is_model_space(record: &BlockRecord) -> bool {
+    record.name.eq_ignore_ascii_case("*MODEL_SPACE")
+}
+
+pub(crate) fn is_paper_space(record: &BlockRecord) -> bool {
+    let prefix = "*PAPER_SPACE";
+    record
+        .name
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
 
 /// Notifications quoted verbatim in reports are capped at this count; the
 /// remainder is summarized numerically so output stays bounded but no class
@@ -137,7 +156,7 @@ pub fn inspect(path: &Path) -> Result<NativeInspection> {
     let block_definition_count = document
         .block_records
         .iter()
-        .filter(|record| !record.is_model_space() && !record.is_paper_space())
+        .filter(|record| !is_model_space(record) && !is_paper_space(record))
         .count();
 
     Ok(NativeInspection {
@@ -361,9 +380,9 @@ fn survey_entities(document: &CadDocument) -> Survey {
     let mut visited: HashSet<u64> = HashSet::new();
 
     for record in document.block_records.iter() {
-        let space = if record.is_model_space() {
+        let space = if is_model_space(record) {
             Space::Model
-        } else if record.is_paper_space() {
+        } else if is_paper_space(record) {
             Space::Paper
         } else {
             Space::Block

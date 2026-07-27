@@ -1322,8 +1322,8 @@ fn extract_with_sink(
     let model_placement = Placement::model_space();
 
     for record in document.block_records.iter() {
-        let is_model = record.is_model_space();
-        let is_paper = record.is_paper_space();
+        let is_model = super::is_model_space(record);
+        let is_paper = super::is_paper_space(record);
         found_model_space |= is_model;
 
         for handle in &record.entity_handles {

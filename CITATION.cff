@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use dwg2geo, please cite it using this metadata."
+title: "dwg2geo: fail-closed, provenance-tracking conversion of DWG engineering drawings to GeoJSON"
+type: software
+authors:
+  - family-names: Leite
+    given-names: "André"
+    affiliation: "Universidade Federal de Pernambuco"
+    email: leite@castlab.org
+    orcid: "https://orcid.org/0000-0002-4718-9766"
+  - family-names: Ospina
+    given-names: Raydonal
+    affiliation: "Universidade Federal de Pernambuco"
+    orcid: "https://orcid.org/0000-0002-9884-9090"
+  - family-names: Vasconcelos
+    given-names: Hugo
+    affiliation: "Secretaria de Planejamento e Gestão, Governo de Pernambuco"
+    orcid: "https://orcid.org/0000-0001-6249-0920"
+  - family-names: Bezerra
+    given-names: Diogo
+    affiliation: "Universidade Federal de Pernambuco"
+    orcid: "https://orcid.org/0000-0002-1216-8674"
+repository-code: "https://github.com/milkway/dwg2geo"
+url: "https://milkway.github.io/dwg2geo/"
+license: MIT
+version: 0.2.2
+date-released: 2026-07-26
+keywords:
+  - DWG
+  - CAD
+  - GIS
+  - GeoJSON
+  - coordinate reference systems
+  - data provenance
+  - reproducibility
+  - Rust
+  - WebAssembly
+abstract: >-
+  dwg2geo converts AutoCAD DWG engineering drawings to GeoJSON with two
+  design commitments. It fails closed: georeferenced output is produced only
+  when the source coordinate reference system is stated explicitly, and
+  local-coordinate output only on explicit opt-in. And it is auditable:
+  output is byte-deterministic for a given input and option set, and every
+  conversion emits a machine-readable provenance record. One Rust core is
+  exposed as a command-line tool, a WebAssembly module, a Python extension
+  and an R package.
