@@ -246,6 +246,7 @@ fn resolve_color(
             .map(|entry| entry.color)
             .filter(|resolved| matches!(resolved, Color::Index(_) | Color::Rgb { .. })),
         Color::ByBlock => placement.inherited_color,
+        Color::None => None,
     }
 }
 
