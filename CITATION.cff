@@ -31,8 +31,8 @@ identifiers:
     value: "10.5281/zenodo.21613917"
     description: "Concept DOI — always resolves to the latest release"
   - type: doi
-    value: "10.5281/zenodo.21622473"
-    description: "Version DOI for v0.2.3"
+    value: "10.5281/zenodo.22282697"
+    description: "Version DOI for v0.2.4"
 keywords:
   - DWG
   - CAD
