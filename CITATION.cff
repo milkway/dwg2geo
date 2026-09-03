@@ -24,8 +24,8 @@ repository-code: "https://github.com/milkway/dwg2geo"
 url: "https://milkway.github.io/dwg2geo/"
 doi: "10.5281/zenodo.21613917"
 license: MIT
-version: 0.2.3
-date-released: 2026-07-27
+version: 0.2.4
+date-released: 2026-09-03
 identifiers:
   - type: doi
     value: "10.5281/zenodo.21613917"
