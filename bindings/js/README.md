@@ -42,8 +42,10 @@ The result mirrors dwg2geo's `EmbedResult`:
 | `warnings` | conversion warnings |
 | `bbox` | `[minx, miny, maxx, maxy]` or `null` |
 | `source_sha256` | hash of the input bytes (audit trail) |
+| `geodata` | the drawing's GEODATA (geographic location) object summary, or `undefined` — coordinate type, design/reference points, units, and the first 240 chars of its coordinate-system definition (WKT or MapGuide XML) |
+| `crs_text_hints` | text strings from **any** space (model, paper-space layouts, block definitions, INSERT attribute values) that mention a CRS keyword (`UTM`, `SIRGAS`, `SAD69`, `WGS`, `FUSO`, `ZONE`, `DATUM`, `EPSG`, …), each as `{ text, space, entity_type, handle }`, capped at 32 — e.g. a title block's `"UTM - SIRGAS-2000 - MC 33º W - FUSO 25 SUL"` |
 
-Features carry resolved CAD style metadata (`layer`, `color_rgb`, `color_index`, `linetype`, `lineweight_mm`, text properties…). Coordinates are **local** — georeference them yourself (e.g. [proj4js](http://proj4js.org/)) with the drawing's known CRS; dwg2geo never guesses one.
+Features carry resolved CAD style metadata (`layer`, `color_rgb`, `color_index`, `linetype`, `lineweight_mm`, text properties…). Coordinates are **local** — georeference them yourself (e.g. [proj4js](http://proj4js.org/)) with the drawing's known CRS; dwg2geo never guesses one. It does surface every CRS *declaration* the drawing carries (`geodata`, `crs_text_hints`) so your app can read the operator's own words and propose a CRS.
 
 Deterministic: the same bytes always produce byte-identical GeoJSON on a given platform (across platforms — native vs WebAssembly — a few floating-point values may differ in the last digit).
 

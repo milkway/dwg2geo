@@ -4432,6 +4432,145 @@ pub struct EmbedResult {
     pub bbox: Option<[f64; 4]>,
     /// SHA-256 of the input bytes.
     pub source_sha256: String,
+    /// The drawing's GEODATA object (AutoCAD geographic location), when it
+    /// has one. Its coordinate-system definition is the closest thing a DWG
+    /// has to a CRS declaration; it is reported, never applied.
+    pub geodata: Option<super::GeoDataSummary>,
+    /// Text strings from ANY space (model, paper-space layouts, block
+    /// definitions, INSERT attribute values) that mention a coordinate-system
+    /// keyword — the title-block "DATUM: UTM - SIRGAS 2000 - FUSO 25 SUL"
+    /// kind of declaration. The embedder decides what to make of them; the
+    /// converter only surfaces the operator's own words. See
+    /// [`CRS_HINT_KEYWORDS`] and [`MAX_CRS_TEXT_HINTS`].
+    pub crs_text_hints: Vec<CrsTextHint>,
+}
+
+/// A text string found in the drawing that mentions a CRS keyword.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CrsTextHint {
+    /// Plain text (MTEXT format codes stripped, whitespace collapsed).
+    pub text: String,
+    /// `"model"`, `"paper"` or `"block"` (a block definition, i.e. text that
+    /// only appears where the block is inserted).
+    pub space: &'static str,
+    /// `"TEXT"`, `"MTEXT"` or `"ATTRIB"` (an attribute value on an INSERT).
+    pub entity_type: &'static str,
+    /// Handle of the TEXT/MTEXT entity, or of the INSERT carrying the ATTRIB.
+    pub handle: String,
+}
+
+/// Case-insensitive substrings that make a text string a CRS hint. Broad on
+/// purpose: a false positive costs the embedder one regex miss, a false
+/// negative hides the only CRS declaration the drawing has.
+pub const CRS_HINT_KEYWORDS: &[&str] = &[
+    "UTM",
+    "SIRGAS",
+    "SAD69",
+    "SAD 69",
+    "SAD-69",
+    "WGS",
+    "FUSO",
+    "ZONA ",
+    "ZONE ",
+    "DATUM",
+    "EPSG",
+    "MERIDIANO",
+    "CORREGO ALEGRE",
+    "CÓRREGO ALEGRE",
+    "HEMISF",
+    "PROJCS",
+    "GEOGCS",
+    "STATE PLANE",
+    "NAD83",
+    "NAD27",
+    "ETRS",
+    "GRS80",
+    "GRS 80",
+];
+
+/// Upper bound on reported hints, so a drawing that stamps "UTM" on every
+/// sheet cannot bloat the result.
+pub const MAX_CRS_TEXT_HINTS: usize = 32;
+
+/// Collect the CRS text hints of a document (see [`EmbedResult::crs_text_hints`]).
+/// Walks every block record in document order; model and paper space first,
+/// block definitions last, since a title block is usually an INSERT whose
+/// attribute values already carry the declaration.
+pub(crate) fn crs_text_hints(document: &CadDocument) -> Vec<CrsTextHint> {
+    let mut hints: Vec<CrsTextHint> = Vec::new();
+    let push = |hints: &mut Vec<CrsTextHint>, text: &str, space, entity_type, handle: String| {
+        let plain = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if plain.is_empty() || !mentions_crs_keyword(&plain) {
+            return;
+        }
+        if hints.iter().any(|h| h.text == plain) {
+            return;
+        }
+        hints.push(CrsTextHint {
+            text: plain,
+            space,
+            entity_type,
+            handle,
+        });
+    };
+    let mut records: Vec<_> = document.block_records.iter().collect();
+    records.sort_by_key(|record| {
+        if super::is_model_space(record) {
+            0
+        } else if super::is_paper_space(record) {
+            1
+        } else {
+            2
+        }
+    });
+    for record in records {
+        let space = if super::is_model_space(record) {
+            "model"
+        } else if super::is_paper_space(record) {
+            "paper"
+        } else {
+            "block"
+        };
+        for handle in &record.entity_handles {
+            if hints.len() >= MAX_CRS_TEXT_HINTS {
+                return hints;
+            }
+            let Some(entity) = document.get_entity(*handle) else {
+                continue;
+            };
+            let handle = entity.common().handle.to_string();
+            match entity {
+                EntityType::Text(text) => push(&mut hints, &text.value, space, "TEXT", handle),
+                EntityType::MText(mtext) => push(
+                    &mut hints,
+                    &strip_mtext_codes(&mtext.value),
+                    space,
+                    "MTEXT",
+                    handle,
+                ),
+                EntityType::Insert(insert) => {
+                    for attribute in &insert.attributes {
+                        push(
+                            &mut hints,
+                            &attribute.value,
+                            space,
+                            "ATTRIB",
+                            handle.clone(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    hints
+}
+
+fn mentions_crs_keyword(text: &str) -> bool {
+    let upper = text.to_uppercase();
+    CRS_HINT_KEYWORDS
+        .iter()
+        .any(|keyword| upper.contains(keyword))
 }
 
 /// Embedding / WebAssembly entry point: convert model-space geometry from an
@@ -4514,6 +4653,8 @@ pub fn convert_bytes(
         warnings,
         bbox,
         source_sha256,
+        geodata: super::geodata_summary(&document),
+        crs_text_hints: crs_text_hints(&document),
         geojson,
     })
 }
@@ -5598,6 +5739,43 @@ mod tests {
             EntityOutcome::Failed(reason) => assert_eq!(reason, "non-finite coordinates"),
             _ => panic!("non-finite 3DFACE must fail"),
         }
+    }
+
+    #[test]
+    fn crs_text_hints_come_from_every_space_and_skip_plain_text() {
+        use acadrust::entities::{MText, Text};
+
+        let mut document = CadDocument::with_version(DxfVersion::AC1027);
+        let mut road = Text::new();
+        road.value = "RODOVIA PE 027".to_string();
+        document
+            .add_entity(EntityType::Text(road))
+            .expect("add model text");
+        let mut datum = MText::new();
+        datum.value = "{\\fArial|b0;DATUM:\\P  SIRGAS   2000}".to_string();
+        document
+            .add_entity(EntityType::MText(datum))
+            .expect("add model mtext");
+        let mut stamp = Text::new();
+        stamp.value = "UTM - SIRGAS-2000 - MC 33º W - FUSO 25 SUL".to_string();
+        document
+            .add_paper_space_entity(EntityType::Text(stamp.clone()))
+            .expect("add paper text");
+        // A second copy of the stamp (another layout) must not repeat.
+        document
+            .add_paper_space_entity(EntityType::Text(stamp))
+            .expect("add duplicate paper text");
+
+        let hints = super::crs_text_hints(&document);
+
+        assert_eq!(hints.len(), 2, "{hints:?}");
+        assert_eq!(hints[0].space, "model");
+        assert_eq!(hints[0].entity_type, "MTEXT");
+        assert_eq!(hints[0].text, "DATUM: SIRGAS 2000");
+        assert_eq!(hints[1].space, "paper");
+        assert_eq!(hints[1].entity_type, "TEXT");
+        assert_eq!(hints[1].text, "UTM - SIRGAS-2000 - MC 33º W - FUSO 25 SUL");
+        assert!(!hints[1].handle.is_empty());
     }
 
     #[test]

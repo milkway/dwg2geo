@@ -222,7 +222,7 @@ fn unknown_object_histogram(document: &CadDocument) -> Vec<TypeCount> {
         .collect()
 }
 
-fn geodata_summary(document: &CadDocument) -> Option<GeoDataSummary> {
+pub(crate) fn geodata_summary(document: &CadDocument) -> Option<GeoDataSummary> {
     document
         .objects
         .iter()
