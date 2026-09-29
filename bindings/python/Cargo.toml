@@ -1,6 +1,7 @@
 [package]
 name = "dwg2geo-python"
 version = "0.2.5"
+authors = ["André Leite <leite@castlab.org>"]
 edition = "2024"
 rust-version = "1.85"
 description = "Convert engineering DWG drawings to GeoJSON — Python bindings for dwg2geo"
