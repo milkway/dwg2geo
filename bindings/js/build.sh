@@ -23,6 +23,11 @@ p.homepage = 'https://github.com/milkway/dwg2geo';
 p.keywords = ['dwg', 'geojson', 'cad', 'gis', 'wasm', 'webassembly', 'autocad', 'converter'];
 p.license = 'MIT';
 p.author = { name: 'André Leite', email: 'leite@castlab.org' };
+p.contributors = [
+  { name: 'Raydonal Ospina', email: 'raydonal@castlab.org' },
+  { name: 'Hugo Vasconcelos', email: 'hugo.vasconcelos@ufpe.br' },
+  { name: 'Diogo Bezerra', email: 'diogo.bezerra@ufpe.br' },
+];
 // Belt and braces: npm auto-includes LICENSE, but list it explicitly too.
 if (Array.isArray(p.files) && !p.files.includes('LICENSE')) p.files.push('LICENSE');
 fs.writeFileSync('pkg/package.json', JSON.stringify(p, null, 2) + '\n');

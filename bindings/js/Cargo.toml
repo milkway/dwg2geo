@@ -1,7 +1,12 @@
 [package]
 name = "dwg2geo-wasm"
 version = "0.2.5"
-authors = ["André Leite <leite@castlab.org>"]
+authors = [
+    "André Leite <leite@castlab.org>",
+    "Raydonal Ospina <raydonal@castlab.org>",
+    "Hugo Vasconcelos <hugo.vasconcelos@ufpe.br>",
+    "Diogo Bezerra <diogo.bezerra@ufpe.br>",
+]
 edition = "2024"
 rust-version = "1.85"
 description = "Convert engineering DWG drawings to GeoJSON in the browser or Node (WebAssembly)"

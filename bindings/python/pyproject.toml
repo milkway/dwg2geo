@@ -7,7 +7,12 @@ name = "dwg2geo"
 description = "Convert engineering DWG drawings to auditable GeoJSON (pure-Rust, no CAD software needed)"
 readme = "README.md"
 license = { text = "MIT" }
-authors = [{ name = "André Leite", email = "leite@castlab.org" }]
+authors = [
+    { name = "André Leite", email = "leite@castlab.org" },
+    { name = "Raydonal Ospina", email = "raydonal@castlab.org" },
+    { name = "Hugo Vasconcelos", email = "hugo.vasconcelos@ufpe.br" },
+    { name = "Diogo Bezerra", email = "diogo.bezerra@ufpe.br" },
+]
 requires-python = ">=3.9"
 keywords = ["dwg", "geojson", "cad", "gis", "autocad", "converter"]
 classifiers = [
