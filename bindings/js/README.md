@@ -2,6 +2,8 @@
 
 Convert engineering **DWG drawings to GeoJSON** entirely in the browser or Node — the pure-Rust [dwg2geo](https://github.com/milkway/dwg2geo) converter compiled to WebAssembly. No native dependencies, no server.
 
+DWG parsing is done by [acadrust](https://github.com/hakanaktt/acadrust), a third-party Rust library by Hakan AK (MPL-2.0), which this package contains in compiled form; dwg2geo adds the GeoJSON conversion, diagnostics and reports on top. Not affiliated with Autodesk; DWG and AutoCAD are trademarks of Autodesk, Inc.
+
 ```bash
 npm install dwg2geo
 ```
@@ -51,4 +53,4 @@ Deterministic: the same bytes always produce byte-identical GeoJSON on a given p
 
 Built with `wasm-pack --target web`. See a full working app at [dwg2geo-app](https://github.com/milkway/dwg2geo-app) ([live demo](https://milkway.github.io/dwg2geo-app/)).
 
-License: MIT.
+License: MIT (dwg2geo). The WebAssembly module also contains third-party Rust crates in compiled form, each under its own license — among them [acadrust](https://github.com/hakanaktt/acadrust) (© Hakan AK, [MPL-2.0](https://www.mozilla.org/MPL/2.0/), used unmodified; source at [crates.io](https://crates.io/crates/acadrust) and in its repository). Texts of all dependency licenses: `THIRD-PARTY-LICENSES.md` in this package ([online](https://github.com/milkway/dwg2geo/blob/main/THIRD-PARTY-LICENSES.md)).

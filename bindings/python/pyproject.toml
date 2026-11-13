@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "dwg2geo"
-description = "Convert engineering DWG drawings to auditable GeoJSON (pure-Rust, no CAD software needed)"
+description = "Convert engineering DWG drawings to auditable GeoJSON (pure Rust, no CAD software needed; DWG reading by the acadrust crate)"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [

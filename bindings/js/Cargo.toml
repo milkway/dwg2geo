@@ -9,7 +9,7 @@ authors = [
 ]
 edition = "2024"
 rust-version = "1.85"
-description = "Convert engineering DWG drawings to GeoJSON in the browser or Node (WebAssembly)"
+description = "Convert engineering DWG drawings to GeoJSON in the browser or Node (WebAssembly; DWG reading by the acadrust crate)"
 license = "MIT"
 repository = "https://github.com/milkway/dwg2geo"
 homepage = "https://github.com/milkway/dwg2geo"

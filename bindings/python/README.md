@@ -2,6 +2,8 @@
 
 Convert engineering **DWG drawings to GeoJSON** from Python — the pure-Rust [dwg2geo](https://github.com/milkway/dwg2geo) converter as a native extension. No AutoCAD, no LibreDWG, no GDAL needed.
 
+DWG parsing is done by [acadrust](https://github.com/hakanaktt/acadrust), a third-party Rust library by Hakan AK (MPL-2.0), which this package contains in compiled form; dwg2geo adds the GeoJSON conversion, diagnostics and reports on top. Not affiliated with Autodesk; DWG and AutoCAD are trademarks of Autodesk, Inc.
+
 ```bash
 pip install dwg2geo
 ```
@@ -41,4 +43,4 @@ lon, lat = transformer.transform(x, y)
 
 Deterministic: the same bytes always produce byte-identical GeoJSON on a given platform (across platforms — native vs WebAssembly — a few floating-point values may differ in the last digit).
 
-License: MIT.
+License: MIT (dwg2geo). The wheel also contains third-party Rust crates in compiled form, each under its own license — among them [acadrust](https://github.com/hakanaktt/acadrust) (© Hakan AK, [MPL-2.0](https://www.mozilla.org/MPL/2.0/), used unmodified; source at [crates.io](https://crates.io/crates/acadrust) and in its repository). Texts of all dependency licenses: [THIRD-PARTY-LICENSES.md](https://github.com/milkway/dwg2geo/blob/main/THIRD-PARTY-LICENSES.md).

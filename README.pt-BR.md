@@ -4,6 +4,8 @@
 
 CLI e biblioteca de código aberto que convertem desenhos DWG de engenharia em **GeoJSON auditável**, com tratamento explícito de sistema de referência de coordenadas (CRS), diagnósticos e relatórios rastreáveis.
 
+A leitura do formato DWG no backend nativo é feita pelo [acadrust](https://github.com/hakanaktt/acadrust), biblioteca Rust de terceiros, de Hakan AK (MPL-2.0); o dwg2geo acrescenta a conversão para GeoJSON, o tratamento de CRS, os diagnósticos e os relatórios. Sem vínculo com a Autodesk; DWG e AutoCAD são marcas da Autodesk, Inc.
+
 **Site e documentação:** <https://milkway.github.io/dwg2geo/>
 
 ## Instalação
@@ -39,4 +41,4 @@ O desenho de referência e todos os dados derivados dele ficam fora deste reposi
 
 ## Licença
 
-MIT (`LICENSE-MIT`). Detalhes de arquitetura, backends, calibração por pontos de controle e limitações: [README em inglês](README.md).
+MIT (`LICENSE-MIT`). O [acadrust](https://github.com/hakanaktt/acadrust) (© Hakan AK) é usado sem modificações sob a [Mozilla Public License 2.0](https://www.mozilla.org/MPL/2.0/); o código-fonte dele está no [crates.io](https://crates.io/crates/acadrust) e no repositório do projeto, e os textos das licenças das dependências estão em `THIRD-PARTY-LICENSES.md`. Detalhes de arquitetura, backends, calibração por pontos de controle e limitações: [README em inglês](README.md).

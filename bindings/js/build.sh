@@ -11,6 +11,9 @@ wasm-pack build --target web --release --out-dir pkg -- --config 'profile.releas
 # npm auto-includes only files named LICENSE/LICENCE (with optional dot
 # extension) — "LICENSE-MIT" is skipped, so ship a plain LICENSE copy.
 cp LICENSE-MIT pkg/LICENSE
+# The wasm module contains third-party crates (acadrust is MPL-2.0): ship
+# their license texts with the package.
+cp ../../THIRD-PARTY-LICENSES.md pkg/THIRD-PARTY-LICENSES.md
 
 # wasm-pack names the package after the crate (dwg2geo-wasm); the npm package
 # is published as plain `dwg2geo`, with the repo metadata npm expects.
@@ -30,6 +33,7 @@ p.contributors = [
 ];
 // Belt and braces: npm auto-includes LICENSE, but list it explicitly too.
 if (Array.isArray(p.files) && !p.files.includes('LICENSE')) p.files.push('LICENSE');
+if (Array.isArray(p.files) && !p.files.includes('THIRD-PARTY-LICENSES.md')) p.files.push('THIRD-PARTY-LICENSES.md');
 fs.writeFileSync('pkg/package.json', JSON.stringify(p, null, 2) + '\n');
 console.log(`pkg ready: ${p.name}@${p.version}`);
 EOF

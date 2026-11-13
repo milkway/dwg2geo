@@ -12,6 +12,8 @@
 
 An open-source CLI that converts engineering DWG drawings to GeoJSON with explicit coordinate-reference handling, diagnostics, and traceable conversion reports.
 
+DWG parsing in the native backend is done by [acadrust](https://github.com/hakanaktt/acadrust), a third-party Rust library by Hakan AK (MPL-2.0); dwg2geo adds the GeoJSON conversion, CRS handling, diagnostics and reports on top. Not affiliated with Autodesk; DWG and AutoCAD are trademarks of Autodesk, Inc. See [License](#license).
+
 **Website & docs:** <https://milkway.github.io/dwg2geo/>
 
 ## Download
@@ -179,7 +181,10 @@ Dockerfile               slim, native-only container image
 `dwg2geo` is released under the **MIT license** (`LICENSE-MIT`). Its own binaries, the prebuilt releases, and the slim container are MIT-clean.
 
 - The native backend's Rust dependencies are permissive (MIT / Apache-2.0 / BSD-3-Clause / Unicode-3.0) plus exactly one weak-copyleft crate, **`acadrust` (MPL-2.0)** — file-level copyleft that places no terms on `dwg2geo`'s source and does not restrict binary distribution. No GPL/LGPL/AGPL dependency is present. See `THIRD-PARTY-LICENSES.md` and `sbom.cdx.json`.
+- **Credit and source for `acadrust`.** The native backend reads DWG files with [`acadrust`](https://github.com/hakanaktt/acadrust), © Hakan AK, used unmodified under the [Mozilla Public License 2.0](https://www.mozilla.org/MPL/2.0/). Every `dwg2geo` artifact built with `native-backend` (release binaries, container image, the npm WebAssembly package, the PyPI wheels and the R package) contains it in executable form. Its source code is available from [crates.io](https://crates.io/crates/acadrust) and from its repository, at the exact version recorded in `Cargo.lock` and `sbom.cdx.json`; the license text is in `THIRD-PARTY-LICENSES.md`, which also carries the texts of the other dependency licenses.
 - The **external backend** shells out to **LibreDWG (`dwgread`, GPL-3.0)** and **GDAL (`ogr2ogr`, permissive)** as separate processes. It does not link, embed, or ship them: the copyleft stays with the tools the user installs, so every distributed `dwg2geo` artifact remains MIT. We deliberately do not bundle LibreDWG into any release or image.
+
+`dwg2geo` is an independent project. It is not affiliated with, sponsored by or endorsed by Autodesk, Inc. or by the acadrust, LibreDWG or GDAL projects. DWG and AutoCAD are trademarks of Autodesk, Inc.
 
 ## Important constraints
 
