@@ -1,6 +1,6 @@
 [package]
 name = "dwg2geo-python"
-version = "0.2.5"
+version = "0.2.6"
 authors = [
     "André Leite <leite@castlab.org>",
     "Raydonal Ospina <raydonal@castlab.org>",
@@ -20,6 +20,6 @@ name = "dwg2geo"
 crate-type = ["cdylib"]
 
 [dependencies]
-dwg2geo = { path = "../..", version = "0.2.5", default-features = false, features = ["native-backend"] }
+dwg2geo = { path = "../..", version = "0.2.6", default-features = false, features = ["native-backend"] }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 pythonize = "0.29"

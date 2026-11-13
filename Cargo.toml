@@ -1,6 +1,6 @@
 [package]
 name = "dwg2geo"
-version = "0.2.5"
+version = "0.2.6"
 authors = [
     "André Leite <leite@castlab.org>",
     "Raydonal Ospina <raydonal@castlab.org>",

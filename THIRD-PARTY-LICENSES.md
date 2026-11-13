@@ -1316,9 +1316,9 @@ SOFTWARE.
 ## MIT License (`MIT`)
 
 Used by:
-- `dwg2geo 0.2.3`
-- `dwg2geo 0.2.3`
-- `dwg2geo 0.2.3`
+- `dwg2geo 0.2.6`
+- `dwg2geo 0.2.6`
+- `dwg2geo 0.2.6`
 
 ```text
 MIT License

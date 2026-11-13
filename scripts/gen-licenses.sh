@@ -40,4 +40,7 @@ cargo about generate \
 
 test -s "$output_file"
 mv "$output_file" THIRD-PARTY-LICENSES.md
-echo "generated $repo_root/THIRD-PARTY-LICENSES.md"
+# The Python wheel ships the same texts: maturin picks up LICENSE* files next
+# to the binding's Cargo.toml and puts them in .dist-info/licenses/.
+cp THIRD-PARTY-LICENSES.md bindings/python/LICENSE-THIRD-PARTY.md
+echo "generated $repo_root/THIRD-PARTY-LICENSES.md (and bindings/python/LICENSE-THIRD-PARTY.md)"
